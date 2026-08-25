@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- infrastructure_v1alpha1_hydramachine.yaml
+- infrastructure_v1alpha1_hydramachinetemplate.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
