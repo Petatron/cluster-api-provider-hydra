@@ -84,6 +84,12 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
+	@# `kind create` sets the kubectl context, but the reuse branch above does not.
+	@# Without this, an e2e run that reuses an existing cluster would deploy into
+	@# whatever ambient context happened to be selected -- possibly a real cluster --
+	@# and then delete the Kind one during teardown. Always bind the context.
+	@$(KIND) export kubeconfig --name $(KIND_CLUSTER)
+	@echo "kubectl context: $$(kubectl config current-context)"
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
