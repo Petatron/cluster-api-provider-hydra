@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  test:
+    permissions:
+      contents: read
+    name: Unit tests (envtest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # go mod tidy is deliberately NOT run here. Tidiness is asserted by the
+      # verify workflow; running it before the tests would silently repair a
+      # dirty go.mod and hide the problem.
+      - name: Run tests
+        run: make test
+
+      - name: Build manager binary
+        run: make build
+
+      - name: Build clusterctl release manifests
+        run: make release-manifests
+
+      - name: Upload release manifests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-manifests-${{ github.sha }}
+          path: |
+            out/infrastructure-components.yaml
+            out/metadata.yaml
+          if-no-files-found: error

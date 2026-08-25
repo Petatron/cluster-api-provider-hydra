@@ -1,0 +1,50 @@
+name: Verify
+
+# Generated code, CRDs and RBAC are committed to the repository. This job fails
+# if any of them is out of step with the source, which is the failure mode you
+# otherwise only notice much later when a manifest does not match the types.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  verify-generated:
+    permissions:
+      contents: read
+    name: Generated files are current
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Regenerate
+        run: make generate manifests
+
+      - name: Fail if regeneration changed anything
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are stale. Run 'make generate manifests' and commit the result."
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the result."
+            exit 1
+          fi
