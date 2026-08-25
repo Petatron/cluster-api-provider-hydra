@@ -35,6 +35,13 @@ import (
 // markers claim. A unit test on the Go types would prove nothing: none of this
 // validation lives in Go.
 
+// Extracted so the linter does not flag repeated literals, and so the fixtures
+// read as one shared machine shape rather than several coincidentally equal ones.
+const (
+	testNetwork = "br0"
+	testImage   = "ubuntu-24.04"
+)
+
 var uniq int
 
 func newMachine(mutate func(*infrav1.HydraMachine)) *infrav1.HydraMachine {
@@ -48,8 +55,8 @@ func newMachine(mutate func(*infrav1.HydraMachine)) *infrav1.HydraMachine {
 			VCPUs:    2,
 			Memory:   resource.MustParse("4Gi"),
 			DiskSize: resource.MustParse("40Gi"),
-			Image:    infrav1.HydraMachineImage{Name: "ubuntu-24.04"},
-			Networks: []infrav1.HydraMachineNetworkAttachment{{Name: "br0"}},
+			Image:    infrav1.HydraMachineImage{Name: testImage},
+			Networks: []infrav1.HydraMachineNetworkAttachment{{Name: testNetwork}},
 		},
 	}
 	if mutate != nil {
@@ -136,7 +143,7 @@ var _ = Describe("HydraMachine API", func() {
 
 		It("rejects duplicate attachments by name", func() {
 			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
-				m.Spec.Networks = []infrav1.HydraMachineNetworkAttachment{{Name: "br0"}, {Name: "br0"}}
+				m.Spec.Networks = []infrav1.HydraMachineNetworkAttachment{{Name: testNetwork}, {Name: testNetwork}}
 			}))
 			Expect(err).To(HaveOccurred())
 		})
@@ -248,7 +255,7 @@ var _ = Describe("HydraMachineTemplate API", func() {
 		// This is the subtree Cluster API clones verbatim into a HydraMachine.
 		cloned := fetched.Spec.Template.Spec
 		Expect(cloned.VCPUs).To(Equal(int32(2)))
-		Expect(cloned.Image.Name).To(Equal("ubuntu-24.04"))
+		Expect(cloned.Image.Name).To(Equal(testImage))
 		Expect(cloned.Networks).To(HaveLen(1))
 		Expect(cloned.ProviderID).To(BeNil())
 	})

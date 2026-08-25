@@ -62,8 +62,8 @@ var _ = Describe("HydraMachine Controller", func() {
 						VCPUs:    2,
 						Memory:   resource2.MustParse("4Gi"),
 						DiskSize: resource2.MustParse("40Gi"),
-						Image:    infrastructurev1alpha1.HydraMachineImage{Name: "ubuntu-24.04"},
-						Networks: []infrastructurev1alpha1.HydraMachineNetworkAttachment{{Name: "br0"}},
+						Image:    infrastructurev1alpha1.HydraMachineImage{Name: testImage},
+						Networks: []infrastructurev1alpha1.HydraMachineNetworkAttachment{{Name: testNetwork}},
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
