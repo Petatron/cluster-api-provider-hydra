@@ -8,13 +8,32 @@ metadata:
 spec:
   group: infrastructure.cluster.x-k8s.io
   names:
+    categories:
+    - cluster-api
     kind: HydraMachineTemplate
     listKind: HydraMachineTemplateList
     plural: hydramachinetemplates
     singular: hydramachinetemplate
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.template.spec.vcpus
+      name: vCPUs
+      type: integer
+    - jsonPath: .spec.template.spec.memory
+      name: Memory
+      type: string
+    - jsonPath: .spec.template.spec.diskSize
+      name: Disk
+      type: string
+    - jsonPath: .spec.template.spec.image.name
+      name: Image
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: HydraMachineTemplate is the Schema for the hydramachinetemplates
@@ -44,8 +63,9 @@ spec:
                 description: template is the machine payload cloned into each HydraMachine.
                 properties:
                   metadata:
-                    description: metadata is the object metadata applied to machines
-                      cloned from this template.
+                    description: |-
+                      metadata is the object metadata applied to machines cloned from this
+                      template.
                     minProperties: 1
                     properties:
                       annotations:
@@ -68,39 +88,150 @@ spec:
                         type: object
                     type: object
                   spec:
-                    description: spec is the HydraMachine spec applied to machines
-                      cloned from this template.
+                    description: |-
+                      spec is the HydraMachine spec applied to machines cloned from this
+                      template.
+
+                      providerID must not be set here. It identifies one specific machine, and a
+                      template describes many; a value here would be copied into every clone and
+                      collide immediately.
                     properties:
+                      diskSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          diskSize is the size of the machine's root disk, as a Kubernetes quantity,
+                          for example "40Gi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: diskSize is immutable; replace the machine instead
+                          rule: self == oldSelf
+                      image:
+                        description: image is the base image the machine boots from.
+                        properties:
+                          checksum:
+                            description: |-
+                              checksum verifies a fetched image, in the form "<algorithm>:<hex>",
+                              for example "sha256:abc...". Only meaningful alongside url.
+                            pattern: ^(sha256|sha512):[a-fA-F0-9]+$
+                            type: string
+                          name:
+                            description: name identifies a base image already known
+                              to the backend.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          url:
+                            description: |-
+                              url is where the backend may fetch the image from when it does not already
+                              hold one matching name.
+                            maxLength: 2048
+                            minLength: 1
+                            type: string
+                        type: object
+                        x-kubernetes-validations:
+                        - message: image is immutable; replace the machine instead
+                          rule: self == oldSelf
+                        - message: one of name or url must be set
+                          rule: has(self.name) || has(self.url)
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          memory is the RAM the machine is given, as a Kubernetes quantity, for
+                          example "8Gi".
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: memory is immutable; replace the machine instead
+                          rule: self == oldSelf
+                      networks:
+                        description: |-
+                          networks are the backend networks this machine attaches to, in order. The
+                          first attachment provides the machine's primary address.
+
+                          A list rather than a single value so that multi-homed machines do not
+                          require an API break later.
+                        items:
+                          description: HydraMachineNetworkAttachment attaches a machine
+                            to one backend network.
+                          properties:
+                            name:
+                              description: |-
+                                name is the backend network or bridge to attach to, for example "br0".
+                                Hydra does not interpret this value; it is passed to the backend, which
+                                decides what it means.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        maxItems: 8
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                        x-kubernetes-validations:
+                        - message: networks are immutable; replace the machine instead
+                          rule: self == oldSelf
                       providerID:
                         description: |-
                           providerID is the unique identifier for this machine, in the form
                           hydra://<backend>/<id>. The controller sets it once the backing
-                          infrastructure exists; the Kubernetes Node reports the same value, which
-                          is how Cluster API pairs a Machine with its Node.
+                          infrastructure exists; the Kubernetes Node reports the same value, which is
+                          how Cluster API pairs a Machine with its Node.
+
+                          This is written by the controller, not by users. It is immutable once set.
 
                           NOTE: this field is part of the Cluster API contract.
+                        maxLength: 512
+                        minLength: 1
                         type: string
+                      vcpus:
+                        description: vcpus is the number of virtual CPUs the machine
+                          is given.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                        x-kubernetes-validations:
+                        - message: vcpus is immutable; replace the machine instead
+                          rule: self == oldSelf
+                    required:
+                    - diskSize
+                    - image
+                    - memory
+                    - networks
+                    - vcpus
                     type: object
+                    x-kubernetes-validations:
+                    - message: providerID must not be set on a template; it identifies
+                        a single machine
+                      rule: '!has(self.providerID)'
+                    - message: providerID is immutable once set
+                      rule: '!has(oldSelf.providerID) || (has(self.providerID) &&
+                        self.providerID == oldSelf.providerID)'
                 required:
                 - spec
                 type: object
             required:
             - template
             type: object
+            x-kubernetes-validations:
+            - message: HydraMachineTemplate spec is immutable; create a new template
+                and roll the MachineDeployment onto it
+              rule: self == oldSelf
           status:
             description: status defines the observed state of HydraMachineTemplate
             properties:
               conditions:
                 description: |-
-                  conditions represent the current state of the HydraMachineTemplate resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  conditions represent the current state of the HydraMachineTemplate
+                  resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

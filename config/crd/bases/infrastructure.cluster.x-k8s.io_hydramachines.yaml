@@ -8,13 +8,31 @@ metadata:
 spec:
   group: infrastructure.cluster.x-k8s.io
   names:
+    categories:
+    - cluster-api
     kind: HydraMachine
     listKind: HydraMachineList
     plural: hydramachines
     singular: hydramachine
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - description: Whether the backing infrastructure is fully provisioned
+      jsonPath: .status.initialization.provisioned
+      name: Provisioned
+      type: boolean
+    - description: Machine readiness across its lifecycle
+      jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .spec.providerID
+      name: ProviderID
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: HydraMachine is the Schema for the hydramachines API
@@ -39,30 +57,167 @@ spec:
           spec:
             description: spec defines the desired state of HydraMachine
             properties:
+              diskSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  diskSize is the size of the machine's root disk, as a Kubernetes quantity,
+                  for example "40Gi".
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: diskSize is immutable; replace the machine instead
+                  rule: self == oldSelf
+              image:
+                description: image is the base image the machine boots from.
+                properties:
+                  checksum:
+                    description: |-
+                      checksum verifies a fetched image, in the form "<algorithm>:<hex>",
+                      for example "sha256:abc...". Only meaningful alongside url.
+                    pattern: ^(sha256|sha512):[a-fA-F0-9]+$
+                    type: string
+                  name:
+                    description: name identifies a base image already known to the
+                      backend.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  url:
+                    description: |-
+                      url is where the backend may fetch the image from when it does not already
+                      hold one matching name.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: image is immutable; replace the machine instead
+                  rule: self == oldSelf
+                - message: one of name or url must be set
+                  rule: has(self.name) || has(self.url)
+              memory:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  memory is the RAM the machine is given, as a Kubernetes quantity, for
+                  example "8Gi".
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+                x-kubernetes-validations:
+                - message: memory is immutable; replace the machine instead
+                  rule: self == oldSelf
+              networks:
+                description: |-
+                  networks are the backend networks this machine attaches to, in order. The
+                  first attachment provides the machine's primary address.
+
+                  A list rather than a single value so that multi-homed machines do not
+                  require an API break later.
+                items:
+                  description: HydraMachineNetworkAttachment attaches a machine to
+                    one backend network.
+                  properties:
+                    name:
+                      description: |-
+                        name is the backend network or bridge to attach to, for example "br0".
+                        Hydra does not interpret this value; it is passed to the backend, which
+                        decides what it means.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 8
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: networks are immutable; replace the machine instead
+                  rule: self == oldSelf
               providerID:
                 description: |-
                   providerID is the unique identifier for this machine, in the form
                   hydra://<backend>/<id>. The controller sets it once the backing
-                  infrastructure exists; the Kubernetes Node reports the same value, which
-                  is how Cluster API pairs a Machine with its Node.
+                  infrastructure exists; the Kubernetes Node reports the same value, which is
+                  how Cluster API pairs a Machine with its Node.
+
+                  This is written by the controller, not by users. It is immutable once set.
 
                   NOTE: this field is part of the Cluster API contract.
+                maxLength: 512
+                minLength: 1
                 type: string
+              vcpus:
+                description: vcpus is the number of virtual CPUs the machine is given.
+                format: int32
+                minimum: 1
+                type: integer
+                x-kubernetes-validations:
+                - message: vcpus is immutable; replace the machine instead
+                  rule: self == oldSelf
+            required:
+            - diskSize
+            - image
+            - memory
+            - networks
+            - vcpus
             type: object
+            x-kubernetes-validations:
+            - message: providerID is immutable once set
+              rule: '!has(oldSelf.providerID) || (has(self.providerID) && self.providerID
+                == oldSelf.providerID)'
           status:
             description: status defines the observed state of HydraMachine
             properties:
+              addresses:
+                description: |-
+                  addresses are the addresses assigned to the machine. Cluster API surfaces
+                  these on the Machine once initialization completes. They are not used to
+                  drive any behaviour -- they exist so an operator debugging a stuck machine
+                  can see where it actually landed.
+                items:
+                  description: MachineAddress contains information for the node's
+                    address.
+                  properties:
+                    address:
+                      description: address is the machine address.
+                      maxLength: 256
+                      minLength: 1
+                      type: string
+                    type:
+                      description: type is the machine address type, one of Hostname,
+                        ExternalIP, InternalIP, ExternalDNS or InternalDNS.
+                      enum:
+                      - Hostname
+                      - ExternalIP
+                      - InternalIP
+                      - ExternalDNS
+                      - InternalDNS
+                      type: string
+                  required:
+                  - address
+                  - type
+                  type: object
+                maxItems: 32
+                type: array
               conditions:
                 description: |-
                   conditions represent the current state of the HydraMachine resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
 
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
+                  A condition of type "Ready" is mirrored into the Machine's
+                  InfrastructureReady condition, and is expected to describe the machine
+                  across its whole lifecycle -- provisioning, steady state, and deletion --
+                  not just whether provisioning finished once.
 
-                  The status of each condition is one of True, False, or Unknown.
+                  Terminal failures are reported here too. The v1beta2 contract has no
+                  special handling for them, so a well-documented condition type is the only
+                  signal consumers get.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -121,21 +276,33 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failureDomain:
+                description: |-
+                  failureDomain is the failure domain the machine was actually placed in.
+
+                  Placement is requested at Machine level, not here; this field reports where
+                  the backend put it, which is not necessarily the same thing.
+                maxLength: 256
+                minLength: 1
+                type: string
               initialization:
                 description: |-
                   initialization reports whether the machine's infrastructure is provisioned.
 
                   NOTE: this field is part of the Cluster API contract.
+                minProperties: 1
                 properties:
                   provisioned:
                     description: |-
                       provisioned is true when the infrastructure backing this machine is fully
                       provisioned and the machine is ready to be bootstrapped.
 
-                      NOTE: this field is part of the Cluster API contract. Cluster API reads it
-                      to populate Machine.status.initialization.infrastructureProvisioned, which
-                      is what actually drives provisioning orchestration. Without it, Cluster API
-                      cannot observe that this provider finished its work.
+                      Cluster API reads this to populate the Machine's
+                      status.initialization.infrastructureProvisioned, which is what actually
+                      drives provisioning orchestration. Without it, Cluster API cannot observe
+                      that this provider finished its work.
+
+                      NOTE: this field is part of the Cluster API contract.
                     type: boolean
                 type: object
             type: object

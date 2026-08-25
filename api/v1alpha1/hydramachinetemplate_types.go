@@ -22,48 +22,55 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // HydraMachineTemplateResource is the machine payload a MachineDeployment clones
 // when it stamps out a new HydraMachine.
 type HydraMachineTemplateResource struct {
-	// metadata is the object metadata applied to machines cloned from this template.
+	// metadata is the object metadata applied to machines cloned from this
+	// template.
 	// +optional
-	ObjectMeta clusterv1.ObjectMeta `json:"metadata,omitempty"`
+	ObjectMeta clusterv1.ObjectMeta `json:"metadata,omitempty,omitzero"`
 
-	// spec is the HydraMachine spec applied to machines cloned from this template.
+	// spec is the HydraMachine spec applied to machines cloned from this
+	// template.
+	//
+	// providerID must not be set here. It identifies one specific machine, and a
+	// template describes many; a value here would be copied into every clone and
+	// collide immediately.
+	// +required
+	// +kubebuilder:validation:XValidation:rule="!has(self.providerID)",message="providerID must not be set on a template; it identifies a single machine"
 	Spec HydraMachineSpec `json:"spec"`
 }
 
 // HydraMachineTemplateSpec defines the desired state of HydraMachineTemplate.
 //
-// The nesting here is not stylistic: the Cluster API v1beta2 InfraMachineTemplate
-// contract requires the machine payload to live at spec.template.spec. Cluster API
-// clones that subtree verbatim into the InfraMachine it creates. Flattening it would
-// make this template uncloneable, and MachineDeployments referencing it would fail.
+// The nesting is not stylistic: the Cluster API v1beta2 InfraMachineTemplate
+// contract requires the machine payload at spec.template.spec, and Cluster API
+// clones that subtree verbatim into the HydraMachine it creates. Flattening it
+// would make the template uncloneable, and a MachineDeployment referencing it
+// would fail at reconcile time rather than at apply time.
+//
+// The whole spec is immutable. Cluster API's model is that changing a machine
+// shape means creating a new template and rolling the MachineDeployment onto it,
+// which keeps a template an accurate record of what its existing machines were
+// built from.
+//
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="HydraMachineTemplate spec is immutable; create a new template and roll the MachineDeployment onto it"
 type HydraMachineTemplateSpec struct {
 	// template is the machine payload cloned into each HydraMachine.
+	// +required
 	Template HydraMachineTemplateResource `json:"template"`
 }
 
 // HydraMachineTemplateStatus defines the observed state of HydraMachineTemplate.
+//
+// Intentionally minimal. The Cluster API contract also allows a template to
+// report status.capacity and status.nodeInfo, which is how Cluster Autoscaler
+// sizes a node pool that currently has zero replicas -- there is no Node to
+// inspect, so the capacity has to come from the template. That is PET-27, and
+// adding those fields later is an additive, non-breaking change.
 type HydraMachineTemplateStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the HydraMachineTemplate resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// conditions represent the current state of the HydraMachineTemplate
+	// resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -72,6 +79,13 @@ type HydraMachineTemplateStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+// +kubebuilder:resource:path=hydramachinetemplates,scope=Namespaced,categories=cluster-api
+// +kubebuilder:printcolumn:name="vCPUs",type="integer",JSONPath=".spec.template.spec.vcpus"
+// +kubebuilder:printcolumn:name="Memory",type="string",JSONPath=".spec.template.spec.memory"
+// +kubebuilder:printcolumn:name="Disk",type="string",JSONPath=".spec.template.spec.diskSize"
+// +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".spec.template.spec.image.name",priority=1
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // HydraMachineTemplate is the Schema for the hydramachinetemplates API
 type HydraMachineTemplate struct {
