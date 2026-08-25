@@ -1,0 +1,85 @@
+name: Release
+
+# Post-merge pipeline.
+#
+#   push to main  -> build and publish a container image tagged with the commit
+#   push of a tag -> same, plus a GitHub Release carrying the two files
+#                    clusterctl needs to install this provider
+#
+# Deliberately does NOT run on pull_request: a PR must never be able to publish
+# an image or a release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create the GitHub Release on a tag
+      packages: write   # required to push to ghcr.io
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # ghcr.io requires a lowercase path, and the org is 'Petatron'.
+      - name: Resolve image reference
+        id: img
+        run: |
+          repo_lc="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="sha-$(echo '${{ github.sha }}' | cut -c1-12)"
+          fi
+          echo "image=ghcr.io/${repo_lc}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ghcr.io/${repo_lc}:${tag}"
+
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build image
+        run: make docker-build IMG='${{ steps.img.outputs.image }}'
+
+      - name: Push image
+        run: make docker-push IMG='${{ steps.img.outputs.image }}'
+
+      # The release manifest must reference the image just published, not the
+      # placeholder in config/manager. release-manifests takes IMG for this.
+      - name: Build clusterctl release manifests
+        run: make release-manifests IMG='${{ steps.img.outputs.image }}'
+
+      - name: Upload release manifests as artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-manifests-${{ github.ref_name }}
+          path: |
+            out/infrastructure-components.yaml
+            out/metadata.yaml
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create '${{ github.ref_name }}' \
+            out/infrastructure-components.yaml \
+            out/metadata.yaml \
+            --title '${{ github.ref_name }}' \
+            --generate-notes

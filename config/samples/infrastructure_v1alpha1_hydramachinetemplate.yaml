@@ -5,5 +5,8 @@ metadata:
     app.kubernetes.io/name: cluster-api-provider-hydra
     app.kubernetes.io/managed-by: kustomize
   name: hydramachinetemplate-sample
+# spec.template.spec is the payload Cluster API clones. Both spec and
+# spec.template.spec are required by the schema, so both need explicit mappings.
 spec:
-  # TODO(user): Add fields here
+  template:
+    spec: {}

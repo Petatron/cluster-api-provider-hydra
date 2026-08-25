@@ -1,8 +1,18 @@
 name: Lint
 
+# Runs on every PR, and on main after merge. Deliberately NOT on every push to
+# every branch: that made each PR run the whole suite twice, once for the branch
+# push and once for the PR.
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR cancels the previous run for that PR. main is never
+# cancelled, so post-merge results are always recorded.
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
 
@@ -10,7 +20,7 @@ jobs:
   lint:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: golangci-lint
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -25,5 +35,6 @@ jobs:
 
       - name: Check linter configuration
         run: make lint-config
+
       - name: Run linter
         run: make lint

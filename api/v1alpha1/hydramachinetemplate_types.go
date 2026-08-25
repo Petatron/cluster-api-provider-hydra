@@ -19,21 +19,32 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// HydraMachineTemplateSpec defines the desired state of HydraMachineTemplate
-type HydraMachineTemplateSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of HydraMachineTemplate. Edit hydramachinetemplate_types.go to remove/update
+// HydraMachineTemplateResource is the machine payload a MachineDeployment clones
+// when it stamps out a new HydraMachine.
+type HydraMachineTemplateResource struct {
+	// metadata is the object metadata applied to machines cloned from this template.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	ObjectMeta clusterv1.ObjectMeta `json:"metadata,omitempty"`
+
+	// spec is the HydraMachine spec applied to machines cloned from this template.
+	Spec HydraMachineSpec `json:"spec"`
+}
+
+// HydraMachineTemplateSpec defines the desired state of HydraMachineTemplate.
+//
+// The nesting here is not stylistic: the Cluster API v1beta2 InfraMachineTemplate
+// contract requires the machine payload to live at spec.template.spec. Cluster API
+// clones that subtree verbatim into the InfraMachine it creates. Flattening it would
+// make this template uncloneable, and MachineDeployments referencing it would fail.
+type HydraMachineTemplateSpec struct {
+	// template is the machine payload cloned into each HydraMachine.
+	Template HydraMachineTemplateResource `json:"template"`
 }
 
 // HydraMachineTemplateStatus defines the observed state of HydraMachineTemplate.

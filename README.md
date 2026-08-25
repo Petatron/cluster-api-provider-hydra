@@ -43,7 +43,7 @@ infrastructure.cluster.x-k8s.io/v1alpha1
 |---|---|
 | Cluster API | v1.14.0 |
 | Cluster API contract | `v1beta2` |
-| Go | 1.27 |
+| Go | 1.26 |
 | Kubebuilder | v4.15.0 |
 | controller-runtime | v0.24.1 |
 
@@ -54,7 +54,7 @@ infrastructure.cluster.x-k8s.io/v1alpha1
 
 ## Local development
 
-Requirements: Go 1.27+, `make`, Docker (for envtest and image builds). Everything else —
+Requirements: Go 1.26 (matching `go.mod`, the `Dockerfile`, and the devcontainer), `make`, Docker (for envtest and image builds). Everything else —
 `controller-gen`, `kustomize`, `setup-envtest`, envtest binaries — is downloaded into `bin/` on
 first use.
 

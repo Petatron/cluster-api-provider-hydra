@@ -5,5 +5,6 @@ metadata:
     app.kubernetes.io/name: cluster-api-provider-hydra
     app.kubernetes.io/managed-by: kustomize
   name: hydramachine-sample
-spec:
-  # TODO(user): Add fields here
+# spec is required by the CRD schema, so it must be an explicit empty mapping
+# rather than a comment. PET-7 replaces this with real fields.
+spec: {}

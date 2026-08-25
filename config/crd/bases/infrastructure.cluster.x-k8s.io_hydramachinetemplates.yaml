@@ -40,10 +40,47 @@ spec:
           spec:
             description: spec defines the desired state of HydraMachineTemplate
             properties:
-              foo:
-                description: foo is an example field of HydraMachineTemplate. Edit
-                  hydramachinetemplate_types.go to remove/update
-                type: string
+              template:
+                description: template is the machine payload cloned into each HydraMachine.
+                properties:
+                  metadata:
+                    description: metadata is the object metadata applied to machines
+                      cloned from this template.
+                    minProperties: 1
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          annotations is an unstructured key value map stored with a resource that may be
+                          set by external tools to store and retrieve arbitrary metadata. They are not
+                          queryable and should be preserved when modifying objects.
+                          More info: http://kubernetes.io/docs/user-guide/annotations
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          labels is a map of string keys and values that can be used to organize and categorize
+                          (scope and select) objects. May match selectors of replication controllers
+                          and services.
+                          More info: http://kubernetes.io/docs/user-guide/labels
+                        type: object
+                    type: object
+                  spec:
+                    description: spec is the HydraMachine spec applied to machines
+                      cloned from this template.
+                    properties:
+                      foo:
+                        description: foo is an example field of HydraMachine. Edit
+                          hydramachine_types.go to remove/update
+                        type: string
+                    type: object
+                required:
+                - spec
+                type: object
+            required:
+            - template
             type: object
           status:
             description: status defines the observed state of HydraMachineTemplate
