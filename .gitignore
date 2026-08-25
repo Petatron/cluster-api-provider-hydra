@@ -32,3 +32,7 @@ go.work
 # clusterctl release output
 out/
 cover.out
+
+# transient snapshot used by release-manifests / build-installer
+config/manager/kustomization.yaml.orig
+dist/

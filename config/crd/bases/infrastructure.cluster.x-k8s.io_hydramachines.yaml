@@ -39,9 +39,14 @@ spec:
           spec:
             description: spec defines the desired state of HydraMachine
             properties:
-              foo:
-                description: foo is an example field of HydraMachine. Edit hydramachine_types.go
-                  to remove/update
+              providerID:
+                description: |-
+                  providerID is the unique identifier for this machine, in the form
+                  hydra://<backend>/<id>. The controller sets it once the backing
+                  infrastructure exists; the Kubernetes Node reports the same value, which
+                  is how Cluster API pairs a Machine with its Node.
+
+                  NOTE: this field is part of the Cluster API contract.
                 type: string
             type: object
           status:
@@ -116,6 +121,23 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              initialization:
+                description: |-
+                  initialization reports whether the machine's infrastructure is provisioned.
+
+                  NOTE: this field is part of the Cluster API contract.
+                properties:
+                  provisioned:
+                    description: |-
+                      provisioned is true when the infrastructure backing this machine is fully
+                      provisioned and the machine is ready to be bootstrapped.
+
+                      NOTE: this field is part of the Cluster API contract. Cluster API reads it
+                      to populate Machine.status.initialization.infrastructureProvisioned, which
+                      is what actually drives provisioning orchestration. Without it, Cluster API
+                      cannot observe that this provider finished its work.
+                    type: boolean
+                type: object
             type: object
         required:
         - spec

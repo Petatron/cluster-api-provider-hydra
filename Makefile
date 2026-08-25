@@ -87,8 +87,11 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	@KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v; \
-		status=$$?; \
+	@# .SHELLFLAGS is -ec, so a bare `cmd; status=$$?` exits before the capture and
+	@# cleanup never runs. `|| status=$$?` keeps the failure inside a compound
+	@# command, where -e does not fire, so teardown is guaranteed.
+	@status=0; \
+		KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v || status=$$?; \
 		$(MAKE) cleanup-test-e2e; \
 		exit $$status
 
@@ -112,10 +115,17 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 
 .PHONY: release-manifests
 release-manifests: manifests generate kustomize ## Build the infrastructure-components.yaml release manifest consumed by clusterctl.
-	mkdir -p out
-	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
-	$(KUSTOMIZE) build config/default > out/infrastructure-components.yaml
-	cp metadata.yaml out/metadata.yaml
+	@# `kustomize edit` rewrites the tracked config/manager/kustomization.yaml.
+	@# Snapshot and restore it so this target only ever writes under out/, and so a
+	@# release build cannot silently change the default image for later builds.
+	@mkdir -p out
+	@cp config/manager/kustomization.yaml config/manager/kustomization.yaml.orig
+	@status=0; \
+		( cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG) ) && \
+		$(KUSTOMIZE) build config/default > out/infrastructure-components.yaml || status=$$?; \
+		mv config/manager/kustomization.yaml.orig config/manager/kustomization.yaml; \
+		cp metadata.yaml out/metadata.yaml; \
+		exit $$status
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
@@ -149,15 +159,21 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name cluster-api-provider-hydra-builder
 	$(CONTAINER_TOOL) buildx use cluster-api-provider-hydra-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm cluster-api-provider-hydra-builder
 	rm Dockerfile.cross
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
-	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+	@# Same snapshot/restore as release-manifests: `kustomize edit` would otherwise
+	@# leave the tracked kustomization.yaml modified.
+	@mkdir -p dist
+	@cp config/manager/kustomization.yaml config/manager/kustomization.yaml.orig
+	@status=0; \
+		( cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG} ) && \
+		"$(KUSTOMIZE)" build config/default > dist/install.yaml || status=$$?; \
+		mv config/manager/kustomization.yaml.orig config/manager/kustomization.yaml; \
+		exit $$status
 
 ##@ Deployment
 

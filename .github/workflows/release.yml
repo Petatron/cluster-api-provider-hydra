@@ -20,8 +20,43 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Publishing must not depend on the PR workflows. They are scoped to
+  # branches: [main] and so do not run for tag pushes at all, and on main they
+  # run concurrently with this one -- either way an unverified commit could
+  # reach ghcr.io or a GitHub Release. Re-run the checks here and gate on them.
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Generated files are current
+        run: |
+          make generate manifests
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are stale; refusing to publish."
+            exit 1
+          fi
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test
+
   publish:
     name: Build and publish
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required to create the GitHub Release on a tag

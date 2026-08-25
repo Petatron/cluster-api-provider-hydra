@@ -24,22 +24,41 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// HydraMachineSpec defines the desired state of HydraMachine
+// HydraMachineSpec defines the desired state of HydraMachine.
+//
+// Only the fields mandated by the Cluster API v1beta2 InfraMachine contract are
+// present. Hydra's own fields (machine class, image, network, GPU) are PET-7.
 type HydraMachineSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of HydraMachine. Edit hydramachine_types.go to remove/update
+	// providerID is the unique identifier for this machine, in the form
+	// hydra://<backend>/<id>. The controller sets it once the backing
+	// infrastructure exists; the Kubernetes Node reports the same value, which
+	// is how Cluster API pairs a Machine with its Node.
+	//
+	// NOTE: this field is part of the Cluster API contract.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	ProviderID *string `json:"providerID,omitempty"`
+}
+
+// HydraMachineInitializationStatus reports provisioning progress to Cluster API.
+type HydraMachineInitializationStatus struct {
+	// provisioned is true when the infrastructure backing this machine is fully
+	// provisioned and the machine is ready to be bootstrapped.
+	//
+	// NOTE: this field is part of the Cluster API contract. Cluster API reads it
+	// to populate Machine.status.initialization.infrastructureProvisioned, which
+	// is what actually drives provisioning orchestration. Without it, Cluster API
+	// cannot observe that this provider finished its work.
+	// +optional
+	Provisioned *bool `json:"provisioned,omitempty"`
 }
 
 // HydraMachineStatus defines the observed state of HydraMachine.
 type HydraMachineStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// initialization reports whether the machine's infrastructure is provisioned.
+	//
+	// NOTE: this field is part of the Cluster API contract.
+	// +optional
+	Initialization HydraMachineInitializationStatus `json:"initialization,omitempty"`
 
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties

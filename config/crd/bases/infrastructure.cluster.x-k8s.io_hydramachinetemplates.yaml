@@ -71,9 +71,14 @@ spec:
                     description: spec is the HydraMachine spec applied to machines
                       cloned from this template.
                     properties:
-                      foo:
-                        description: foo is an example field of HydraMachine. Edit
-                          hydramachine_types.go to remove/update
+                      providerID:
+                        description: |-
+                          providerID is the unique identifier for this machine, in the form
+                          hydra://<backend>/<id>. The controller sets it once the backing
+                          infrastructure exists; the Kubernetes Node reports the same value, which
+                          is how Cluster API pairs a Machine with its Node.
+
+                          NOTE: this field is part of the Cluster API contract.
                         type: string
                     type: object
                 required:
