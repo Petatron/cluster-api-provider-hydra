@@ -40,6 +40,9 @@ import (
 const (
 	testNetwork = "br0"
 	testImage   = "ubuntu-24.04"
+	// A real sha256 digest (of the empty input), so the fixture exercises the
+	// exact-length rule rather than a placeholder that only happens to be hex.
+	testChecksum = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
 var uniq int
@@ -118,18 +121,37 @@ var _ = Describe("HydraMachine API", func() {
 			m := newMachine(func(m *infrav1.HydraMachine) {
 				m.Spec.Image = infrav1.HydraMachineImage{
 					URL:      "https://example.invalid/ubuntu-24.04.img",
-					Checksum: "sha256:0123456789abcdef",
+					Checksum: testChecksum,
 				}
 			})
 			Expect(k8sClient.Create(ctx, m)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, m)).To(Succeed())
 		})
 
-		It("rejects a malformed checksum", func() {
+		It("rejects an unsupported checksum algorithm", func() {
 			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
-				m.Spec.Image.Checksum = "md5:whatever"
+				m.Spec.Image.URL = "https://example.invalid/img"
+				m.Spec.Image.Checksum = "md5:d41d8cd98f00b204e9800998ecf8427e"
 			}))
 			Expect(err).To(HaveOccurred())
+		})
+
+		It("rejects a truncated sha256 digest", func() {
+			// The old pattern allowed any non-empty hex run, so "sha256:a" passed
+			// admission and only failed much later during provisioning.
+			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
+				m.Spec.Image.URL = "https://example.invalid/img"
+				m.Spec.Image.Checksum = "sha256:abc123"
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("rejects a checksum with no url to verify", func() {
+			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
+				m.Spec.Image = infrav1.HydraMachineImage{Name: testImage, Checksum: testChecksum}
+			}))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("checksum is only meaningful alongside url"))
 		})
 	})
 
@@ -159,6 +181,52 @@ var _ = Describe("HydraMachine API", func() {
 			err := k8sClient.Update(ctx, m)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("rejects a change to memory", func() {
+			// Quantity compiles to x-kubernetes-int-or-string, a different schema
+			// shape from a scalar, so its transition rule needs proving separately.
+			m := newMachine(nil)
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Memory = resource.MustParse("8Gi")
+			err := k8sClient.Update(ctx, m)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("rejects a change to diskSize", func() {
+			m := newMachine(nil)
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.DiskSize = resource.MustParse("80Gi")
+			err := k8sClient.Update(ctx, m)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("rejects a change to networks", func() {
+			// networks is an associative list (listType=map), which again compiles
+			// differently from both scalars and quantities.
+			m := newMachine(nil)
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Networks = []infrav1.HydraMachineNetworkAttachment{{Name: "br1"}}
+			err := k8sClient.Update(ctx, m)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
+
+		It("rejects appending a network", func() {
+			m := newMachine(nil)
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Networks = append(m.Spec.Networks, infrav1.HydraMachineNetworkAttachment{Name: "br1"})
+			Expect(k8sClient.Update(ctx, m)).ToNot(Succeed())
 		})
 
 		It("rejects a change to the image", func() {

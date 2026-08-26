@@ -54,8 +54,10 @@ spec:
 status:
   initialization:
     provisioned: true  # contract: drives Cluster API provisioning orchestration
-  addresses: []        # surfaced on the Machine once provisioned
-  failureDomain: ""    # where the backend actually placed it
+  addresses:           # surfaced on the Machine once provisioned
+    - type: InternalIP
+      address: 192.168.15.42
+  failureDomain: workstation  # where the backend actually placed it
   conditions: []       # a "Ready" condition mirrors to Machine.InfrastructureReady
 ```
 

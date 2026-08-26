@@ -113,9 +113,14 @@ spec:
                         properties:
                           checksum:
                             description: |-
-                              checksum verifies a fetched image, in the form "<algorithm>:<hex>",
-                              for example "sha256:abc...". Only meaningful alongside url.
-                            pattern: ^(sha256|sha512):[a-fA-F0-9]+$
+                              checksum verifies a fetched image, in the form "<algorithm>:<hex>".
+
+                              The digest length is pinned to the algorithm -- 64 hex characters for
+                              sha256, 128 for sha512 -- so a truncated or malformed digest is rejected at
+                              admission rather than discovered halfway through provisioning a machine.
+
+                              Only valid alongside url; a checksum with nothing to verify is rejected.
+                            pattern: ^(sha256:[a-fA-F0-9]{64}|sha512:[a-fA-F0-9]{128})$
                             type: string
                           name:
                             description: name identifies a base image already known
@@ -136,6 +141,8 @@ spec:
                           rule: self == oldSelf
                         - message: one of name or url must be set
                           rule: has(self.name) || has(self.url)
+                        - message: checksum is only meaningful alongside url
+                          rule: '!has(self.checksum) || has(self.url)'
                       memory:
                         anyOf:
                         - type: integer

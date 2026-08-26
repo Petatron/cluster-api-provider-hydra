@@ -32,6 +32,7 @@ import (
 // satisfy.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.name) || has(self.url)",message="one of name or url must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.checksum) || has(self.url)",message="checksum is only meaningful alongside url"
 type HydraMachineImage struct {
 	// name identifies a base image already known to the backend.
 	// +optional
@@ -46,10 +47,15 @@ type HydraMachineImage struct {
 	// +kubebuilder:validation:MaxLength=2048
 	URL string `json:"url,omitempty"`
 
-	// checksum verifies a fetched image, in the form "<algorithm>:<hex>",
-	// for example "sha256:abc...". Only meaningful alongside url.
+	// checksum verifies a fetched image, in the form "<algorithm>:<hex>".
+	//
+	// The digest length is pinned to the algorithm -- 64 hex characters for
+	// sha256, 128 for sha512 -- so a truncated or malformed digest is rejected at
+	// admission rather than discovered halfway through provisioning a machine.
+	//
+	// Only valid alongside url; a checksum with nothing to verify is rejected.
 	// +optional
-	// +kubebuilder:validation:Pattern=`^(sha256|sha512):[a-fA-F0-9]+$`
+	// +kubebuilder:validation:Pattern=`^(sha256:[a-fA-F0-9]{64}|sha512:[a-fA-F0-9]{128})$`
 	Checksum string `json:"checksum,omitempty"`
 }
 
