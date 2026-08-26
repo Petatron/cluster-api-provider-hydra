@@ -5,8 +5,16 @@ metadata:
     app.kubernetes.io/name: cluster-api-provider-hydra
     app.kubernetes.io/managed-by: kustomize
   name: hydramachinetemplate-sample
-# spec.template.spec is the payload Cluster API clones. Both spec and
-# spec.template.spec are required by the schema, so both need explicit mappings.
 spec:
+  # spec.template.spec is the subtree Cluster API clones verbatim into each
+  # HydraMachine a MachineDeployment stamps out. The whole spec is immutable:
+  # changing a machine shape means a new template and a rollout.
   template:
-    spec: {}
+    spec:
+      vcpus: 4
+      memory: 8Gi
+      diskSize: 60Gi
+      image:
+        name: ubuntu-24.04
+      networks:
+        - name: br0

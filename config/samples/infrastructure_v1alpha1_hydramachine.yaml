@@ -5,6 +5,13 @@ metadata:
     app.kubernetes.io/name: cluster-api-provider-hydra
     app.kubernetes.io/managed-by: kustomize
   name: hydramachine-sample
-# spec is required by the CRD schema, so it must be an explicit empty mapping
-# rather than a comment. PET-7 replaces this with real fields.
-spec: {}
+spec:
+  vcpus: 2
+  memory: 4Gi
+  diskSize: 40Gi
+  image:
+    name: ubuntu-24.04
+  networks:
+    - name: br0
+  # providerID is intentionally absent. The controller writes it once the
+  # backing machine exists, and it is immutable thereafter.

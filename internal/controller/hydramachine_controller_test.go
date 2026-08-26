@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	resource2 "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	infrastructurev1alpha1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
@@ -54,7 +55,16 @@ var _ = Describe("HydraMachine Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					// A minimal but valid spec. The scaffolded version left this
+					// empty, which stopped being creatable once PET-7 gave the API
+					// required fields.
+					Spec: infrastructurev1alpha1.HydraMachineSpec{
+						VCPUs:    2,
+						Memory:   resource2.MustParse("4Gi"),
+						DiskSize: resource2.MustParse("40Gi"),
+						Image:    infrastructurev1alpha1.HydraMachineImage{Name: testImage},
+						Networks: []infrastructurev1alpha1.HydraMachineNetworkAttachment{{Name: testNetwork}},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
