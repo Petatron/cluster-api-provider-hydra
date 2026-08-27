@@ -39,6 +39,7 @@ import (
 
 	infrastructurev1alpha1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/controller"
+	libvirtprovider "github.com/Petatron/cluster-api-provider-hydra/internal/providers/libvirt"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +62,7 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	var libvirtURI, libvirtRemoteAddr, libvirtPool, libvirtBaseImage string
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -69,6 +71,15 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&libvirtURI, "libvirt-uri", "qemu:///system",
+		"libvirt connection URI the provider drives.")
+	flag.StringVar(&libvirtRemoteAddr, "libvirt-remote-addr", "",
+		"host:port of a remote libvirt daemon. Empty uses the local socket. Set this when "+
+			"the hypervisor is not the machine running this controller.")
+	flag.StringVar(&libvirtPool, "libvirt-storage-pool", "",
+		"libvirt storage pool that machine disks are created in. Required.")
+	flag.StringVar(&libvirtBaseImage, "libvirt-base-image", "",
+		"volume name of the backing image machines are cloned from. Required.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -185,9 +196,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The backend is constructed here and injected, so the reconciler depends on
+	// the MachineProvider interface rather than on libvirt. Adding a second
+	// backend is a change to this block, not to the controller.
+	machineProvider, err := libvirtprovider.New(libvirtprovider.Config{
+		URI:         libvirtURI,
+		RemoteAddr:  libvirtRemoteAddr,
+		StoragePool: libvirtPool,
+		BaseImage:   libvirtBaseImage,
+	})
+	if err != nil {
+		setupLog.Error(err, "Failed to connect to libvirt",
+			"uri", libvirtURI, "remoteAddr", libvirtRemoteAddr)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := machineProvider.Close(); err != nil {
+			setupLog.Error(err, "Failed to close the libvirt connection")
+		}
+	}()
+
 	if err := (&controller.HydraMachineReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Provider: machineProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")
 		os.Exit(1)
