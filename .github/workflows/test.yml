@@ -37,8 +37,18 @@ jobs:
       # `make test` writes cover.out at the repository root. Fork pull requests
       # do not receive CODECOV_TOKEN, so the upload is skipped there instead of
       # failing a contributor's PR on something they cannot fix.
+      #
+      # It is also skipped when CODECOV_TOKEN is simply not configured. Codecov
+      # requires a token for protected branches, so without one the upload fails
+      # and -- with fail_ci_if_error: true -- fails every PR on a reporting
+      # concern rather than a correctness one. Gating on the token keeps
+      # fail_ci_if_error meaningful for real upload errors while not holding
+      # builds hostage to an unset secret. Set CODECOV_TOKEN in repository
+      # settings to enable coverage reporting.
       - name: Upload coverage to Codecov
-        if: github.event.pull_request.head.repo.fork != true
+        if: ${{ github.event.pull_request.head.repo.fork != true && env.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
