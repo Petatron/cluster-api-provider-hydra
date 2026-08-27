@@ -63,6 +63,26 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --libvirt-uri=$(LIBVIRT_URI)
+          - --libvirt-remote-addr=$(LIBVIRT_REMOTE_ADDR)
+          - --libvirt-storage-pool=$(LIBVIRT_STORAGE_POOL)
+          - --libvirt-base-image=$(LIBVIRT_BASE_IMAGE)
+        env:
+          # Sourced from the libvirt-config ConfigMap, which must be edited before
+          # deploying: storagePool and baseImage are site-specific and have no
+          # sensible default.
+          - name: LIBVIRT_URI
+            valueFrom:
+              configMapKeyRef: {name: libvirt-config, key: uri}
+          - name: LIBVIRT_REMOTE_ADDR
+            valueFrom:
+              configMapKeyRef: {name: libvirt-config, key: remoteAddr}
+          - name: LIBVIRT_STORAGE_POOL
+            valueFrom:
+              configMapKeyRef: {name: libvirt-config, key: storagePool}
+          - name: LIBVIRT_BASE_IMAGE
+            valueFrom:
+              configMapKeyRef: {name: libvirt-config, key: baseImage}
         image: controller:latest
         name: manager
         ports:

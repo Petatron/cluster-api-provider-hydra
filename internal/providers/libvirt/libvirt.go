@@ -37,12 +37,56 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
+// call runs a libvirt RPC under the caller's context.
+//
+// go-libvirt's generated API is context-free: DomainCreate and friends take no
+// ctx and block until the daemon answers. That is a poor fit for a provider
+// whose contract promises cancellation and whose hypervisor may be across a WAN
+// hop, so every RPC goes through here.
+//
+// Honest limitation: cancelling returns control to the caller but does NOT abort
+// the in-flight RPC. The goroutine stays parked until the daemon replies or the
+// connection drops, at which point it exits. That leaks a goroutine and a
+// connection slot for the duration, which is a real cost -- but it is strictly
+// better than a reconcile worker blocking indefinitely, which is what the
+// previous preflight-only check allowed.
+func call[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	type result struct {
+		val T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		val, err := fn()
+		ch <- result{val, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	case r := <-ch:
+		return r.val, r.err
+	}
+}
+
+// callVoid is call for RPCs that return only an error.
+func callVoid(ctx context.Context, fn func() error) error {
+	_, err := call(ctx, func() (struct{}, error) { return struct{}{}, fn() })
+	return err
+}
+
 // addrSourceLease selects the DHCP lease table as the address source.
 //
 // The generated API takes a uint32 while the constant is typed
 // DomainInterfaceAddressesSource, so the conversion is required; naming it here
 // keeps that out of the call site.
 const addrSourceLease = uint32(golibvirt.DomainInterfaceAddressesSrcLease)
+
+// addrSourceAgent asks the QEMU guest agent, which reports addresses the host's
+// DHCP lease table never sees -- statically configured guests, or any guest on a
+// network libvirt does not serve DHCP for.
+const addrSourceAgent = uint32(golibvirt.DomainInterfaceAddressesSrcAgent)
 
 // Config describes how to reach libvirt and where to put what it creates.
 type Config struct {
@@ -114,60 +158,154 @@ func (p *Provider) Name() string { return "libvirt" }
 // Idempotent on spec.Name, as the interface requires: an existing domain with
 // that name is returned rather than a second one being defined.
 func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*providers.MachineState, error) {
-	if err := ctx.Err(); err != nil {
+	// Idempotency, and more than a lookup. Every interruption point below leaves
+	// a different partial state, and each one has to be recoverable:
+	//
+	//   volume created, domain not defined  -> adopt the volume
+	//   domain defined, never started       -> start it
+	//   domain started                      -> return it
+	//
+	// The middle case is the subtle one: a defined-but-inactive domain adopted
+	// without being started would be polled forever, because nothing else in the
+	// reconcile loop ever attempts a start.
+	dom, err := call(ctx, func() (golibvirt.Domain, error) {
+		return p.lv.DomainLookupByName(spec.Name)
+	})
+	switch {
+	case err == nil:
+		if startErr := p.ensureRunning(ctx, dom); startErr != nil {
+			return nil, startErr
+		}
+		return p.stateOf(ctx, dom)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return nil, err
-	}
-
-	// Idempotency check first. This is the whole guarantee: a reconcile that
-	// crashed after defining a domain but before recording its providerID will
-	// land here and adopt the existing machine.
-	if dom, err := p.lv.DomainLookupByName(spec.Name); err == nil {
-		return p.stateOf(dom)
-	} else if !isNotFound(err) {
+	case !isNotFound(err):
 		return nil, fmt.Errorf("libvirt: looking up domain %q: %w", spec.Name, err)
 	}
 
-	pool, err := p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
+	pool, err := call(ctx, func() (golibvirt.StoragePool, error) {
+		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: storage pool %q: %w", p.cfg.StoragePool, err)
 	}
 
-	volName := spec.Name + ".qcow2"
-	if _, err := p.lv.StorageVolCreateXML(pool, volumeXML(volName, p.cfg.BaseImage, spec.DiskBytes), 0); err != nil {
-		return nil, fmt.Errorf("libvirt: creating volume %q: %w", volName, err)
+	backingPath, err := p.resolveBackingPath(ctx, pool, spec.Image)
+	if err != nil {
+		return nil, err
 	}
 
-	dom, err := p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName))
+	volName := spec.Name + ".qcow2"
+	_, err = call(ctx, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolCreateXML(pool, volumeXML(volName, backingPath, spec.DiskBytes), 0)
+	})
+	if err != nil && !isAlreadyExists(err) {
+		return nil, fmt.Errorf("libvirt: creating volume %q: %w", volName, err)
+	}
+	// An already-existing volume is a previous attempt's, adopted rather than
+	// treated as fatal. Without this, a crash between volume creation and domain
+	// definition would make every subsequent retry fail identically forever.
+
+	dom, err = call(ctx, func() (golibvirt.Domain, error) {
+		return p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
-	if err := p.lv.DomainCreate(dom); err != nil {
-		return nil, fmt.Errorf("libvirt: starting domain %q: %w", spec.Name, err)
+	if err := p.ensureRunning(ctx, dom); err != nil {
+		return nil, err
 	}
-	return p.stateOf(dom)
+	return p.stateOf(ctx, dom)
+}
+
+// ensureRunning starts a domain that is defined but not active.
+func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) error {
+	active, err := call(ctx, func() (int32, error) { return p.lv.DomainIsActive(dom) })
+	if err != nil {
+		return fmt.Errorf("libvirt: checking whether domain %q is active: %w", dom.Name, err)
+	}
+	if active == 1 {
+		return nil
+	}
+	if err := callVoid(ctx, func() error { return p.lv.DomainCreate(dom) }); err != nil {
+		return fmt.Errorf("libvirt: starting domain %q: %w", dom.Name, err)
+	}
+	return nil
+}
+
+// resolveBackingPath turns the requested image into a backing-store path.
+//
+// The previous version ignored spec.Image entirely and used the process-wide
+// BaseImage for every machine, so a per-machine image request was silently
+// discarded. It also passed a volume *name* where libvirt expects a *path*.
+func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.StoragePool, img providers.Image) (string, error) {
+	name := img.Name
+	if name == "" {
+		name = p.cfg.BaseImage
+	}
+	if name == "" {
+		// A URL-only image needs fetching into the pool first, which this provider
+		// does not yet do. Failing loudly beats silently booting the wrong image.
+		if img.URL != "" {
+			return "", fmt.Errorf("%w: libvirt: image %q must be present in pool %q; fetching by URL is not implemented", providers.ErrTerminal, img.URL, p.cfg.StoragePool)
+		}
+		return "", fmt.Errorf("%w: libvirt: no image specified and no default base image configured", providers.ErrTerminal)
+	}
+
+	vol, err := call(ctx, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolLookupByName(pool, name)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return "", fmt.Errorf("%w: libvirt: image %q not found in pool %q", providers.ErrTerminal, name, p.cfg.StoragePool)
+		}
+		return "", fmt.Errorf("libvirt: looking up image %q: %w", name, err)
+	}
+	path, err := call(ctx, func() (string, error) { return p.lv.StorageVolGetPath(vol) })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: resolving path for image %q: %w", name, err)
+	}
+	return path, nil
 }
 
 // Get implements providers.MachineProvider.
 func (p *Provider) Get(ctx context.Context, id string) (*providers.MachineState, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	dom, err := p.lookupByUUID(id)
+	dom, err := p.lookupByUUID(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return p.stateOf(dom)
+	return p.stateOf(ctx, dom)
+}
+
+// FindByName implements providers.MachineProvider.
+//
+// Used when a machine exists but its providerID was never persisted, so the
+// name is the only handle the controller has left.
+func (p *Provider) FindByName(ctx context.Context, name string) (*providers.MachineState, error) {
+	dom, err := call(ctx, func() (golibvirt.Domain, error) {
+		return p.lv.DomainLookupByName(name)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, providers.ErrNotFound
+		}
+		return nil, fmt.Errorf("libvirt: looking up domain %q: %w", name, err)
+	}
+	return p.stateOf(ctx, dom)
 }
 
 // Delete implements providers.MachineProvider.
 //
-// Deleting an absent machine succeeds, as the interface requires: teardown is
-// retried, and the second attempt finding nothing is the desired end state.
+// Deleting an absent machine succeeds: teardown is retried, and the second
+// attempt finding nothing is the desired end state.
+//
+// Order matters. Storage is removed BEFORE the domain is undefined, because the
+// domain is the only handle by which a retry can find the volume again. Undefining
+// first and then failing on storage would orphan the qcow2 permanently -- the next
+// attempt looks up the UUID, finds nothing, and returns success while the disk
+// stays on the host forever.
 func (p *Provider) Delete(ctx context.Context, id string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	dom, err := p.lookupByUUID(id)
+	dom, err := p.lookupByUUID(ctx, id)
 	if err != nil {
 		if errors.Is(err, providers.ErrNotFound) {
 			return nil
@@ -175,36 +313,66 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 		return err
 	}
 
-	// A running domain must be destroyed before it can be undefined. A stopped
-	// one returns an error here, which is expected rather than fatal.
-	if err := p.lv.DomainDestroy(dom); err != nil && !isNotFound(err) && !isInvalidState(err) {
+	// A running domain must be stopped before its disk can be removed. A stopped
+	// one reports an invalid-state error here, which is expected rather than fatal.
+	if err := callVoid(ctx, func() error { return p.lv.DomainDestroy(dom) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
 		return fmt.Errorf("libvirt: destroying domain %q: %w", id, err)
 	}
 
-	// Remove the domain's storage along with it. Undefining without this leaves
-	// orphaned qcow2 files that nothing references and nothing reclaims.
-	const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
-	if err := p.lv.DomainUndefineFlags(dom, flags); err != nil && !isNotFound(err) {
-		return fmt.Errorf("libvirt: undefining domain %q: %w", id, err)
+	if err := p.deleteVolume(ctx, dom.Name+".qcow2"); err != nil {
+		return err
 	}
 
-	pool, err := p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
-	if err == nil {
-		if vol, err := p.lv.StorageVolLookupByName(pool, dom.Name+".qcow2"); err == nil {
-			if err := p.lv.StorageVolDelete(vol, 0); err != nil && !isNotFound(err) {
-				return fmt.Errorf("libvirt: deleting volume for %q: %w", id, err)
-			}
-		}
+	const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
+	if err := callVoid(ctx, func() error { return p.lv.DomainUndefineFlags(dom, flags) }); err != nil &&
+		!isNotFound(err) {
+		return fmt.Errorf("libvirt: undefining domain %q: %w", id, err)
 	}
 	return nil
 }
 
-func (p *Provider) lookupByUUID(id string) (golibvirt.Domain, error) {
+// deleteVolume removes a machine's disk, propagating anything that is not a
+// benign "already gone".
+//
+// The previous version swallowed pool and volume lookup errors entirely, so a
+// transient failure here looked like success and left the disk behind.
+func (p *Provider) deleteVolume(ctx context.Context, volName string) error {
+	pool, err := call(ctx, func() (golibvirt.StoragePool, error) {
+		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: storage pool %q while deleting %q: %w", p.cfg.StoragePool, volName, err)
+	}
+
+	vol, err := call(ctx, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolLookupByName(pool, volName)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: looking up volume %q: %w", volName, err)
+	}
+
+	if err := callVoid(ctx, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+		!isNotFound(err) {
+		return fmt.Errorf("libvirt: deleting volume %q: %w", volName, err)
+	}
+	return nil
+}
+
+func (p *Provider) lookupByUUID(ctx context.Context, id string) (golibvirt.Domain, error) {
 	uuid, err := parseUUID(id)
 	if err != nil {
 		return golibvirt.Domain{}, fmt.Errorf("libvirt: %w", err)
 	}
-	dom, err := p.lv.DomainLookupByUUID(uuid)
+	dom, err := call(ctx, func() (golibvirt.Domain, error) {
+		return p.lv.DomainLookupByUUID(uuid)
+	})
 	if err != nil {
 		if isNotFound(err) {
 			return golibvirt.Domain{}, providers.ErrNotFound
@@ -214,34 +382,85 @@ func (p *Provider) lookupByUUID(id string) (golibvirt.Domain, error) {
 	return dom, nil
 }
 
-func (p *Provider) stateOf(dom golibvirt.Domain) (*providers.MachineState, error) {
+func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*providers.MachineState, error) {
 	state := &providers.MachineState{ID: formatUUID(dom.UUID)}
 
-	st, _, err := p.lv.DomainGetState(dom, 0)
+	st, _, err := call2(ctx, func() (int32, int32, error) { return p.lv.DomainGetState(dom, 0) })
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: domain state for %q: %w", state.ID, err)
 	}
 	state.Ready = golibvirt.DomainState(st) == golibvirt.DomainRunning
 
-	// Addresses come from the guest agent or the DHCP lease table, and are simply
-	// absent until the guest has booted far enough to have one. That is not an
-	// error -- the machine is still provisioning.
-	ifaces, err := p.lv.DomainInterfaceAddresses(dom, addrSourceLease, 0)
-	if err == nil {
-		for _, iface := range ifaces {
-			for _, addr := range iface.Addrs {
-				state.Addresses = append(state.Addresses, providers.Address{
-					Type:    providers.AddressTypeInternalIP,
-					Address: addr.Addr,
-				})
-			}
-		}
-	}
+	state.Addresses = p.addressesOf(ctx, dom)
 	state.Addresses = append(state.Addresses, providers.Address{
 		Type:    providers.AddressTypeHostname,
 		Address: dom.Name,
 	})
 	return state, nil
+}
+
+// addressesOf asks the guest agent first and falls back to the DHCP lease table.
+//
+// Order matters: the domain XML installs a QEMU guest agent channel precisely so
+// addresses can be read from inside the guest. Querying only leases -- as the
+// first version did -- made that channel dead weight and meant a guest with a
+// static address, or on a network libvirt does not serve DHCP for, would never
+// report one.
+//
+// Absent addresses are not an error. A machine that has not finished booting
+// simply has none yet.
+func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []providers.Address {
+	for _, source := range []uint32{addrSourceAgent, addrSourceLease} {
+		ifaces, err := call(ctx, func() ([]golibvirt.DomainInterface, error) {
+			return p.lv.DomainInterfaceAddresses(dom, source, 0)
+		})
+		if err != nil {
+			continue
+		}
+		var out []providers.Address
+		for _, iface := range ifaces {
+			for _, addr := range iface.Addrs {
+				out = append(out, providers.Address{
+					Type:    providers.AddressTypeInternalIP,
+					Address: addr.Addr,
+				})
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+// call2 is call for RPCs returning two values plus an error.
+func call2[A, B any](ctx context.Context, fn func() (A, B, error)) (A, B, error) {
+	type result struct {
+		a   A
+		b   B
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		a, b, err := fn()
+		ch <- result{a, b, err}
+	}()
+	select {
+	case <-ctx.Done():
+		var za A
+		var zb B
+		return za, zb, ctx.Err()
+	case r := <-ch:
+		return r.a, r.b, r.err
+	}
+}
+
+func isAlreadyExists(err error) bool {
+	var e golibvirt.Error
+	if errors.As(err, &e) {
+		return golibvirt.ErrorNumber(e.Code) == golibvirt.ErrStorageVolExist
+	}
+	return false
 }
 
 func isNotFound(err error) bool {

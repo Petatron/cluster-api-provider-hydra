@@ -46,6 +46,7 @@ type Provider struct {
 	// Injected failures. Set to make the corresponding call fail.
 	CreateErr error
 	GetErr    error
+	FindErr   error
 	DeleteErr error
 
 	// ReadyOnCreate controls whether machines report Ready immediately. Real
@@ -106,6 +107,21 @@ func (p *Provider) Get(_ context.Context, id string) (*providers.MachineState, e
 		return nil, providers.ErrNotFound
 	}
 	return copyState(state), nil
+}
+
+// FindByName implements providers.MachineProvider.
+func (p *Provider) FindByName(_ context.Context, name string) (*providers.MachineState, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.FindErr != nil {
+		return nil, p.FindErr
+	}
+	id, ok := p.byName[name]
+	if !ok {
+		return nil, providers.ErrNotFound
+	}
+	return copyState(p.machines[id]), nil
 }
 
 // Delete implements providers.MachineProvider. Deleting an absent machine

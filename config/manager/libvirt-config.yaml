@@ -1,0 +1,27 @@
+# Backend configuration for the Hydra provider.
+#
+# These values are site-specific -- they name a storage pool and a base image on
+# your hypervisor -- so there is no correct default. Edit them before deploying.
+#
+# The manager fails fast on startup if the pool or base image is unset. That is
+# deliberate: a provider that guessed where to put machine disks would be far
+# worse than one that refuses to start with a clear message in its logs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: libvirt-config
+data:
+  # libvirt connection URI.
+  uri: "qemu:///system"
+
+  # host:port of a remote libvirt daemon. Leave empty to use the local socket.
+  # Set this when the hypervisor is not the node running this controller --
+  # which, per architectural principle 9, must not be assumed.
+  remoteAddr: ""
+
+  # Storage pool that machine disks are created in. REQUIRED.
+  storagePool: ""
+
+  # Volume name of the base image machines are cloned from. REQUIRED.
+  # Used when a HydraMachine does not name its own image.
+  baseImage: ""

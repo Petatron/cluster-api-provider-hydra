@@ -1,5 +1,12 @@
 # cluster-api-provider-hydra
 
+[![Tests](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/test.yml)
+[![Lint](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/lint.yml)
+[![Verify](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/Petatron/cluster-api-provider-hydra/actions/workflows/verify.yml)
+[![Coverage](https://codecov.io/gh/Petatron/cluster-api-provider-hydra/branch/main/graph/badge.svg)](https://codecov.io/gh/Petatron/cluster-api-provider-hydra)
+[![Cluster API](https://img.shields.io/badge/Cluster%20API-v1.14%20%C2%B7%20contract%20v1beta2-326CE5?logo=kubernetes&logoColor=white)](https://cluster-api.sigs.k8s.io/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
+
 A [Cluster API](https://cluster-api.sigs.k8s.io/) **infrastructure provider** for Hydra. It
 reconciles Cluster API `Machine` objects into real machines on an on-prem hypervisor, starting with
 libvirt/KVM.
@@ -143,6 +150,10 @@ make lint              # golangci-lint
 
 After changing anything under `api/`, run `make generate manifests` — the generated code and CRDs
 are committed, so a diff there means you forgot.
+
+`make test` writes a coverage profile to `cover.out`; `go tool cover -html=cover.out` renders it.
+CI uploads the same file to Codecov, which is where the coverage badge comes from. What counts
+towards it is configured in [`codecov.yml`](./codecov.yml).
 
 ### Running the controller against a cluster
 

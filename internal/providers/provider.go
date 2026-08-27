@@ -31,12 +31,24 @@ import (
 	"fmt"
 )
 
-// ErrNotFound is returned by Get and Delete when the machine does not exist.
+// ErrNotFound is returned by Get and FindByName when the machine does not exist.
 //
-// Callers must distinguish "gone" from "failed": a deleted machine is the
-// desired end state during teardown, and treating it as an error would leave
-// finalizers stuck forever.
+// Delete never returns it: deleting an absent machine is the desired end state
+// during teardown, so it reports success. A provider that returned ErrNotFound
+// from Delete would wedge finalizers forever.
 var ErrNotFound = errors.New("machine not found")
+
+// ErrTerminal marks a failure the provider cannot recover from by retrying.
+//
+// Backends wrap it around configuration-shaped errors -- a missing image, a
+// nonexistent storage pool -- as distinct from an unreachable hypervisor, which
+// is expected to succeed on a later attempt.
+//
+// The distinction has teeth: the controller only raises its terminal
+// ProvisioningFailed condition for these, and a MachineHealthCheck or an
+// operator may act on that condition. Reporting a transient network blip as
+// terminal would invite remediation of a machine that was about to be fine.
+var ErrTerminal = errors.New("terminal provider failure")
 
 // AddressType classifies a machine address, mirroring the Cluster API
 // MachineAddress types the controller surfaces on status.
@@ -75,8 +87,14 @@ type Network struct {
 // API surface, and converting once at the boundary keeps unit handling out of
 // every backend.
 type MachineSpec struct {
-	// Name is the machine's identity, derived from the HydraMachine. Backends
-	// must treat it as the idempotency key -- see MachineProvider.Create.
+	// Name is the machine's identity on the backend, and backends must treat it
+	// as the idempotency key -- see MachineProvider.Create.
+	//
+	// It must be GLOBALLY UNIQUE on the backend, not merely unique within a
+	// Kubernetes namespace. A libvirt domain name is flat: two HydraMachines
+	// called "worker-1" in different namespaces would otherwise adopt, and then
+	// delete, each other's VM. The controller therefore derives this from
+	// namespace, name and object UID rather than from the object name alone.
 	Name string
 
 	VCPUs       int32
@@ -134,6 +152,15 @@ type MachineProvider interface {
 
 	// Get returns the machine's current state, or ErrNotFound.
 	Get(ctx context.Context, id string) (*MachineState, error)
+
+	// FindByName resolves the idempotency key back to a machine, or ErrNotFound.
+	//
+	// This exists for one specific crash window: Create can succeed and the
+	// providerID patch that records its ID can then fail. Deletion would
+	// otherwise find no ID, skip backend cleanup, release the finalizer, and
+	// orphan a running machine permanently. Given only the name, the controller
+	// can still find and remove it.
+	FindByName(ctx context.Context, name string) (*MachineState, error)
 
 	// Delete removes the machine and everything the backend created for it.
 	//

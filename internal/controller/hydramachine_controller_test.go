@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -34,6 +35,15 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers/fake"
 )
+
+// renamedProvider presents another provider under a different backend name, to
+// simulate a providerID written by a different backend.
+type renamedProvider struct {
+	*fake.Provider
+	name string
+}
+
+func (p *renamedProvider) Name() string { return p.name }
 
 var _ = Describe("HydraMachine Reconciler", func() {
 	ctx := context.Background()
@@ -155,7 +165,7 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			// this -- the API rejects that, since it is immutable once set -- so the
 			// orphan is created directly, which is what the real failure leaves
 			// behind anyway.
-			orphan, err := provider.Create(ctx, providers.MachineSpec{Name: machine.Name})
+			orphan, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(machine)})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(provider.Count()).To(Equal(1))
 
@@ -170,8 +180,27 @@ var _ = Describe("HydraMachine Reconciler", func() {
 	})
 
 	Context("failures", func() {
-		It("reports a creation failure through conditions", func() {
-			provider.CreateErr = errors.New("no capacity on host")
+		It("reports a retryable failure without raising the terminal condition", func() {
+			// An unreachable hypervisor will probably work next time. Marking it
+			// terminal invites a MachineHealthCheck to remediate a machine that was
+			// about to be fine.
+			provider.CreateErr = errors.New("hypervisor unreachable")
+
+			_, err := reconcile()
+			Expect(err).To(HaveOccurred())
+
+			ready := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal("ProvisioningFailedRetrying"))
+			Expect(ready.Message).To(ContainSubstring("hypervisor unreachable"))
+
+			Expect(apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)).
+				To(BeNil(), "a retryable error must not raise the terminal condition")
+		})
+
+		It("raises the terminal condition for a failure that will not fix itself", func() {
+			provider.CreateErr = fmt.Errorf("%w: image not found in pool", providers.ErrTerminal)
 
 			_, err := reconcile()
 			Expect(err).To(HaveOccurred())
@@ -179,10 +208,7 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			failed := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)
 			Expect(failed).NotTo(BeNil())
 			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
-			Expect(failed.Message).To(ContainSubstring("no capacity on host"))
-
-			ready := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineReadyCondition)
-			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(failed.Message).To(ContainSubstring("image not found in pool"))
 		})
 
 		It("does not recreate a machine that vanished", func() {
@@ -201,7 +227,104 @@ var _ = Describe("HydraMachine Reconciler", func() {
 		})
 	})
 
+	Context("identity and safety", func() {
+		It("derives a globally unique backend name", func() {
+			// A libvirt domain namespace is flat; a Kubernetes name is not unique
+			// across namespaces. Two machines with the same name must not collide.
+			name := backendName(machine)
+			Expect(name).To(HavePrefix(machine.Namespace + "-" + machine.Name + "-"))
+			Expect(name).NotTo(Equal(machine.Name), "the object name alone is not globally unique")
+
+			other := machine.DeepCopy()
+			other.Namespace = "other-namespace"
+			other.UID = "ffffffff-0000-0000-0000-000000000000"
+			Expect(backendName(other)).NotTo(Equal(name))
+		})
+
+		It("refuses a providerID belonging to another backend", func() {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+
+			// Simulate the controller being pointed at a different backend than the
+			// one that created this machine.
+			r.Provider = &renamedProvider{Provider: provider, name: "proxmox"}
+
+			_, err = reconcile()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("belongs to backend"))
+			Expect(provider.CreateCalls).To(Equal(1), "must not touch the other backend's machine")
+		})
+
+		It("latches provisioned once true, even if the machine later stops", func() {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+
+			_, id, err := providers.ParseProviderID(*machine.Spec.ProviderID)
+			Expect(err).NotTo(HaveOccurred())
+			provider.SetReady(id, true, providers.Address{Type: providers.AddressTypeInternalIP, Address: "10.0.0.5"})
+			_, err = reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*machine.Status.Initialization.Provisioned).To(BeTrue())
+
+			// The VM stops. provisioned is an initialization milestone, so it must
+			// not regress -- that would confuse Cluster API's orchestration. Ready
+			// carries ongoing health instead.
+			provider.SetReady(id, false)
+			_, err = reconcile()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(*machine.Status.Initialization.Provisioned).To(BeTrue(), "provisioned must latch")
+			ready := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse), "Ready should reflect that it stopped")
+		})
+
+		It("keeps polling a running machine until an address appears", func() {
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			_, id, err := providers.ParseProviderID(*machine.Spec.ProviderID)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Running, but only a hostname so far -- which says nothing about
+			// reachability. Addresses arrive later and nothing else triggers a
+			// refresh, so the controller must keep looking.
+			provider.SetReady(id, true, providers.Address{
+				Type: providers.AddressTypeHostname, Address: "worker",
+			})
+			res, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0), "must keep polling for an address")
+
+			provider.SetReady(id, true, providers.Address{
+				Type: providers.AddressTypeInternalIP, Address: "10.0.0.5",
+			})
+			res, err = reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeZero(), "an addressed, ready machine needs no further polling")
+		})
+	})
+
 	Context("deleting", func() {
+		It("deletes a machine whose providerID was never recorded", func() {
+			// The crash window: Create succeeded, the providerID patch did not.
+			// Without a name fallback this releases the finalizer and orphans a
+			// running VM permanently.
+			orphan, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(machine)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(orphan).NotTo(BeNil())
+			Expect(provider.Count()).To(Equal(1))
+
+			patch := client.MergeFrom(machine.DeepCopy())
+			controllerutil.AddFinalizer(machine, MachineFinalizer)
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+			Expect(machine.Spec.ProviderID).To(BeNil(), "precondition: no providerID recorded")
+
+			Expect(k8sClient.Delete(ctx, machine)).To(Succeed())
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.Count()).To(Equal(0), "the unrecorded machine must still be removed")
+		})
+
 		It("removes the machine and releases the finalizer", func() {
 			_, err := reconcile()
 			Expect(err).NotTo(HaveOccurred())
