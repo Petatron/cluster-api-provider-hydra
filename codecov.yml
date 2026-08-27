@@ -1,0 +1,26 @@
+# Coverage comes from `make test`, which runs the envtest suite and writes
+# cover.out. The e2e suite is excluded from that run and from this report.
+#
+# Statuses are informational on purpose: they annotate a pull request with what
+# coverage did without gating the merge. While the provider is a scaffold there
+# is no floor worth defending, and a status that fails for uninteresting reasons
+# is a status people learn to ignore. Set `informational: false` once there is.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true
+
+ignore:
+  - "**/zz_generated.*.go"        # controller-gen output
+  - "api/**/groupversion_info.go" # scheme registration boilerplate
+  - "cmd/main.go"                 # manager wiring; exercised by e2e, not envtest
+  - "test/**"                     # e2e suite and test helpers
