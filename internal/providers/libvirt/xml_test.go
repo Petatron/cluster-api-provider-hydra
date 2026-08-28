@@ -132,3 +132,30 @@ func TestParseUUIDRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// The guest agent reports every interface it can see. Publishing loopback or
+// link-local as InternalIP would be worse than reporting nothing: the controller
+// stops polling once any IP appears, so a loopback arriving first would freeze
+// status at 127.0.0.1 with nothing to correct it.
+func TestIsRoutable(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"192.168.15.42", true},
+		{"10.0.0.5", true},
+		{"2001:db8::1", true},
+
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"169.254.10.5", false},
+		{"fe80::1", false},
+		{"0.0.0.0", false},
+		{"", false},
+		{"not-an-ip", false},
+	} {
+		if got := isRoutable(tc.addr); got != tc.want {
+			t.Errorf("isRoutable(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}

@@ -70,6 +70,19 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Cluster API's paused annotation means "do not touch this object". That
+	// covers deletion as well as creation: an operator pausing a machine to
+	// investigate it would not expect the controller to keep destroying
+	// infrastructure underneath them. The finalizer stays, so deletion resumes
+	// once the annotation is removed.
+	if _, paused := machine.Annotations[clusterv1.PausedAnnotation]; paused {
+		log.V(1).Info("reconciliation is paused by annotation", "name", machine.Name)
+		return ctrl.Result{}, r.setPaused(ctx, machine, true)
+	}
+	if err := r.setPaused(ctx, machine, false); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if !machine.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, machine)
 	}
@@ -276,6 +289,45 @@ func (r *HydraMachineReconciler) updateStatus(ctx context.Context, machine *infr
 
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("updating status: %w", err)
+	}
+	return nil
+}
+
+// setPaused surfaces whether reconciliation is suspended.
+//
+// The contract asks providers to report this through a Paused condition, so an
+// operator can see why a machine has stopped progressing rather than assuming
+// the controller is broken.
+//
+// Note this only checks the annotation on the HydraMachine. The contract also
+// asks for spec.paused on the owning Cluster, which this provider cannot read
+// until Cluster linkage lands in PET-9.
+func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1.HydraMachine, paused bool) error {
+	existing := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachinePausedCondition)
+	if !paused && existing == nil {
+		// Nothing to clear, and no reason to issue a write on every reconcile.
+		return nil
+	}
+	if existing != nil && (existing.Status == metav1.ConditionTrue) == paused {
+		return nil
+	}
+
+	cond := metav1.Condition{
+		Type:    infrav1.MachinePausedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  "NotPaused",
+		Message: "reconciliation is active",
+	}
+	if paused {
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = "Paused"
+		cond.Message = fmt.Sprintf("reconciliation is suspended by the %s annotation", clusterv1.PausedAnnotation)
+	}
+
+	patch := client.MergeFrom(machine.DeepCopy())
+	apimeta.SetStatusCondition(&machine.Status.Conditions, cond)
+	if err := r.Status().Patch(ctx, machine, patch); err != nil {
+		return fmt.Errorf("recording paused state: %w", err)
 	}
 	return nil
 }

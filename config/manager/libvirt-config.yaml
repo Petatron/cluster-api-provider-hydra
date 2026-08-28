@@ -14,9 +14,17 @@ data:
   # libvirt connection URI.
   uri: "qemu:///system"
 
-  # host:port of a remote libvirt daemon. Leave empty to use the local socket.
-  # Set this when the hypervisor is not the node running this controller --
-  # which, per architectural principle 9, must not be assumed.
+  # host:port of a remote libvirt daemon.
+  #
+  # REQUIRED for the in-cluster deployment. Leaving it empty selects the local
+  # socket at /var/run/libvirt/libvirt-sock, which the manager pod does not have:
+  # nothing mounts it, so the manager fails at startup. Local-socket mode is for
+  # `make run` outside the cluster, or for a pod deliberately pinned to the
+  # hypervisor with the socket mounted -- see the commented block in manager.yaml.
+  #
+  # Preferring a remote address is also the honest default: per architectural
+  # principle 9, the controller must not assume it shares a host with the
+  # hypervisor.
   remoteAddr: ""
 
   # Storage pool that machine disks are created in. REQUIRED.

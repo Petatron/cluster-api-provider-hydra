@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -183,11 +184,9 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		return nil, fmt.Errorf("libvirt: looking up domain %q: %w", spec.Name, err)
 	}
 
-	pool, err := call(ctx, func() (golibvirt.StoragePool, error) {
-		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
-	})
+	pool, err := p.lookupPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("libvirt: storage pool %q: %w", p.cfg.StoragePool, err)
+		return nil, err
 	}
 
 	backingPath, err := p.resolveBackingPath(ctx, pool, spec.Image)
@@ -233,22 +232,46 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 	return nil
 }
 
+// lookupPool resolves the configured storage pool.
+//
+// A pool that does not exist is configuration-shaped, not transient: retrying
+// will never conjure it. Classifying it as terminal is what makes the difference
+// between an operator seeing ProvisioningFailed and watching
+// ProvisioningFailedRetrying scroll past forever.
+func (p *Provider) lookupPool(ctx context.Context) (golibvirt.StoragePool, error) {
+	pool, err := call(ctx, func() (golibvirt.StoragePool, error) {
+		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return golibvirt.StoragePool{}, fmt.Errorf("%w: libvirt: storage pool %q does not exist",
+				providers.ErrTerminal, p.cfg.StoragePool)
+		}
+		return golibvirt.StoragePool{}, fmt.Errorf("libvirt: storage pool %q: %w", p.cfg.StoragePool, err)
+	}
+	return pool, nil
+}
+
 // resolveBackingPath turns the requested image into a backing-store path.
 //
 // The previous version ignored spec.Image entirely and used the process-wide
 // BaseImage for every machine, so a per-machine image request was silently
 // discarded. It also passed a volume *name* where libvirt expects a *path*.
 func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.StoragePool, img providers.Image) (string, error) {
+	// A URL-only image must be rejected BEFORE the default is applied. Because
+	// New requires BaseImage, falling through would substitute the default and
+	// silently boot an image the caller never asked for -- an admitted request
+	// producing the wrong machine, which is worse than a clear rejection.
+	if img.Name == "" && img.URL != "" {
+		return "", fmt.Errorf("%w: libvirt: image %q must already exist in pool %q; fetching by URL is not implemented",
+			providers.ErrTerminal, img.URL, p.cfg.StoragePool)
+	}
+
 	name := img.Name
 	if name == "" {
 		name = p.cfg.BaseImage
 	}
 	if name == "" {
-		// A URL-only image needs fetching into the pool first, which this provider
-		// does not yet do. Failing loudly beats silently booting the wrong image.
-		if img.URL != "" {
-			return "", fmt.Errorf("%w: libvirt: image %q must be present in pool %q; fetching by URL is not implemented", providers.ErrTerminal, img.URL, p.cfg.StoragePool)
-		}
 		return "", fmt.Errorf("%w: libvirt: no image specified and no default base image configured", providers.ErrTerminal)
 	}
 
@@ -338,14 +361,14 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 // The previous version swallowed pool and volume lookup errors entirely, so a
 // transient failure here looked like success and left the disk behind.
 func (p *Provider) deleteVolume(ctx context.Context, volName string) error {
-	pool, err := call(ctx, func() (golibvirt.StoragePool, error) {
-		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
-	})
+	pool, err := p.lookupPool(ctx)
 	if err != nil {
-		if isNotFound(err) {
+		// A pool that no longer exists has taken its volumes with it; there is
+		// nothing left to delete, so teardown proceeds rather than wedging.
+		if errors.Is(err, providers.ErrTerminal) {
 			return nil
 		}
-		return fmt.Errorf("libvirt: storage pool %q while deleting %q: %w", p.cfg.StoragePool, volName, err)
+		return fmt.Errorf("while deleting %q: %w", volName, err)
 	}
 
 	vol, err := call(ctx, func() (golibvirt.StorageVol, error) {
@@ -420,6 +443,9 @@ func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []prov
 		var out []providers.Address
 		for _, iface := range ifaces {
 			for _, addr := range iface.Addrs {
+				if !isRoutable(addr.Addr) {
+					continue
+				}
 				out = append(out, providers.Address{
 					Type:    providers.AddressTypeInternalIP,
 					Address: addr.Addr,
@@ -431,6 +457,20 @@ func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []prov
 		}
 	}
 	return nil
+}
+
+// isRoutable rejects addresses that say nothing about how to reach a machine.
+//
+// The guest agent reports every interface it can see, including loopback and
+// IPv6 link-local. Publishing those as InternalIP is actively harmful: the
+// controller stops polling once any IP appears, so a loopback arriving before
+// the real NIC would freeze status at 127.0.0.1 and it would never be corrected.
+func isRoutable(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
 }
 
 // call2 is call for RPCs returning two values plus an error.

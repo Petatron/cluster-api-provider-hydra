@@ -31,6 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers/fake"
@@ -300,6 +302,65 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			res, err = reconcile()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.RequeueAfter).To(BeZero(), "an addressed, ready machine needs no further polling")
+		})
+	})
+
+	Context("pausing", func() {
+		pause := func() {
+			patch := client.MergeFrom(machine.DeepCopy())
+			if machine.Annotations == nil {
+				machine.Annotations = map[string]string{}
+			}
+			machine.Annotations[clusterv1.PausedAnnotation] = "true"
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+		}
+
+		It("creates nothing while paused, and reports why", func() {
+			pause()
+
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.Count()).To(Equal(0), "a paused machine must not be provisioned")
+			Expect(machine.Spec.ProviderID).To(BeNil())
+
+			cond := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachinePausedCondition)
+			Expect(cond).NotTo(BeNil(), "the contract asks for a Paused condition")
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("resumes when the annotation is removed", func() {
+			pause()
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.Count()).To(Equal(0))
+
+			patch := client.MergeFrom(machine.DeepCopy())
+			delete(machine.Annotations, clusterv1.PausedAnnotation)
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+			_, err = reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.Count()).To(Equal(1))
+
+			cond := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachinePausedCondition)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		})
+
+		It("does not destroy infrastructure while paused", func() {
+			// An operator pausing a machine to investigate it would not expect the
+			// controller to keep tearing infrastructure down underneath them.
+			_, err := reconcile()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.Count()).To(Equal(1))
+
+			pause()
+			Expect(k8sClient.Delete(ctx, machine)).To(Succeed())
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.Count()).To(Equal(1), "deletion must wait for the pause to be lifted")
+			Expect(k8sClient.Get(ctx, key, machine)).To(Succeed(), "the finalizer must hold the object")
 		})
 	})
 

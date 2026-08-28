@@ -201,6 +201,10 @@ const (
 	// condition by Cluster API.
 	MachineReadyCondition = "Ready"
 
+	// MachinePausedCondition reports that reconciliation is suspended because the
+	// object carries the Cluster API paused annotation.
+	MachinePausedCondition = "Paused"
+
 	// MachineProvisioningFailedCondition reports a failure the provider cannot
 	// recover from on its own. The v1beta2 contract removed special treatment of
 	// terminal failures, so this condition is the only way such a state reaches

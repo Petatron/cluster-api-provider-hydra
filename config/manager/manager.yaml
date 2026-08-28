@@ -83,6 +83,16 @@ spec:
           - name: LIBVIRT_BASE_IMAGE
             valueFrom:
               configMapKeyRef: {name: libvirt-config, key: baseImage}
+        # [LOCAL-LIBVIRT] To drive libvirt over the host's local socket instead
+        # of a remote address, uncomment this mount AND the volume below, and pin
+        # the pod to the hypervisor node with a nodeSelector. Without the mount
+        # the socket does not exist inside the pod and the manager fails at
+        # startup; without the pin it may land on a node that has no libvirt at
+        # all. A remote address avoids both problems and does not assume the
+        # controller shares a host with the hypervisor.
+        # volumeMounts:
+        #   - name: libvirt-sock
+        #     mountPath: /var/run/libvirt/libvirt-sock
         image: controller:latest
         name: manager
         ports:
@@ -119,4 +129,10 @@ spec:
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager
+      # [LOCAL-LIBVIRT] Companion to the volumeMount above.
+      # volumes:
+      #   - name: libvirt-sock
+      #     hostPath:
+      #       path: /var/run/libvirt/libvirt-sock
+      #       type: Socket
       terminationGracePeriodSeconds: 10
