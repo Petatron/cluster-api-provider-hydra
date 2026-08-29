@@ -25,12 +25,16 @@ import (
 	golibvirt "github.com/digitalocean/go-libvirt"
 )
 
+// testProvider is a Provider with no connection. recycle tolerates that, so the
+// wrappers can be exercised without a hypervisor.
+func testProvider() *Provider { return &Provider{} }
+
 // The whole point of the call wrappers is that a stalled hypervisor cannot hold
 // a reconcile worker forever. go-libvirt's generated API takes no context, so
 // this behaviour lives entirely in these helpers and is worth testing directly.
 
 func TestCallReturnsResultWhenFast(t *testing.T) {
-	got, err := call(context.Background(), func() (int, error) { return 42, nil })
+	got, err := call(context.Background(), testProvider(), func() (int, error) { return 42, nil })
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -41,7 +45,7 @@ func TestCallReturnsResultWhenFast(t *testing.T) {
 
 func TestCallPropagatesError(t *testing.T) {
 	sentinel := errors.New("libvirt said no")
-	if _, err := call(context.Background(), func() (int, error) { return 0, sentinel }); !errors.Is(err, sentinel) {
+	if _, err := call(context.Background(), testProvider(), func() (int, error) { return 0, sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("call() error = %v, want %v", err, sentinel)
 	}
 }
@@ -51,7 +55,7 @@ func TestCallGivesUpWhenContextIsCancelled(t *testing.T) {
 	defer cancel()
 
 	released := make(chan struct{})
-	_, err := call(ctx, func() (int, error) {
+	_, err := call(ctx, testProvider(), func() (int, error) {
 		<-released // a hypervisor that never answers
 		return 1, nil
 	})
@@ -69,7 +73,7 @@ func TestCallVoidGivesUpWhenContextIsCancelled(t *testing.T) {
 	released := make(chan struct{})
 	defer close(released)
 
-	if err := callVoid(ctx, func() error { <-released; return nil }); !errors.Is(err, context.Canceled) {
+	if err := callVoid(ctx, testProvider(), func() error { <-released; return nil }); !errors.Is(err, context.Canceled) {
 		t.Fatalf("callVoid() error = %v, want context.Canceled", err)
 	}
 }
@@ -81,14 +85,14 @@ func TestCall2GivesUpWhenContextIsCancelled(t *testing.T) {
 	released := make(chan struct{})
 	defer close(released)
 
-	_, _, err := call2(ctx, func() (int32, int32, error) { <-released; return 0, 0, nil })
+	_, _, err := call2(ctx, testProvider(), func() (int32, int32, error) { <-released; return 0, 0, nil })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("call2() error = %v, want context.Canceled", err)
 	}
 }
 
 func TestCall2ReturnsBothValues(t *testing.T) {
-	a, b, err := call2(context.Background(), func() (int32, int32, error) { return 7, 9, nil })
+	a, b, err := call2(context.Background(), testProvider(), func() (int32, int32, error) { return 7, 9, nil })
 	if err != nil || a != 7 || b != 9 {
 		t.Fatalf("call2() = (%d, %d, %v), want (7, 9, nil)", a, b, err)
 	}
@@ -151,4 +155,14 @@ func TestErrorClassification(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 	}
+}
+
+// A timeout recycles the connection to release the parked RPC. With no
+// connection there is nothing to drop, and it must not panic -- otherwise the
+// first timeout during startup would take the manager down instead of retrying.
+func TestRecycleToleratesNoConnection(t *testing.T) {
+	testProvider().recycle()
+
+	var nilProvider *Provider
+	nilProvider.recycle()
 }

@@ -198,11 +198,19 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 			}
 			return ctrl.Result{}, fmt.Errorf("deleting machine %q: %w", id, err)
 		}
-	} else if err := r.Provider.DeleteByName(ctx, backendName(machine)); err != nil {
+	}
+
+	// Sweep by name even when the ID delete reported success. Delete succeeds
+	// when the domain is already absent, but an externally undefined domain --
+	// or a lookup losing a race with one -- leaves the name-keyed qcow2 behind.
+	// Releasing the finalizer at that point would orphan the disk with nothing
+	// left referencing it. DeleteByName is idempotent, so the common case where
+	// everything was already removed costs one no-op lookup.
+	if err := r.Provider.DeleteByName(ctx, backendName(machine)); err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{}, fmt.Errorf("deleting unrecorded machine %q: %w", backendName(machine), err)
+		return ctrl.Result{}, fmt.Errorf("removing residual resources for %q: %w", backendName(machine), err)
 	}
 
 	patch := client.MergeFrom(machine.DeepCopy())
@@ -410,11 +418,13 @@ func hasIPAddress(addrs []providers.Address) bool {
 // delete -- each other's VM. The object UID closes that, and also ensures a
 // deleted-and-recreated object does not inherit its predecessor's machine.
 func backendName(machine *infrav1.HydraMachine) string {
-	uid := string(machine.UID)
-	if len(uid) > 8 {
-		uid = uid[:8]
-	}
-	return fmt.Sprintf("%s-%s-%s", machine.Namespace, machine.Name, uid)
+	// The full UID, not a prefix. Eight hex characters is 32 bits, where a
+	// birthday collision becomes plausible in tens of thousands of objects --
+	// and a collision here means two HydraMachines adopting and then deleting
+	// the same VM, which is the exact failure this name exists to prevent.
+	// Trading a guarantee for brevity is a poor bargain when the full value
+	// still leaves the domain and volume names within normal filesystem limits.
+	return fmt.Sprintf("%s-%s-%s", machine.Namespace, machine.Name, machine.UID)
 }
 
 // specFor converts the Kubernetes API object into the backend-neutral spec.
