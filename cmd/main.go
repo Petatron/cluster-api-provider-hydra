@@ -62,7 +62,8 @@ func init() {
 
 // nolint:gocyclo
 func main() {
-	var libvirtURI, libvirtRemoteAddr, libvirtPool, libvirtBaseImage string
+	var libvirtURI, libvirtRemoteAddr, libvirtPool, libvirtBaseImage, libvirtPKIPath string
+	var libvirtInsecure bool
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -74,8 +75,13 @@ func main() {
 	flag.StringVar(&libvirtURI, "libvirt-uri", "qemu:///system",
 		"libvirt connection URI the provider drives.")
 	flag.StringVar(&libvirtRemoteAddr, "libvirt-remote-addr", "",
-		"host:port of a remote libvirt daemon. Empty uses the local socket. Set this when "+
-			"the hypervisor is not the machine running this controller.")
+		"host:port of a remote libvirt daemon. Empty uses the local socket. Remote "+
+			"connections use TLS; set --libvirt-insecure for plaintext TCP over a trusted tunnel.")
+	flag.BoolVar(&libvirtInsecure, "libvirt-insecure", false,
+		"Dial the remote libvirt daemon over raw TCP instead of TLS. Only for a trusted tunnel.")
+	flag.StringVar(&libvirtPKIPath, "libvirt-pki-path", "",
+		"Directory containing clientcert.pem, clientkey.pem and cacert.pem for TLS. "+
+			"Empty uses go-libvirt's default search paths.")
 	flag.StringVar(&libvirtPool, "libvirt-storage-pool", "",
 		"libvirt storage pool that machine disks are created in. Required.")
 	flag.StringVar(&libvirtBaseImage, "libvirt-base-image", "",
@@ -202,6 +208,8 @@ func main() {
 	machineProvider, err := libvirtprovider.New(libvirtprovider.Config{
 		URI:         libvirtURI,
 		RemoteAddr:  libvirtRemoteAddr,
+		Insecure:    libvirtInsecure,
+		PKIPath:     libvirtPKIPath,
 		StoragePool: libvirtPool,
 		BaseImage:   libvirtBaseImage,
 	})
@@ -209,6 +217,9 @@ func main() {
 		setupLog.Error(err, "Failed to connect to libvirt",
 			"uri", libvirtURI, "remoteAddr", libvirtRemoteAddr)
 		os.Exit(1)
+	}
+	if libvirtInsecure && libvirtRemoteAddr != "" {
+		setupLog.Info("Using plaintext TCP to reach libvirt; this is only safe across a trusted tunnel")
 	}
 	defer func() {
 		if err := machineProvider.Close(); err != nil {

@@ -94,6 +94,33 @@ func TestCall2ReturnsBothValues(t *testing.T) {
 	}
 }
 
+func TestWithRPCDeadlinePreservesExistingDeadline(t *testing.T) {
+	p := &Provider{cfg: Config{RPCTimeout: time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	got, stop := p.withRPCDeadline(ctx)
+	defer stop()
+
+	gotDeadline, ok := got.Deadline()
+	if !ok {
+		t.Fatal("expected the existing deadline to be kept")
+	}
+	want, _ := ctx.Deadline()
+	if !gotDeadline.Equal(want) {
+		t.Fatalf("withRPCDeadline mutated a context that already had a deadline")
+	}
+}
+
+func TestWithRPCDeadlineAddsOneWhenMissing(t *testing.T) {
+	p := &Provider{cfg: Config{RPCTimeout: 50 * time.Millisecond}}
+	got, stop := p.withRPCDeadline(context.Background())
+	defer stop()
+	if _, ok := got.Deadline(); !ok {
+		t.Fatal("expected a deadline on a context that had none")
+	}
+}
+
 // Error classification decides whether a machine is treated as absent, as
 // already-present, or as a real failure. Getting these wrong makes teardown wedge
 // or makes a retry loop forever, so each mapping is pinned.

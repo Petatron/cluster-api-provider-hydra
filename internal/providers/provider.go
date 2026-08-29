@@ -167,6 +167,15 @@ type MachineProvider interface {
 	// Deleting a machine that does not exist MUST succeed. Teardown is retried,
 	// and the second attempt finding nothing is success, not failure.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteByName removes the machine and any partial resources keyed by the
+	// idempotency name -- including a clone volume whose domain was never
+	// defined. Create can crash after allocating the volume and before defining
+	// the domain; FindByName would then report not-found and deletion would
+	// release the finalizer, permanently leaving the qcow2 behind.
+	//
+	// As with Delete, removing nothing succeeds.
+	DeleteByName(ctx context.Context, name string) error
 }
 
 // ProviderID renders the Cluster API providerID for a machine.

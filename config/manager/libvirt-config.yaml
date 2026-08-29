@@ -14,7 +14,8 @@ data:
   # libvirt connection URI.
   uri: "qemu:///system"
 
-  # host:port of a remote libvirt daemon.
+  # host:port of a remote libvirt daemon (TLS port 16514, or 16509 with
+  # insecure: "true").
   #
   # REQUIRED for the in-cluster deployment. Leaving it empty selects the local
   # socket at /var/run/libvirt/libvirt-sock, which the manager pod does not have:
@@ -22,10 +23,21 @@ data:
   # `make run` outside the cluster, or for a pod deliberately pinned to the
   # hypervisor with the socket mounted -- see the commented block in manager.yaml.
   #
+  # Remote connections use TLS. Privileged domain RPCs must not cross an
+  # untrusted network in the clear. Set insecure to "true" only for a trusted
+  # tunnel (SSH, WireGuard). Mount client PKI at pkiPath -- see manager.yaml.
+  #
   # Preferring a remote address is also the honest default: per architectural
   # principle 9, the controller must not assume it shares a host with the
   # hypervisor.
   remoteAddr: ""
+
+  # "true" dials remoteAddr over raw TCP instead of TLS. Default "false".
+  insecure: "false"
+
+  # Directory inside the container with clientcert.pem, clientkey.pem and
+  # cacert.pem. Unused when insecure is "true" or remoteAddr is empty.
+  pkiPath: "/etc/pki/libvirt"
 
   # Storage pool that machine disks are created in. REQUIRED.
   storagePool: ""

@@ -52,6 +52,11 @@ type Provider struct {
 	// ReadyOnCreate controls whether machines report Ready immediately. Real
 	// backends usually do not, so the default of false is the honest one.
 	ReadyOnCreate bool
+
+	// partials are names that have leftover resources but no machine -- a
+	// volume created before DomainDefineXML failed. DeleteByName must remove
+	// these; FindByName cannot see them.
+	partials map[string]struct{}
 }
 
 // New returns an empty fake provider.
@@ -59,8 +64,11 @@ func New() *Provider {
 	return &Provider{
 		machines: map[string]*providers.MachineState{},
 		byName:   map[string]string{},
+		partials: map[string]struct{}{},
 	}
 }
+
+var _ providers.MachineProvider = (*Provider)(nil)
 
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "fake" }
@@ -134,9 +142,30 @@ func (p *Provider) Delete(_ context.Context, id string) error {
 	if p.DeleteErr != nil {
 		return p.DeleteErr
 	}
+	p.deleteLocked(id)
+	return nil
+}
+
+// DeleteByName implements providers.MachineProvider.
+func (p *Provider) DeleteByName(_ context.Context, name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.DeleteCalls++
+	if p.DeleteErr != nil {
+		return p.DeleteErr
+	}
+	delete(p.partials, name)
+	if id, ok := p.byName[name]; ok {
+		p.deleteLocked(id)
+	}
+	return nil
+}
+
+func (p *Provider) deleteLocked(id string) {
 	state, ok := p.machines[id]
 	if !ok {
-		return nil
+		return
 	}
 	for name, mappedID := range p.byName {
 		if mappedID == state.ID {
@@ -145,7 +174,21 @@ func (p *Provider) Delete(_ context.Context, id string) error {
 		}
 	}
 	delete(p.machines, id)
-	return nil
+}
+
+// AddPartial records leftover resources for a name that has no machine, so a
+// test can assert DeleteByName still cleans them up.
+func (p *Provider) AddPartial(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.partials[name] = struct{}{}
+}
+
+// PartialCount returns how many name-keyed leftovers currently exist.
+func (p *Provider) PartialCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.partials)
 }
 
 // SetReady marks a machine ready, simulating a backend finishing provisioning

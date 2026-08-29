@@ -135,8 +135,8 @@ func TestParseUUIDRejectsGarbage(t *testing.T) {
 
 // The guest agent reports every interface it can see. Publishing loopback or
 // link-local as InternalIP would be worse than reporting nothing: the controller
-// stops polling once any IP appears, so a loopback arriving first would freeze
-// status at 127.0.0.1 with nothing to correct it.
+// treats any IP as addressed and drops to a slow health interval, so a loopback
+// arriving first would freeze status at 127.0.0.1.
 func TestIsRoutable(t *testing.T) {
 	for _, tc := range []struct {
 		addr string

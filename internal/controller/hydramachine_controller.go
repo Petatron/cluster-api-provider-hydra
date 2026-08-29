@@ -44,6 +44,12 @@ const MachineFinalizer = "hydramachine.infrastructure.cluster.x-k8s.io/finalizer
 // exists but is not yet reporting ready.
 const requeueWhileProvisioning = 15 * time.Second
 
+// requeueWhileHealthy is how often to re-check a machine that already looks
+// fine. Once Ready and addressed, there is no backend event source, so without
+// this a vanished or stopped VM would stay Ready=True until an unrelated
+// Kubernetes event or controller-runtime's roughly 10-hour cache resync.
+const requeueWhileHealthy = 5 * time.Minute
+
 // HydraMachineReconciler reconciles a HydraMachine object
 type HydraMachineReconciler struct {
 	client.Client
@@ -118,11 +124,13 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, machine *i
 	// has not yet reported an address. Addresses arrive from the guest agent or a
 	// DHCP lease some time after the domain starts, and this controller watches no
 	// secondary resources -- so stopping at Ready would leave the address list
-	// permanently empty for most machines.
+	// permanently empty for most machines. Once addressed, keep a slower health
+	// requeue: a later vanished VM would otherwise stay Ready=True until an
+	// unrelated event or the default cache resync.
 	if !state.Ready || !hasIPAddress(state.Addresses) {
 		return ctrl.Result{RequeueAfter: requeueWhileProvisioning}, nil
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueWhileHealthy}, nil
 }
 
 // ensureMachine returns the machine's current state, creating it if it does not
@@ -138,9 +146,11 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, machine *inf
 			if errors.Is(err, providers.ErrNotFound) {
 				// The machine was deleted out from under us. Recreating is not an
 				// option: providerID is immutable and a new machine would get a new
-				// ID, so the Node association would be wrong. Surface it and let a
-				// human or a MachineHealthCheck decide to replace the object.
-				return nil, fmt.Errorf("backing machine %q no longer exists; the HydraMachine must be replaced", id)
+				// ID, so the Node association would be wrong. Surface it as terminal
+				// so an operator or MachineHealthCheck replaces the object rather
+				// than retrying forever.
+				return nil, fmt.Errorf("%w: backing machine %q no longer exists; the HydraMachine must be replaced",
+					providers.ErrTerminal, id)
 			}
 			return nil, fmt.Errorf("querying machine %q: %w", id, err)
 		}
@@ -188,6 +198,11 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 			}
 			return ctrl.Result{}, fmt.Errorf("deleting machine %q: %w", id, err)
 		}
+	} else if err := r.Provider.DeleteByName(ctx, backendName(machine)); err != nil {
+		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, fmt.Errorf("deleting unrecorded machine %q: %w", backendName(machine), err)
 	}
 
 	patch := client.MergeFrom(machine.DeepCopy())
@@ -205,7 +220,8 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 // unhandled, deletion would skip cleanup, release the finalizer, and orphan a
 // running VM permanently -- so the name is used as a second handle.
 //
-// Returns an empty ID when there is genuinely nothing to delete.
+// Returns an empty ID when no providerID was persisted, in which case the
+// caller must DeleteByName so a volume-only leftover is still removed.
 func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, machine *infrav1.HydraMachine) (string, error) {
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 		id, err := r.machineIDFor(*machine.Spec.ProviderID)
@@ -268,10 +284,11 @@ func (r *HydraMachineReconciler) updateStatus(ctx context.Context, machine *infr
 	machine.Status.Addresses = toMachineAddresses(state.Addresses)
 
 	cond := metav1.Condition{
-		Type:    infrav1.MachineReadyCondition,
-		Status:  metav1.ConditionFalse,
-		Reason:  "Provisioning",
-		Message: "waiting for the backing machine to become ready",
+		Type:               infrav1.MachineReadyCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Provisioning",
+		Message:            "waiting for the backing machine to become ready",
+		ObservedGeneration: machine.Generation,
 	}
 	if state.Ready {
 		cond.Status = metav1.ConditionTrue
@@ -313,10 +330,11 @@ func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1
 	}
 
 	cond := metav1.Condition{
-		Type:    infrav1.MachinePausedCondition,
-		Status:  metav1.ConditionFalse,
-		Reason:  "NotPaused",
-		Message: "reconciliation is active",
+		Type:               infrav1.MachinePausedCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             "NotPaused",
+		Message:            "reconciliation is active",
+		ObservedGeneration: machine.Generation,
 	}
 	if paused {
 		cond.Status = metav1.ConditionTrue
@@ -350,17 +368,19 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-		Type:    infrav1.MachineReadyCondition,
-		Status:  metav1.ConditionFalse,
-		Reason:  reason,
-		Message: cause.Error(),
+		Type:               infrav1.MachineReadyCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            cause.Error(),
+		ObservedGeneration: machine.Generation,
 	})
 	if terminal {
 		apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
-			Type:    infrav1.MachineProvisioningFailedCondition,
-			Status:  metav1.ConditionTrue,
-			Reason:  reason,
-			Message: cause.Error(),
+			Type:               infrav1.MachineProvisioningFailedCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             reason,
+			Message:            cause.Error(),
+			ObservedGeneration: machine.Generation,
 		})
 	}
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {

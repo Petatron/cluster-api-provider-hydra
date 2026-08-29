@@ -136,11 +136,13 @@ var _ = Describe("HydraMachine Reconciler", func() {
 
 			res, err := reconcile()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res.RequeueAfter).To(BeZero(), "a ready machine should not be re-polled")
+			Expect(res.RequeueAfter).To(Equal(requeueWhileHealthy),
+				"a ready machine is re-checked slowly so a later vanished VM is observed")
 
 			Expect(*machine.Status.Initialization.Provisioned).To(BeTrue())
 			cond := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineReadyCondition)
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.ObservedGeneration).To(Equal(machine.Generation))
 			Expect(machine.Status.Addresses[0].Address).To(Equal("192.168.15.42"))
 		})
 
@@ -226,6 +228,10 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("must be replaced"))
 			Expect(provider.CreateCalls).To(Equal(1), "no attempt to recreate")
+
+			failed := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)
+			Expect(failed).NotTo(BeNil(), "vanishing is terminal: the object cannot be repaired by retrying")
+			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
 		})
 	})
 
@@ -301,7 +307,8 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			})
 			res, err = reconcile()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(res.RequeueAfter).To(BeZero(), "an addressed, ready machine needs no further polling")
+			Expect(res.RequeueAfter).To(Equal(requeueWhileHealthy),
+				"an addressed, ready machine is re-checked on a health interval")
 		})
 	})
 
@@ -414,6 +421,25 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			Expect(k8sClient.Get(ctx, key, machine)).To(Succeed())
 			Expect(controllerutil.ContainsFinalizer(machine, MachineFinalizer)).To(BeTrue(),
 				"a failed delete must not release the object and strand the machine")
+		})
+
+		It("removes leftover storage when Create never defined a domain", func() {
+			// Create can allocate a volume and then fail before DomainDefineXML.
+			// FindByName only sees domains, so without DeleteByName this would
+			// release the finalizer and leave the qcow2 behind forever.
+			provider.AddPartial(backendName(machine))
+			Expect(provider.PartialCount()).To(Equal(1))
+
+			patch := client.MergeFrom(machine.DeepCopy())
+			controllerutil.AddFinalizer(machine, MachineFinalizer)
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+			Expect(machine.Spec.ProviderID).To(BeNil(), "precondition: no providerID recorded")
+
+			Expect(k8sClient.Delete(ctx, machine)).To(Succeed())
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.PartialCount()).To(Equal(0), "the leftover volume must still be removed")
 		})
 
 		It("succeeds when the machine is already gone", func() {

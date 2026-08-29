@@ -30,13 +30,19 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
-	"github.com/digitalocean/go-libvirt/socket/dialers"
 
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
+
+// defaultRPCTimeout bounds a provider call when the caller did not set a
+// deadline. DialTimeout only covers connection establishment; without this, a
+// libvirt that accepts the TCP handshake and then stops answering would hold a
+// reconcile worker until manager shutdown.
+const defaultRPCTimeout = 30 * time.Second
 
 // call runs a libvirt RPC under the caller's context.
 //
@@ -95,9 +101,19 @@ type Config struct {
 	// qemu:///system over the local socket.
 	URI string
 
-	// RemoteAddr, when set, dials libvirt over TCP instead of a local socket.
-	// This is the case principle 9 exists for.
+	// RemoteAddr, when set, is host or host:port of a remote libvirt daemon.
+	// Remote connections use TLS (libvirt's default listen, port 16514). Set
+	// Insecure to use plaintext TCP instead, and only then across a trusted
+	// tunnel.
 	RemoteAddr string
+
+	// Insecure dials RemoteAddr over raw TCP rather than TLS. Privileged
+	// domain RPCs travel in the clear, so this is for a trusted tunnel only.
+	Insecure bool
+
+	// PKIPath is a directory containing clientcert.pem, clientkey.pem and
+	// cacert.pem. Empty uses go-libvirt's default search paths.
+	PKIPath string
 
 	// StoragePool is the libvirt pool that machine disks are created in.
 	StoragePool string
@@ -105,15 +121,25 @@ type Config struct {
 	// BaseImage is the volume name of the backing image machines are cloned from.
 	BaseImage string
 
-	// DialTimeout bounds connection establishment. Defaults to 10s.
+	// DialTimeout bounds connection establishment. Defaults to 10s. TLS
+	// connections use go-libvirt's own dial timeout; this applies to the local
+	// socket and to Insecure TCP.
 	DialTimeout time.Duration
+
+	// RPCTimeout bounds each exported provider call when the caller did not
+	// set a deadline. Defaults to 30s.
+	RPCTimeout time.Duration
 }
 
 // Provider implements providers.MachineProvider against libvirt.
 type Provider struct {
 	cfg Config
 	lv  *golibvirt.Libvirt
+	uri golibvirt.ConnectURI
+	mu  sync.Mutex
 }
+
+var _ providers.MachineProvider = (*Provider)(nil)
 
 // New connects to libvirt and returns a Provider.
 //
@@ -122,6 +148,9 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = 10 * time.Second
 	}
+	if cfg.RPCTimeout == 0 {
+		cfg.RPCTimeout = defaultRPCTimeout
+	}
 	if cfg.StoragePool == "" {
 		return nil, errors.New("libvirt: StoragePool is required")
 	}
@@ -129,14 +158,11 @@ func New(cfg Config) (*Provider, error) {
 		return nil, errors.New("libvirt: BaseImage is required")
 	}
 
-	var lv *golibvirt.Libvirt
-	if cfg.RemoteAddr != "" {
-		lv = golibvirt.NewWithDialer(dialers.NewRemote(
-			cfg.RemoteAddr, dialers.WithRemoteTimeout(cfg.DialTimeout)))
-	} else {
-		lv = golibvirt.NewWithDialer(dialers.NewLocal(
-			dialers.WithLocalTimeout(cfg.DialTimeout)))
+	dialer, err := newDialer(cfg)
+	if err != nil {
+		return nil, err
 	}
+	lv := golibvirt.NewWithDialer(dialer)
 
 	uri := golibvirt.QEMUSystem
 	if cfg.URI != "" {
@@ -145,11 +171,46 @@ func New(cfg Config) (*Provider, error) {
 	if err := lv.ConnectToURI(uri); err != nil {
 		return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, err)
 	}
-	return &Provider{cfg: cfg, lv: lv}, nil
+	return &Provider{cfg: cfg, lv: lv, uri: uri}, nil
 }
 
 // Close releases the libvirt connection.
 func (p *Provider) Close() error { return p.lv.Disconnect() }
+
+// begin arms a deadline and reconnects if libvirtd dropped us. Every exported
+// method goes through here so a stalled RPC cannot occupy a reconcile worker
+// until process exit, and so a WAN blip does not require a pod restart.
+func (p *Provider) begin(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	ctx, cancel := p.withRPCDeadline(ctx)
+	if err := p.ensureConnected(); err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return ctx, cancel, nil
+}
+
+func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	t := p.cfg.RPCTimeout
+	if t == 0 {
+		t = defaultRPCTimeout
+	}
+	return context.WithTimeout(ctx, t)
+}
+
+func (p *Provider) ensureConnected() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lv.IsConnected() {
+		return nil
+	}
+	if err := p.lv.ConnectToURI(p.uri); err != nil {
+		return fmt.Errorf("libvirt: reconnecting to %q: %w", p.uri, err)
+	}
+	return nil
+}
 
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "libvirt" }
@@ -159,6 +220,12 @@ func (p *Provider) Name() string { return "libvirt" }
 // Idempotent on spec.Name, as the interface requires: an existing domain with
 // that name is returned rather than a second one being defined.
 func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*providers.MachineState, error) {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+
 	// Idempotency, and more than a lookup. Every interruption point below leaves
 	// a different partial state, and each one has to be recoverable:
 	//
@@ -209,6 +276,10 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		return p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName))
 	})
 	if err != nil {
+		// Roll back the volume so a failed define does not leave a qcow2 that
+		// FindByName cannot see. A crash in this window is recovered by
+		// DeleteByName, which removes the volume even when no domain exists.
+		_ = p.deleteVolume(ctx, volName)
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
@@ -293,6 +364,12 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 
 // Get implements providers.MachineProvider.
 func (p *Provider) Get(ctx context.Context, id string) (*providers.MachineState, error) {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+
 	dom, err := p.lookupByUUID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -305,6 +382,12 @@ func (p *Provider) Get(ctx context.Context, id string) (*providers.MachineState,
 // Used when a machine exists but its providerID was never persisted, so the
 // name is the only handle the controller has left.
 func (p *Provider) FindByName(ctx context.Context, name string) (*providers.MachineState, error) {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+
 	dom, err := call(ctx, func() (golibvirt.Domain, error) {
 		return p.lv.DomainLookupByName(name)
 	})
@@ -328,6 +411,12 @@ func (p *Provider) FindByName(ctx context.Context, name string) (*providers.Mach
 // attempt looks up the UUID, finds nothing, and returns success while the disk
 // stays on the host forever.
 func (p *Provider) Delete(ctx context.Context, id string) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
 	dom, err := p.lookupByUUID(ctx, id)
 	if err != nil {
 		if errors.Is(err, providers.ErrNotFound) {
@@ -335,12 +424,41 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 		}
 		return err
 	}
+	return p.deleteDomain(ctx, dom)
+}
 
+// DeleteByName implements providers.MachineProvider.
+func (p *Provider) DeleteByName(ctx context.Context, name string) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	dom, err := call(ctx, func() (golibvirt.Domain, error) {
+		return p.lv.DomainLookupByName(name)
+	})
+	switch {
+	case err == nil:
+		return p.deleteDomain(ctx, dom)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case !isNotFound(err):
+		return fmt.Errorf("libvirt: looking up domain %q: %w", name, err)
+	}
+	// No domain. Create can leave a clone volume behind if it crashes after
+	// StorageVolCreateXML and before DomainDefineXML; FindByName would report
+	// not-found and the controller would release the finalizer. Removing the
+	// volume here closes that window.
+	return p.deleteVolume(ctx, name+".qcow2")
+}
+
+func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error {
 	// A running domain must be stopped before its disk can be removed. A stopped
 	// one reports an invalid-state error here, which is expected rather than fatal.
 	if err := callVoid(ctx, func() error { return p.lv.DomainDestroy(dom) }); err != nil &&
 		!isNotFound(err) && !isInvalidState(err) {
-		return fmt.Errorf("libvirt: destroying domain %q: %w", id, err)
+		return fmt.Errorf("libvirt: destroying domain %q: %w", dom.Name, err)
 	}
 
 	if err := p.deleteVolume(ctx, dom.Name+".qcow2"); err != nil {
@@ -350,7 +468,7 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 	const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
 	if err := callVoid(ctx, func() error { return p.lv.DomainUndefineFlags(dom, flags) }); err != nil &&
 		!isNotFound(err) {
-		return fmt.Errorf("libvirt: undefining domain %q: %w", id, err)
+		return fmt.Errorf("libvirt: undefining domain %q: %w", dom.Name, err)
 	}
 	return nil
 }
@@ -363,12 +481,15 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 func (p *Provider) deleteVolume(ctx context.Context, volName string) error {
 	pool, err := p.lookupPool(ctx)
 	if err != nil {
-		// A pool that no longer exists has taken its volumes with it; there is
-		// nothing left to delete, so teardown proceeds rather than wedging.
-		if errors.Is(err, providers.ErrTerminal) {
-			return nil
-		}
-		return fmt.Errorf("while deleting %q: %w", volName, err)
+		// A missing pool definition does not mean the qcow2 is gone: pools can
+		// be undefined while their files remain on disk. Treating that as
+		// success lets deletion undefine the domain and release the finalizer,
+		// permanently orphaning the disk. Propagate so teardown retries once
+		// the pool is restored. Do not wrap ErrTerminal: a missing pool during
+		// teardown is expected to recover, and a terminal condition would invite
+		// remediation of a machine that is being deleted.
+		return fmt.Errorf("libvirt: storage pool %q is unavailable while deleting %q: %v",
+			p.cfg.StoragePool, volName, err)
 	}
 
 	vol, err := call(ctx, func() (golibvirt.StorageVol, error) {
@@ -463,8 +584,8 @@ func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []prov
 //
 // The guest agent reports every interface it can see, including loopback and
 // IPv6 link-local. Publishing those as InternalIP is actively harmful: the
-// controller stops polling once any IP appears, so a loopback arriving before
-// the real NIC would freeze status at 127.0.0.1 and it would never be corrected.
+// controller treats any IP as "addressed" and drops to a slow health interval,
+// so a loopback arriving before the real NIC would freeze status at 127.0.0.1.
 func isRoutable(addr string) bool {
 	ip := net.ParseIP(addr)
 	if ip == nil {
