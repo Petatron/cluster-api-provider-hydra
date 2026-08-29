@@ -27,6 +27,7 @@ package libvirt
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net"
@@ -157,7 +158,7 @@ var _ providers.MachineProvider = (*Provider)(nil)
 // New connects to libvirt and returns a Provider.
 //
 // The caller owns the connection and must call Close.
-func New(cfg Config) (*Provider, error) {
+func New(ctx context.Context, cfg Config) (*Provider, error) {
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = 10 * time.Second
 	}
@@ -181,8 +182,31 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.URI != "" {
 		uri = golibvirt.ConnectURI(cfg.URI)
 	}
-	if err := lv.ConnectToURI(uri); err != nil {
-		return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, err)
+
+	// The initial handshake needs the same deadline as everything else.
+	// ConnectToURI does not take a context, and go-libvirt's connect and
+	// authentication exchange waits indefinitely for replies -- so a daemon that
+	// accepts the socket and then stops answering would hang manager startup
+	// forever, with no reconcile loop yet running to time out.
+	//
+	// DialTimeout alone does not cover this: it bounds establishing the
+	// connection, not the protocol exchange that follows.
+	ctx, cancel := context.WithTimeout(ctx, cfg.DialTimeout+cfg.RPCTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- lv.ConnectToURI(uri) }()
+
+	select {
+	case <-ctx.Done():
+		// Closing the transport releases the parked handshake rather than leaving
+		// it attached to a connection nothing will ever read.
+		_ = lv.Disconnect()
+		return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, ctx.Err())
+	case err := <-done:
+		if err != nil {
+			return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, err)
+		}
 	}
 	return &Provider{cfg: cfg, lv: lv, uri: uri}, nil
 }
@@ -344,7 +368,9 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		// Roll back the volume so a failed define does not leave a qcow2 that
 		// FindByName cannot see. A crash in this window is recovered by
 		// DeleteByName, which removes the volume even when no domain exists.
-		_ = p.deleteVolume(ctx, volName)
+		// This volume was just created in the configured pool, so that is the
+		// right place to look -- unlike deletion, which must consult the domain.
+		_ = p.deleteVolume(ctx, p.cfg.StoragePool, volName)
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
@@ -375,15 +401,24 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 // between an operator seeing ProvisioningFailed and watching
 // ProvisioningFailedRetrying scroll past forever.
 func (p *Provider) lookupPool(ctx context.Context) (golibvirt.StoragePool, error) {
+	return p.lookupPoolNamed(ctx, p.cfg.StoragePool)
+}
+
+// lookupPoolNamed resolves a pool by name, so deletion can target the pool the
+// domain was actually built in rather than whatever is configured now.
+func (p *Provider) lookupPoolNamed(ctx context.Context, name string) (golibvirt.StoragePool, error) {
+	if name == "" {
+		name = p.cfg.StoragePool
+	}
 	pool, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
-		return p.lv.StoragePoolLookupByName(p.cfg.StoragePool)
+		return p.lv.StoragePoolLookupByName(name)
 	})
 	if err != nil {
 		if isNotFound(err) {
 			return golibvirt.StoragePool{}, fmt.Errorf("%w: libvirt: storage pool %q does not exist",
-				providers.ErrTerminal, p.cfg.StoragePool)
+				providers.ErrTerminal, name)
 		}
-		return golibvirt.StoragePool{}, fmt.Errorf("libvirt: storage pool %q: %w", p.cfg.StoragePool, err)
+		return golibvirt.StoragePool{}, fmt.Errorf("libvirt: storage pool %q: %w", name, err)
 	}
 	return pool, nil
 }
@@ -515,7 +550,9 @@ func (p *Provider) DeleteByName(ctx context.Context, name string) error {
 	// StorageVolCreateXML and before DomainDefineXML; FindByName would report
 	// not-found and the controller would release the finalizer. Removing the
 	// volume here closes that window.
-	return p.deleteVolume(ctx, name+".qcow2")
+	// A domain-less leftover can only have come from this provider's own
+	// Create, which uses the configured pool.
+	return p.deleteVolume(ctx, p.cfg.StoragePool, name+".qcow2")
 }
 
 func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error {
@@ -526,8 +563,20 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 		return fmt.Errorf("libvirt: destroying domain %q: %w", dom.Name, err)
 	}
 
-	if err := p.deleteVolume(ctx, dom.Name+".qcow2"); err != nil {
+	// Resolve the disk from the domain itself rather than from current config.
+	// The configured pool can change between the machine being created and being
+	// deleted -- a redeploy with a different --libvirt-storage-pool is enough --
+	// and looking in the new pool would report the volume absent, undefine the
+	// domain, and strand the real disk in the old pool with nothing left pointing
+	// at it.
+	pool, volName, err := p.diskSourceOf(ctx, dom)
+	if err != nil {
 		return err
+	}
+	if volName != "" {
+		if err := p.deleteVolume(ctx, pool, volName); err != nil {
+			return err
+		}
 	}
 
 	const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
@@ -543,8 +592,39 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 //
 // The previous version swallowed pool and volume lookup errors entirely, so a
 // transient failure here looked like success and left the disk behind.
-func (p *Provider) deleteVolume(ctx context.Context, volName string) error {
-	pool, err := p.lookupPool(ctx)
+// diskSourceOf reads the pool and volume backing a domain out of its own XML.
+//
+// Returns an empty volume name when the domain has no pool-backed disk, which is
+// not an error: there is simply nothing for this provider to reclaim.
+func (p *Provider) diskSourceOf(ctx context.Context, dom golibvirt.Domain) (pool, volume string, err error) {
+	desc, err := call(ctx, p, func() (string, error) {
+		return p.lv.DomainGetXMLDesc(dom, 0)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("libvirt: reading domain XML for %q: %w", dom.Name, err)
+	}
+
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(desc), &parsed); err != nil {
+		return "", "", fmt.Errorf("libvirt: parsing domain XML for %q: %w", dom.Name, err)
+	}
+	for _, d := range parsed.Devices.Disks {
+		if d.Source.Volume != "" {
+			p := d.Source.Pool
+			if p == "" {
+				p = pool
+			}
+			return p, d.Source.Volume, nil
+		}
+	}
+	return "", "", nil
+}
+
+func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) error {
+	pool, err := p.lookupPoolNamed(ctx, poolName)
 	if err != nil {
 		// A missing pool definition does not mean the qcow2 is gone: pools can
 		// be undefined while their files remain on disk. Treating that as
@@ -600,8 +680,11 @@ func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*provider
 	}
 	state.Ready = golibvirt.DomainState(st) == golibvirt.DomainRunning
 
-	state.Addresses = p.addressesOf(ctx, dom)
-	state.Addresses = append(state.Addresses, providers.Address{
+	addrs, err := p.addressesOf(ctx, dom)
+	if err != nil {
+		return nil, err
+	}
+	state.Addresses = append(addrs, providers.Address{
 		Type:    providers.AddressTypeHostname,
 		Address: dom.Name,
 	})
@@ -618,12 +701,19 @@ func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*provider
 //
 // Absent addresses are not an error. A machine that has not finished booting
 // simply has none yet.
-func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []providers.Address {
+func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) ([]providers.Address, error) {
 	for _, source := range []uint32{addrSourceAgent, addrSourceLease} {
 		ifaces, err := call(ctx, p, func() ([]golibvirt.DomainInterface, error) {
 			return p.lv.DomainInterfaceAddresses(dom, source, 0)
 		})
 		if err != nil {
+			// A source being unavailable is ordinary -- no guest agent, no lease --
+			// and the next source is tried. Cancellation is not: swallowing it would
+			// report "no addresses yet" for a call that never actually completed,
+			// and the contract requires cancellation to reach the caller.
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("libvirt: querying addresses for %q: %w", dom.Name, ctx.Err())
+			}
 			continue
 		}
 		var out []providers.Address
@@ -639,10 +729,10 @@ func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) []prov
 			}
 		}
 		if len(out) > 0 {
-			return out
+			return out, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // isRoutable rejects addresses that say nothing about how to reach a machine.

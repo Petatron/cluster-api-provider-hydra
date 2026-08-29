@@ -205,7 +205,13 @@ func main() {
 	// The backend is constructed here and injected, so the reconciler depends on
 	// the MachineProvider interface rather than on libvirt. Adding a second
 	// backend is a change to this block, not to the controller.
-	machineProvider, err := libvirtprovider.New(libvirtprovider.Config{
+	// SetupSignalHandler must be called exactly once -- a second call panics --
+	// so the same context bounds the initial libvirt handshake and the manager.
+	// That also means a SIGTERM during a stalled connect aborts startup instead
+	// of waiting out the timeout.
+	signalCtx := ctrl.SetupSignalHandler()
+
+	machineProvider, err := libvirtprovider.New(signalCtx, libvirtprovider.Config{
 		URI:         libvirtURI,
 		RemoteAddr:  libvirtRemoteAddr,
 		Insecure:    libvirtInsecure,
@@ -247,7 +253,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}

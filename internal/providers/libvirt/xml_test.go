@@ -159,3 +159,31 @@ func TestIsRoutable(t *testing.T) {
 		}
 	}
 }
+
+// Deletion must find the disk the domain actually uses, not the one current
+// config would point at. A redeploy with a different --libvirt-storage-pool is
+// enough to diverge, and looking in the wrong pool would report the volume
+// absent, undefine the domain, and strand the real disk with nothing pointing
+// at it.
+func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
+	out := domainXML(testSpec(), "pool-the-machine-was-built-in", "worker-1.qcow2")
+
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated domain XML does not parse: %v", err)
+	}
+
+	var pool, volume string
+	for _, d := range parsed.Devices.Disks {
+		if d.Source.Volume != "" {
+			pool, volume = d.Source.Pool, d.Source.Volume
+			break
+		}
+	}
+	if pool != "pool-the-machine-was-built-in" {
+		t.Errorf("disk pool = %q, want the pool the domain was defined with", pool)
+	}
+	if volume != "worker-1.qcow2" {
+		t.Errorf("disk volume = %q, want worker-1.qcow2", volume)
+	}
+}
