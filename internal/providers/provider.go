@@ -38,6 +38,16 @@ import (
 // from Delete would wedge finalizers forever.
 var ErrNotFound = errors.New("machine not found")
 
+// ErrInvalidID marks a machine ID the backend can never resolve, as opposed to
+// one that merely does not exist right now.
+//
+// providerID is writable at creation, so a value can be syntactically valid to
+// the controller and still be meaningless to the backend. Without a distinct
+// signal, deletion would treat that as a real failure and wedge the finalizer
+// permanently -- even though the backend name can still identify and clean up
+// the machine's resources.
+var ErrInvalidID = errors.New("machine id is not valid for this backend")
+
 // ErrTerminal marks a failure the provider cannot recover from by retrying.
 //
 // Backends wrap it around configuration-shaped errors -- a missing image, a

@@ -563,9 +563,46 @@ func (p *Provider) DeleteByName(ctx context.Context, name string) error {
 	// StorageVolCreateXML and before DomainDefineXML; FindByName would report
 	// not-found and the controller would release the finalizer. Removing the
 	// volume here closes that window.
-	// A domain-less leftover can only have come from this provider's own
-	// Create, which uses the configured pool.
-	return p.deleteVolume(ctx, p.cfg.StoragePool, name+".qcow2")
+	// Search every pool, not just the configured one. Create can leave a
+	// volume-only partial in pool A, and if the controller is redeployed against
+	// pool B before deletion, looking only in B reports success and releases the
+	// finalizer while the disk stays orphaned in A. The volume name is derived
+	// from the object UID, so it is unambiguous wherever it turns up.
+	return p.deleteVolumeAnyPool(ctx, name+".qcow2")
+}
+
+// deleteVolumeAnyPool removes a volume from whichever pool holds it.
+//
+// Used for domain-less leftovers, where the domain XML that would normally name
+// the pool no longer exists. Falls back to the configured pool if pools cannot
+// be listed, which is still better than not looking at all.
+func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) error {
+	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
+		return p.lv.ConnectListAllStoragePools(1, 0)
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("libvirt: listing storage pools: %w", err)
+		}
+		return p.deleteVolume(ctx, p.cfg.StoragePool, volName)
+	}
+
+	for _, pool := range pools {
+		vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
+			return p.lv.StorageVolLookupByName(pool, volName)
+		})
+		if err != nil {
+			if isNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("libvirt: looking up volume %q in pool %q: %w", volName, pool.Name, err)
+		}
+		if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+			!isNotFound(err) {
+			return fmt.Errorf("libvirt: deleting volume %q from pool %q: %w", volName, pool.Name, err)
+		}
+	}
+	return nil
 }
 
 func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error {
@@ -646,8 +683,11 @@ func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) e
 		// the pool is restored. Do not wrap ErrTerminal: a missing pool during
 		// teardown is expected to recover, and a terminal condition would invite
 		// remediation of a machine that is being deleted.
+		// Name the pool that was actually looked up, not the configured one. After
+		// a pool configuration change those differ, and reporting the wrong one
+		// sends an operator to restore a pool that was never the problem.
 		return fmt.Errorf("libvirt: storage pool %q is unavailable while deleting %q: %v",
-			p.cfg.StoragePool, volName, err)
+			poolName, volName, err)
 	}
 
 	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
@@ -670,7 +710,11 @@ func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) e
 func (p *Provider) lookupByUUID(ctx context.Context, id string) (golibvirt.Domain, error) {
 	uuid, err := parseUUID(id)
 	if err != nil {
-		return golibvirt.Domain{}, fmt.Errorf("libvirt: %w", err)
+		// Signal this distinctly. A providerID like hydra://libvirt/not-a-uuid
+		// satisfies the CRD and the controller's format check but can never name a
+		// domain, so treating it as an ordinary failure would wedge the finalizer
+		// forever. The controller falls back to deleting by name instead.
+		return golibvirt.Domain{}, fmt.Errorf("%w: libvirt: %v", providers.ErrInvalidID, err)
 	}
 	dom, err := call(ctx, p, func() (golibvirt.Domain, error) {
 		return p.lv.DomainLookupByUUID(uuid)

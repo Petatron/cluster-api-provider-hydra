@@ -546,3 +546,47 @@ var _ = Describe("HydraMachine Reconciler", func() {
 		})
 	})
 })
+
+var _ = Describe("HydraMachine Reconciler — unusable providerID", func() {
+	ctx := context.Background()
+
+	It("still cleans up and releases the finalizer", func() {
+		// hydra://fake/not-a-uuid satisfies the CRD and the controller's format
+		// check but can never name a machine. Treating that as an ordinary failure
+		// would wedge the finalizer forever, even though the backend name can
+		// still identify the resources.
+		provider := &invalidIDProvider{Provider: fake.New()}
+		r := &HydraMachineReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Provider: provider}
+
+		m := newMachine(nil)
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		key := client.ObjectKeyFromObject(m)
+
+		_, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(m)})
+		Expect(err).NotTo(HaveOccurred())
+
+		pid := providers.ProviderID(provider.Name(), "not-a-uuid")
+		patch := client.MergeFrom(m.DeepCopy())
+		m.Spec.ProviderID = &pid
+		controllerutil.AddFinalizer(m, MachineFinalizer)
+		Expect(k8sClient.Patch(ctx, m, patch)).To(Succeed())
+
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(provider.Count()).To(Equal(0), "resources must be cleaned up via the name")
+		Expect(client.IgnoreNotFound(k8sClient.Get(ctx, key, m))).To(Succeed())
+	})
+})
+
+// invalidIDProvider rejects any ID that is not one it issued, the way a backend
+// with a structured identifier does.
+type invalidIDProvider struct{ *fake.Provider }
+
+func (p *invalidIDProvider) Get(ctx context.Context, id string) (*providers.MachineState, error) {
+	if !strings.HasPrefix(id, "fake-") {
+		return nil, fmt.Errorf("%w: %q is not a fake machine id", providers.ErrInvalidID, id)
+	}
+	return p.Provider.Get(ctx, id)
+}

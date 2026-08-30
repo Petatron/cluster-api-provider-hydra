@@ -202,6 +202,12 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 			return nil, err
 		}
 		state, err := prov.Get(ctx, id)
+		if errors.Is(err, providers.ErrInvalidID) {
+			// The recorded ID can never name a machine, so this object will never
+			// reconcile. Say so terminally rather than retrying forever.
+			return nil, fmt.Errorf("%w: recorded providerID %q is not usable by the %s backend",
+				providers.ErrTerminal, *machine.Spec.ProviderID, prov.Name())
+		}
 		if err == nil {
 			if ownErr := verifyOwnership(machine, state); ownErr != nil {
 				return nil, ownErr
@@ -314,9 +320,13 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 					return "", ownErr
 				}
 				return id, nil
-			case errors.Is(err, providers.ErrNotFound):
-				// Nothing under that ID; fall through to the name lookup, which is
-				// scoped to this object by construction.
+			case errors.Is(err, providers.ErrNotFound), errors.Is(err, providers.ErrInvalidID):
+				// Nothing under that ID, or an ID the backend can never resolve --
+				// a providerID like hydra://libvirt/not-a-uuid satisfies the CRD and
+				// the format check but names no machine. Either way, fall through to
+				// the name lookup, which is scoped to this object by construction.
+				// Returning an error instead would wedge the finalizer forever over
+				// a value that can never become valid.
 			default:
 				return "", fmt.Errorf("confirming ownership before deletion: %w", err)
 			}
