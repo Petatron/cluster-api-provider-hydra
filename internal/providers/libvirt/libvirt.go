@@ -26,6 +26,7 @@ limitations under the License.
 package libvirt
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -36,6 +37,7 @@ import (
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 
+	"github.com/Petatron/cluster-api-provider-hydra/internal/cloudinit"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
@@ -346,6 +348,14 @@ func (p *Provider) recycle() {
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "libvirt" }
 
+// rootVolumeName and cidataVolumeName derive a machine's volume names from its
+// backend name, which is already globally unique. Both are pure functions of the
+// name so that teardown can find them without a domain to consult -- the whole
+// reason a crashed Create does not orphan a disk.
+func rootVolumeName(machineName string) string { return machineName + ".qcow2" }
+
+func cidataVolumeName(machineName string) string { return machineName + "-cidata.iso" }
+
 // Create implements providers.MachineProvider.
 //
 // Idempotent on spec.Name, as the interface requires: an existing domain with
@@ -392,7 +402,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		return nil, err
 	}
 
-	volName := spec.Name + ".qcow2"
+	volName := rootVolumeName(spec.Name)
 	_, err = call(ctx, p, func() (golibvirt.StorageVol, error) {
 		return p.lv.StorageVolCreateXML(pool, volumeXML(volName, backingPath, spec.DiskBytes), 0)
 	})
@@ -403,22 +413,104 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// treated as fatal. Without this, a crash between volume creation and domain
 	// definition would make every subsequent retry fail identically forever.
 
+	cidataVol, err := p.ensureCloudInitVolume(ctx, pool, spec)
+	if err != nil {
+		_ = p.deleteVolume(ctx, pool.Name, volName)
+		return nil, err
+	}
+
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName))
+		return p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName, cidataVol))
 	})
 	if err != nil {
-		// Roll back the volume so a failed define does not leave a qcow2 that
+		// Roll back both volumes so a failed define does not leave disks that
 		// FindByName cannot see. A crash in this window is recovered by
-		// DeleteByName, which removes the volume even when no domain exists.
-		// This volume was just created in the configured pool, so that is the
-		// right place to look -- unlike deletion, which must consult the domain.
-		_ = p.deleteVolume(ctx, p.cfg.StoragePool, volName)
+		// DeleteByName, which removes them even when no domain exists.
+		// These were just created in the configured pool, so that is the right
+		// place to look -- unlike deletion, which must consult the domain.
+		_ = p.deleteVolume(ctx, pool.Name, volName)
+		if cidataVol != "" {
+			_ = p.deleteVolume(ctx, pool.Name, cidataVol)
+		}
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
 		return nil, err
 	}
 	return p.stateOf(ctx, dom)
+}
+
+// ensureCloudInitVolume renders the machine's bootstrap data into a NoCloud
+// image and uploads it as a volume, returning the volume name.
+//
+// Returns an empty name when there is no bootstrap data, which is the
+// no-Cluster-API case: the machine boots its base image and configures nothing.
+func (p *Provider) ensureCloudInitVolume(ctx context.Context, pool golibvirt.StoragePool, spec providers.MachineSpec) (string, error) {
+	if len(spec.BootstrapData) == 0 {
+		return "", nil
+	}
+
+	// InstanceID is the backend name rather than anything per-boot. cloud-init
+	// remembers the last instance id it saw and re-runs per-instance modules when
+	// it changes -- so a value that varied would re-run the kubeadm join on every
+	// restart of the machine.
+	iso, err := cloudinit.ISO(cloudinit.Metadata{
+		InstanceID: spec.Name,
+		Hostname:   spec.Hostname,
+	}, spec.BootstrapData)
+	if err != nil {
+		// Bad bootstrap data cannot be fixed by retrying, and a machine created
+		// without its cloud-init would come up unconfigured and never join.
+		return "", fmt.Errorf("%w: libvirt: rendering cloud-init for %q: %v", providers.ErrTerminal, spec.Name, err)
+	}
+
+	volName := cidataVolumeName(spec.Name)
+	vol, err := p.createCloudInitVolume(ctx, pool, volName, int64(len(iso)))
+	if err != nil {
+		return "", err
+	}
+
+	if err := callVoid(ctx, p, func() error {
+		return p.lv.StorageVolUpload(vol, bytes.NewReader(iso), 0, uint64(len(iso)), 0)
+	}); err != nil {
+		// A half-written image is worse than none: cloud-init would find a
+		// corrupt filesystem and the machine would boot unconfigured with nothing
+		// obviously wrong. Remove it so the next attempt starts clean.
+		_ = p.deleteVolume(ctx, pool.Name, volName)
+		return "", fmt.Errorf("libvirt: uploading cloud-init image %q: %w", volName, err)
+	}
+	return volName, nil
+}
+
+// createCloudInitVolume allocates the image volume, replacing any leftover.
+//
+// This deliberately does NOT adopt an existing volume, which is the opposite of
+// how the root disk is handled, and the difference matters. A leftover root disk
+// is a valid copy-on-write clone that a previous attempt made; a leftover
+// cloud-init image is by definition from an attempt that failed before defining
+// a domain, so it may be truncated -- and a truncated ISO is exactly the failure
+// that boots a machine which configures nothing and looks fine.
+func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.StoragePool, volName string, size int64) (golibvirt.StorageVol, error) {
+	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
+	})
+	if err == nil {
+		return vol, nil
+	}
+	if !isAlreadyExists(err) {
+		return golibvirt.StorageVol{}, fmt.Errorf("libvirt: creating cloud-init volume %q: %w", volName, err)
+	}
+
+	if err := p.deleteVolume(ctx, pool.Name, volName); err != nil {
+		return golibvirt.StorageVol{}, fmt.Errorf("libvirt: replacing a leftover cloud-init volume %q: %w", volName, err)
+	}
+	vol, err = call(ctx, p, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
+	})
+	if err != nil {
+		return golibvirt.StorageVol{}, fmt.Errorf("libvirt: recreating cloud-init volume %q: %w", volName, err)
+	}
+	return vol, nil
 }
 
 // ensureRunning starts a domain that is defined but not active.
@@ -588,16 +680,26 @@ func (p *Provider) DeleteByName(ctx context.Context, name string) error {
 	case !isNotFound(err):
 		return fmt.Errorf("libvirt: looking up domain %q: %w", name, err)
 	}
-	// No domain. Create can leave a clone volume behind if it crashes after
+	// No domain. Create can leave volumes behind if it crashes after
 	// StorageVolCreateXML and before DomainDefineXML; FindByName would report
-	// not-found and the controller would release the finalizer. Removing the
-	// volume here closes that window.
+	// not-found and the controller would release the finalizer. Removing them
+	// here closes that window.
 	// Search every pool, not just the configured one. Create can leave a
 	// volume-only partial in pool A, and if the controller is redeployed against
 	// pool B before deletion, looking only in B reports success and releases the
-	// finalizer while the disk stays orphaned in A. The volume name is derived
-	// from the object UID, so it is unambiguous wherever it turns up.
-	return p.deleteVolumeAnyPool(ctx, name+".qcow2")
+	// finalizer while the disk stays orphaned in A. The volume names are derived
+	// from the object UID, so they are unambiguous wherever they turn up.
+	//
+	// Both volumes are swept, not just the root disk. Create allocates the
+	// cloud-init image between the two, so a crash in that window leaves exactly
+	// the ISO behind -- and a sweep that only knew about the qcow2 would report
+	// success and orphan it.
+	for _, volName := range []string{rootVolumeName(name), cidataVolumeName(name)} {
+		if err := p.deleteVolumeAnyPool(ctx, volName); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteVolumeAnyPool removes a volume from whichever pool holds it.
@@ -650,12 +752,16 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	// and looking in the new pool would report the volume absent, undefine the
 	// domain, and strand the real disk in the old pool with nothing left pointing
 	// at it.
-	pool, volName, err := p.diskSourceOf(ctx, dom)
+	disks, err := p.diskSourcesOf(ctx, dom)
 	if err != nil {
 		return err
 	}
-	if volName != "" {
-		if err := p.deleteVolume(ctx, pool, volName); err != nil {
+	// Every pool-backed disk, not just the first. A machine with bootstrap data
+	// has two -- its root qcow2 and its cloud-init ISO -- and stopping at one
+	// would undefine the domain, release the finalizer, and leave the other
+	// behind with nothing left referencing it.
+	for _, d := range disks {
+		if err := p.deleteVolume(ctx, d.pool, d.volume); err != nil {
 			return err
 		}
 	}
@@ -673,35 +779,43 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 //
 // The previous version swallowed pool and volume lookup errors entirely, so a
 // transient failure here looked like success and left the disk behind.
-// diskSourceOf reads the pool and volume backing a domain out of its own XML.
+// diskSource is one pool-backed disk attached to a domain.
+type diskSource struct {
+	pool   string
+	volume string
+}
+
+// diskSourcesOf reads every pool-backed disk out of a domain's own XML.
 //
-// Returns an empty volume name when the domain has no pool-backed disk, which is
-// not an error: there is simply nothing for this provider to reclaim.
-func (p *Provider) diskSourceOf(ctx context.Context, dom golibvirt.Domain) (pool, volume string, err error) {
+// Returns an empty slice when the domain has no pool-backed disk, which is not
+// an error: there is simply nothing for this provider to reclaim.
+func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]diskSource, error) {
 	desc, err := call(ctx, p, func() (string, error) {
 		return p.lv.DomainGetXMLDesc(dom, 0)
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return "", "", nil
+			return nil, nil
 		}
-		return "", "", fmt.Errorf("libvirt: reading domain XML for %q: %w", dom.Name, err)
+		return nil, fmt.Errorf("libvirt: reading domain XML for %q: %w", dom.Name, err)
 	}
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(desc), &parsed); err != nil {
-		return "", "", fmt.Errorf("libvirt: parsing domain XML for %q: %w", dom.Name, err)
+		return nil, fmt.Errorf("libvirt: parsing domain XML for %q: %w", dom.Name, err)
 	}
+
+	var out []diskSource
 	for _, d := range parsed.Devices.Disks {
-		if d.Source.Volume != "" {
-			p := d.Source.Pool
-			if p == "" {
-				p = pool
-			}
-			return p, d.Source.Volume, nil
+		if d.Source.Volume == "" {
+			continue
 		}
+		// An empty pool attribute leaves deleteVolume to fall back to the
+		// configured pool, which is the best available guess when the domain XML
+		// does not say.
+		out = append(out, diskSource{pool: d.Source.Pool, volume: d.Source.Volume})
 	}
-	return "", "", nil
+	return out, nil
 }
 
 func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) error {
