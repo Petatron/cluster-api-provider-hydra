@@ -134,7 +134,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// infrastructure underneath them. The finalizer stays, so deletion resumes
 	// once the annotation is removed.
 	if _, paused := machine.Annotations[clusterv1.PausedAnnotation]; paused {
-		log.V(1).Info("reconciliation is paused by annotation", "name", machine.Name)
+		log.V(1).Info("Reconciliation is paused by annotation", "name", machine.Name)
 		return ctrl.Result{}, r.setPaused(ctx, machine, true)
 	}
 	if err := r.setPaused(ctx, machine, false); err != nil {
@@ -152,7 +152,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !machine.DeletionTimestamp.IsZero() {
 		return r.reconcileDelete(ctx, prov, machine)
 	}
-	log.V(1).Info("reconciling machine", "name", machine.Name)
+	log.V(1).Info("Reconciling machine", "name", machine.Name)
 	return r.reconcileNormal(ctx, prov, machine)
 }
 
@@ -307,7 +307,7 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 		if err != nil {
 			// An unusable providerID identifies nothing, and blocking deletion
 			// forever over it is worse than proceeding. Fall through to the name.
-			logf.FromContext(ctx).Error(err, "providerID unusable during deletion; falling back to name lookup",
+			logf.FromContext(ctx).Error(err, "ProviderID unusable during deletion, falling back to name lookup",
 				"providerID", *machine.Spec.ProviderID)
 		} else {
 			// Confirm the ID actually resolves to this object's machine before
@@ -340,7 +340,7 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 		}
 		return "", fmt.Errorf("searching for an unrecorded machine: %w", err)
 	}
-	logf.FromContext(ctx).Info("found a machine whose providerID was never recorded; deleting it",
+	logf.FromContext(ctx).Info("Found a machine whose providerID was never recorded, deleting it",
 		"name", backendName(machine), "id", state.ID)
 	return state.ID, nil
 }
@@ -370,7 +370,12 @@ func verifyOwnership(machine *infrav1.HydraMachine, state *providers.MachineStat
 func (r *HydraMachineReconciler) machineIDFor(prov providers.MachineProvider, providerID string) (string, error) {
 	backend, id, err := providers.ParseProviderID(providerID)
 	if err != nil {
-		return "", fmt.Errorf("stored providerID is unusable: %w", err)
+		// Immutable once set, so a malformed value can never become valid.
+		// Classified terminal for the same reason as a backend mismatch or an ID
+		// the backend cannot resolve -- otherwise the object reports
+		// ProvisioningFailedRetrying forever over something no retry can fix.
+		return "", fmt.Errorf("%w: stored providerID %q is malformed: %v",
+			providers.ErrTerminal, providerID, err)
 	}
 	if backend != prov.Name() {
 		return "", fmt.Errorf("%w: providerID %q belongs to backend %q, but this controller runs %q",

@@ -169,18 +169,26 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 	if cfg.RPCTimeout == 0 {
 		cfg.RPCTimeout = defaultRPCTimeout
 	}
+	// Terminal, not a plain error. Construction is lazy now, so this reaches the
+	// controller through recordError -- and an unset pool is a configuration
+	// mistake that retrying cannot fix, so reporting it as retryable would leave
+	// the object cycling forever as though the hypervisor were merely down.
 	if cfg.StoragePool == "" {
-		return nil, errors.New("libvirt: StoragePool is required")
+		return nil, fmt.Errorf("%w: libvirt: a storage pool must be configured", providers.ErrTerminal)
 	}
-	if cfg.BaseImage == "" {
-		return nil, errors.New("libvirt: BaseImage is required")
-	}
+	// BaseImage is deliberately optional. The API requires image.name or
+	// image.url, resolveBackingPath uses the per-machine name, and URL-only
+	// requests are rejected before any fallback -- so the global default is
+	// unreachable for every admitted HydraMachine. Requiring it forced operators
+	// to invent a duplicate value, and blocked deletion after a restart.
 
 	dialer, err := newDialer(cfg)
 	if err != nil {
 		return nil, err
 	}
-	tracked := newTrackingDialer(dialer)
+	// The dial bound must exceed the handshake budget, or a slow but healthy
+	// hypervisor would be cut off before it finished.
+	tracked := newTrackingDialer(dialer, cfg.DialTimeout+cfg.RPCTimeout)
 	lv := golibvirt.NewWithDialer(tracked)
 
 	uri := golibvirt.QEMUSystem
@@ -218,7 +226,28 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 }
 
 // Close releases the libvirt connection.
-func (p *Provider) Close() error { return p.lv.Disconnect() }
+//
+// Tries a graceful Disconnect, but bounded. Disconnect is a request/reply
+// exchange, so against a daemon that has stopped answering it blocks -- and
+// during shutdown that means hanging until Kubernetes sends SIGKILL, or
+// indefinitely when run locally. The socket is force-closed if the polite
+// version does not return promptly.
+func (p *Provider) Close() error {
+	done := make(chan error, 1)
+	go func() { done <- p.lv.Disconnect() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(closeGracePeriod):
+		p.recycle()
+		return nil
+	}
+}
+
+// closeGracePeriod is how long a polite disconnect gets before the socket is
+// dropped from under it.
+const closeGracePeriod = 5 * time.Second
 
 // begin arms a deadline and reconnects if libvirtd dropped us. Every exported
 // method goes through here so a stalled RPC cannot occupy a reconcile worker
@@ -581,10 +610,12 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) erro
 		return p.lv.ConnectListAllStoragePools(1, 0)
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("libvirt: listing storage pools: %w", err)
-		}
-		return p.deleteVolume(ctx, p.cfg.StoragePool, volName)
+		// Do not fall back to the configured pool. A domain-less partial can be in
+		// a pool that is no longer configured, and looking only at the current one
+		// would find nothing, report success, and let the controller release the
+		// finalizer -- orphaning that qcow2 permanently. Propagating keeps the
+		// finalizer until an exhaustive sweep is actually possible.
+		return fmt.Errorf("libvirt: listing storage pools to find %q: %w", volName, err)
 	}
 
 	for _, pool := range pools {
@@ -803,7 +834,13 @@ func isRoutable(addr string) bool {
 	if ip == nil {
 		return false
 	}
-	return !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+	// IsGlobalUnicast covers this exactly: it excludes loopback, link-local,
+	// multicast, unspecified and the IPv4 broadcast address, while still
+	// accepting private ranges like 192.168.0.0/16 -- which is where these
+	// machines actually live. The earlier hand-rolled predicate admitted
+	// multicast and broadcast, and publishing either would make the controller
+	// treat the machine as addressed and stop polling for a real one.
+	return ip.IsGlobalUnicast()
 }
 
 // call2 is call for RPCs returning two values plus an error.

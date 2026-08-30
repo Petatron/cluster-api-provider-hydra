@@ -3,9 +3,14 @@
 # These values are site-specific -- they name a storage pool and a base image on
 # your hypervisor -- so there is no correct default. Edit them before deploying.
 #
-# The manager fails fast on startup if the pool or base image is unset. That is
-# deliberate: a provider that guessed where to put machine disks would be far
-# worse than one that refuses to start with a clear message in its logs.
+# The manager starts regardless of what is set here. The backend is built on the
+# first HydraMachine reconcile, not at startup, so a missing or wrong value shows
+# up as a terminal condition on the HydraMachine rather than as a crash-looping
+# pod -- check `kubectl describe hydramachine`, not the manager logs.
+#
+# That is deliberate: connecting at startup meant a missing pool or an offline
+# hypervisor crash-looped the manager before its health probes came up, so an
+# operator saw a restart count instead of a message.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -39,9 +44,12 @@ data:
   # cacert.pem. Unused when insecure is "true" or remoteAddr is empty.
   pkiPath: "/etc/pki/libvirt"
 
-  # Storage pool that machine disks are created in. REQUIRED.
+  # Storage pool that machine disks are created in. REQUIRED -- an empty value is
+  # reported as a terminal condition on every HydraMachine.
   storagePool: ""
 
-  # Volume name of the base image machines are cloned from. REQUIRED.
-  # Used when a HydraMachine does not name its own image.
+  # Volume name of a default base image. OPTIONAL, and currently unused: the API
+  # requires every HydraMachine to name its own image (or give a URL, which is
+  # not yet fetchable), so this fallback is unreachable in practice. Left in
+  # place for a future defaulting story rather than removed outright.
   baseImage: ""

@@ -147,6 +147,9 @@ func TestIsRoutable(t *testing.T) {
 		{"2001:db8::1", true},
 
 		{"127.0.0.1", false},
+		{"224.0.0.1", false},       // multicast identifies a group, not this guest
+		{"255.255.255.255", false}, // broadcast
+		{"ff02::1", false},         // IPv6 all-nodes multicast
 		{"::1", false},
 		{"169.254.10.5", false},
 		{"fe80::1", false},

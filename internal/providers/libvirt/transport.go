@@ -17,8 +17,10 @@ limitations under the License.
 package libvirt
 
 import (
+	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/digitalocean/go-libvirt/socket"
 )
@@ -35,27 +37,71 @@ import (
 // Closing the net.Conn underneath it does not negotiate anything. Every parked
 // read fails immediately, which is the whole point.
 type trackingDialer struct {
-	inner socket.Dialer
+	inner   socket.Dialer
+	timeout time.Duration
 
 	mu   sync.Mutex
 	conn net.Conn
 }
 
-func newTrackingDialer(inner socket.Dialer) *trackingDialer {
-	return &trackingDialer{inner: inner}
+func newTrackingDialer(inner socket.Dialer, timeout time.Duration) *trackingDialer {
+	return &trackingDialer{inner: inner, timeout: timeout}
 }
 
-// Dial implements socket.Dialer.
+// Dial implements socket.Dialer, bounded so a stalled peer cannot block the
+// caller indefinitely.
+//
+// The bound is needed because the TLS dialer completes its handshake and then
+// performs an unbounded read of libvirt's verification byte before returning the
+// connection. Until it returns there is no net.Conn here, so forceClose has
+// nothing to close and a peer that finishes TLS but never sends that byte would
+// otherwise hang Dial forever.
+//
+// Known limitation: timing out unblocks the caller but cannot abort the dial
+// itself, so that socket and goroutine stay alive until the peer acts or the OS
+// gives up. On the TLS path specifically this leaks one of each per retry. A
+// real fix needs a TLS dialer that applies a deadline to the verification read,
+// which this dependency revision does not offer -- tracked as follow-up work
+// rather than papered over here.
 func (d *trackingDialer) Dial() (net.Conn, error) {
-	c, err := d.inner.Dial()
-	if err != nil {
-		return nil, err
+	type result struct {
+		conn net.Conn
+		err  error
 	}
-	d.mu.Lock()
-	d.conn = c
-	d.mu.Unlock()
-	return c, nil
+	ch := make(chan result, 1)
+	go func() {
+		c, err := d.inner.Dial()
+		ch <- result{c, err}
+	}()
+
+	timeout := d.timeout
+	if timeout <= 0 {
+		timeout = defaultDialTimeout
+	}
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, r.err
+		}
+		d.mu.Lock()
+		d.conn = r.conn
+		d.mu.Unlock()
+		return r.conn, nil
+	case <-time.After(timeout):
+		// Close the connection if it arrives late, so an abandoned dial does not
+		// leave a socket open for the rest of the process lifetime.
+		go func() {
+			if r := <-ch; r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("libvirt: dial did not complete within %s", timeout)
+	}
 }
+
+// defaultDialTimeout bounds a dial when no timeout was configured.
+const defaultDialTimeout = 30 * time.Second
 
 // forceClose drops the current connection without negotiating.
 //

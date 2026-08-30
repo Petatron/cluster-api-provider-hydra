@@ -189,7 +189,7 @@ func TestTrackingDialerForceClosesTheConnection(t *testing.T) {
 		}
 	}()
 
-	d := newTrackingDialer(stubDialer{addr: ln.Addr().String()})
+	d := newTrackingDialer(stubDialer{addr: ln.Addr().String()}, 5*time.Second)
 	conn, err := d.Dial()
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -218,7 +218,7 @@ func TestTrackingDialerForceClosesTheConnection(t *testing.T) {
 }
 
 func TestTrackingDialerForceCloseWithoutConnection(t *testing.T) {
-	newTrackingDialer(stubDialer{addr: "127.0.0.1:1"}).forceClose()
+	newTrackingDialer(stubDialer{addr: "127.0.0.1:1"}, time.Second).forceClose()
 }
 
 type stubDialer struct{ addr string }
