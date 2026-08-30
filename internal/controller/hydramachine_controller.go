@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
@@ -116,6 +117,8 @@ func (r *HydraMachineReconciler) provider(ctx context.Context) (providers.Machin
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/finalizers,verbs=update
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;clusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile drives a HydraMachine towards its desired state.
 func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -128,16 +131,27 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Cluster API's paused annotation means "do not touch this object". That
-	// covers deletion as well as creation: an operator pausing a machine to
-	// investigate it would not expect the controller to keep destroying
-	// infrastructure underneath them. The finalizer stays, so deletion resumes
-	// once the annotation is removed.
-	if _, paused := machine.Annotations[clusterv1.PausedAnnotation]; paused {
-		log.V(1).Info("Reconciliation is paused by annotation", "name", machine.Name)
-		return ctrl.Result{}, r.setPaused(ctx, machine, true)
+	// Resolve the Cluster API objects around this machine before anything else.
+	// Both the paused check and the bootstrap data depend on them, and a machine
+	// with no owning Machine is a supported standalone case rather than an error.
+	link, err := r.resolveLinkage(ctx, machine)
+	if err != nil {
+		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
 	}
-	if err := r.setPaused(ctx, machine, false); err != nil {
+
+	// Cluster API's pause signals mean "do not touch this object". That covers
+	// deletion as well as creation: an operator pausing a machine to investigate
+	// it would not expect the controller to keep destroying infrastructure
+	// underneath them. The finalizer stays, so deletion resumes once the pause is
+	// lifted -- and the Cluster watch is what notices that it has been.
+	if reason := pausedReason(machine, link); reason != "" {
+		log.V(1).Info("Reconciliation is paused", "name", machine.Name, "reason", reason)
+		return ctrl.Result{}, r.setPaused(ctx, machine, reason)
+	}
+	if err := r.setPaused(ctx, machine, ""); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -153,10 +167,10 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.reconcileDelete(ctx, prov, machine)
 	}
 	log.V(1).Info("Reconciling machine", "name", machine.Name)
-	return r.reconcileNormal(ctx, prov, machine)
+	return r.reconcileNormal(ctx, prov, machine, link)
 }
 
-func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (ctrl.Result, error) {
 	// The finalizer must be persisted before any infrastructure exists.
 	// Registering it afterwards leaves a window where a delete would remove the
 	// object and strand the VM.
@@ -168,7 +182,18 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 		}
 	}
 
-	state, err := r.ensureMachine(ctx, prov, machine)
+	state, err := r.ensureMachine(ctx, prov, machine, link)
+	if errors.Is(err, errWaitingForBootstrap) {
+		// Not a failure. The bootstrap provider publishes its Secret
+		// asynchronously, so every Cluster API machine passes through this state
+		// on its way up. Report it as a distinct reason -- an operator watching a
+		// machine that never joins needs to know whether it is waiting on CABPK or
+		// on the hypervisor, and "ProvisioningFailedRetrying" would answer neither.
+		if statusErr := r.recordWaiting(ctx, machine, "WaitingForBootstrapData", err.Error()); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueWhileProvisioning}, nil
+	}
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -195,7 +220,7 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 
 // ensureMachine returns the machine's current state, creating it if it does not
 // exist yet.
-func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (*providers.MachineState, error) {
+func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (*providers.MachineState, error) {
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
@@ -228,11 +253,20 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		return state, nil
 	}
 
+	// Bootstrap data is fetched here, on the create path only, and deliberately
+	// not above. A machine that already exists must never be blocked on it: the
+	// Secret is consumed once at first boot, and re-requiring it would strand a
+	// running, healthy machine the moment its Secret was rotated or cleaned up.
+	bootstrapData, err := r.bootstrapDataFor(ctx, link)
+	if err != nil {
+		return nil, err
+	}
+
 	// No providerID yet. Create is idempotent on name, which is what makes this
 	// safe: if a previous reconcile created the machine but crashed before
 	// persisting the providerID, this call returns that same machine rather than
 	// creating a second one.
-	state, err := prov.Create(ctx, specFor(machine))
+	state, err := prov.Create(ctx, specFor(machine, bootstrapData))
 	if err != nil {
 		return nil, fmt.Errorf("creating machine: %w", err)
 	}
@@ -430,22 +464,22 @@ func (r *HydraMachineReconciler) updateStatus(ctx context.Context, machine *infr
 	return nil
 }
 
-// setPaused surfaces whether reconciliation is suspended.
+// setPaused surfaces whether reconciliation is suspended, and why.
 //
 // The contract asks providers to report this through a Paused condition, so an
 // operator can see why a machine has stopped progressing rather than assuming
-// the controller is broken.
+// the controller is broken. An empty reason means not paused.
 //
-// Note this only checks the annotation on the HydraMachine. The contract also
-// asks for spec.paused on the owning Cluster, which this provider cannot read
-// until Cluster linkage lands in PET-9.
-func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1.HydraMachine, paused bool) error {
+// The reason is carried in the message rather than inferred, because there are
+// now three ways to pause a machine -- its own annotation, the owning Cluster's
+// spec.paused, and the Cluster's annotation -- and "paused" alone would leave an
+// operator hunting for which one is in effect.
+func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1.HydraMachine, reason string) error {
+	paused := reason != ""
+
 	existing := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachinePausedCondition)
 	if !paused && existing == nil {
 		// Nothing to clear, and no reason to issue a write on every reconcile.
-		return nil
-	}
-	if existing != nil && (existing.Status == metav1.ConditionTrue) == paused {
 		return nil
 	}
 
@@ -459,13 +493,44 @@ func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1
 	if paused {
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "Paused"
-		cond.Message = fmt.Sprintf("reconciliation is suspended by the %s annotation", clusterv1.PausedAnnotation)
+		cond.Message = fmt.Sprintf("reconciliation is suspended by %s", reason)
+	}
+
+	// Skip the write only when the condition already says exactly this. Comparing
+	// status alone would pin the first reason recorded, so a machine paused by its
+	// annotation and then also by its Cluster would keep reporting the annotation
+	// after the annotation was removed.
+	if existing != nil && existing.Status == cond.Status && existing.Message == cond.Message {
+		return nil
 	}
 
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, cond)
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("recording paused state: %w", err)
+	}
+	return nil
+}
+
+// recordWaiting reports that the machine is blocked on something that is
+// expected to arrive, as distinct from something that has gone wrong.
+//
+// It sets Ready=False like a failure would, but never raises ProvisioningFailed
+// -- and clears any stale one. That condition is documented as unrecoverable and
+// a MachineHealthCheck may act on it, so a machine waiting on its bootstrap
+// Secret must not carry it.
+func (r *HydraMachineReconciler) recordWaiting(ctx context.Context, machine *infrav1.HydraMachine, reason, message string) error {
+	patch := client.MergeFrom(machine.DeepCopy())
+	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
+		Type:               infrav1.MachineReadyCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: machine.Generation,
+	})
+	apimeta.RemoveStatusCondition(&machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)
+	if err := r.Status().Patch(ctx, machine, patch); err != nil {
+		return fmt.Errorf("recording waiting state: %w", err)
 	}
 	return nil
 }
@@ -554,12 +619,24 @@ func backendName(machine *infrav1.HydraMachine) string {
 //
 // This is the only place quantities are turned into bytes, so no backend has to
 // think about units.
-func specFor(machine *infrav1.HydraMachine) providers.MachineSpec {
+//
+// bootstrapData comes from the owning Machine's Secret rather than from this
+// object, and is passed in rather than read here so that the fetch stays on the
+// create path where it belongs.
+func specFor(machine *infrav1.HydraMachine, bootstrapData []byte) providers.MachineSpec {
 	spec := providers.MachineSpec{
-		Name:        backendName(machine),
-		VCPUs:       machine.Spec.VCPUs,
-		MemoryBytes: machine.Spec.Memory.Value(),
-		DiskBytes:   machine.Spec.DiskSize.Value(),
+		Name: backendName(machine),
+		// The object's own name, not the derived backend name. The backend name
+		// carries a hash for global uniqueness, which is right for a domain name
+		// and wrong for something an operator has to recognise in `kubectl get
+		// nodes`. Uniqueness still holds where it matters: Cluster API names
+		// Machines uniquely within a namespace, and a cluster's nodes come from
+		// one namespace.
+		Hostname:      machine.Name,
+		BootstrapData: bootstrapData,
+		VCPUs:         machine.Spec.VCPUs,
+		MemoryBytes:   machine.Spec.Memory.Value(),
+		DiskBytes:     machine.Spec.DiskSize.Value(),
 		Image: providers.Image{
 			Name:     machine.Spec.Image.Name,
 			URL:      machine.Spec.Image.URL,
@@ -605,9 +682,26 @@ func toMachineAddresses(addrs []providers.Address) []clusterv1.MachineAddress {
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// The two watches are what make Cluster API integration timely rather than
+// merely correct.
+//
+// Note what is deliberately NOT watched: Secrets. A Secret watch would make
+// controller-runtime cache every Secret in the cluster -- every token, every
+// TLS key, every application credential -- in a provider that needs one key
+// from a handful of them. The Machine watch covers the same event anyway, since
+// spec.bootstrap.dataSecretName is what changes when the Secret becomes usable.
 func (r *HydraMachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.HydraMachine{}).
 		Named("hydramachine").
+		Watches(
+			&clusterv1.Machine{},
+			handler.EnqueueRequestsFromMapFunc(machineToHydraMachine),
+		).
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.clusterToHydraMachines),
+		).
 		Complete(r)
 }
