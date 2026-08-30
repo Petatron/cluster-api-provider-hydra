@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -309,6 +310,95 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.RequeueAfter).To(Equal(requeueWhileHealthy),
 				"an addressed, ready machine is re-checked on a health interval")
+		})
+	})
+
+	Context("ownership", func() {
+		It("refuses a providerID pointing at a machine it does not own", func() {
+			// providerID is writable at creation, so anyone able to create a
+			// HydraMachine can aim it at somebody else's VM. Format and backend
+			// checks both pass for a well-formed foreign ID.
+			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: "someone-elses-machine"})
+			Expect(err).NotTo(HaveOccurred())
+
+			pid := providers.ProviderID(provider.Name(), foreign.ID)
+			patch := client.MergeFrom(machine.DeepCopy())
+			machine.Spec.ProviderID = &pid
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+			_, err = reconcile()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not owned by this HydraMachine"))
+		})
+
+		It("will not delete a machine it does not own", func() {
+			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: "someone-elses-machine"})
+			Expect(err).NotTo(HaveOccurred())
+
+			pid := providers.ProviderID(provider.Name(), foreign.ID)
+			patch := client.MergeFrom(machine.DeepCopy())
+			machine.Spec.ProviderID = &pid
+			controllerutil.AddFinalizer(machine, MachineFinalizer)
+			Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+			Expect(k8sClient.Delete(ctx, machine)).To(Succeed())
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+
+			Expect(provider.Count()).To(Equal(1), "the unrelated machine must survive")
+		})
+	})
+
+	Context("backend naming", func() {
+		It("stays short enough to be a filename", func() {
+			// The name becomes a libvirt domain name and, with .qcow2 appended, a
+			// filename. A 63-character namespace and a 253-character object name
+			// would blow past the 255-byte limit of directory-backed pools.
+			long := machine.DeepCopy()
+			long.Namespace = strings.Repeat("n", 63)
+			long.Name = strings.Repeat("m", 253)
+
+			name := backendName(long)
+			Expect(len(name) + len(".qcow2")).To(BeNumerically("<", 255))
+		})
+
+		It("distinguishes objects that differ only by UID", func() {
+			a := machine.DeepCopy()
+			b := machine.DeepCopy()
+			b.UID = "ffffffff-1111-2222-3333-444444444444"
+			Expect(backendName(a)).NotTo(Equal(backendName(b)))
+		})
+
+		It("is stable for the same object", func() {
+			Expect(backendName(machine)).To(Equal(backendName(machine)))
+		})
+	})
+
+	Context("backend availability", func() {
+		It("reports a backend that cannot be built, and retries", func() {
+			attempts := 0
+			lazy := &HydraMachineReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+				NewProvider: func(context.Context) (providers.MachineProvider, error) {
+					attempts++
+					if attempts == 1 {
+						return nil, errors.New("hypervisor unreachable")
+					}
+					return provider, nil
+				},
+			}
+
+			_, err := lazy.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(k8sClient.Get(ctx, key, machine)).To(Succeed())
+			ready := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Message).To(ContainSubstring("hypervisor unreachable"))
+
+			// A backend that was down once must not be remembered as broken.
+			_, err = lazy.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(attempts).To(Equal(2))
 		})
 	})
 

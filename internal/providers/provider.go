@@ -117,6 +117,16 @@ type MachineState struct {
 	// ID is the backend-native identifier, e.g. a libvirt domain UUID.
 	ID string
 
+	// Name is the machine's name on the backend, echoed back so the caller can
+	// confirm it found what it expected.
+	//
+	// This exists for a specific attack: providerID is a user-writable spec field
+	// at creation time, so anyone able to create a HydraMachine can point it at an
+	// unrelated machine's ID. Format and backend validation do not catch that --
+	// only comparing the resolved machine's name against the one this object owns
+	// does. Never run a destructive operation without that comparison.
+	Name string
+
 	// Ready reports that the machine is running and, as far as the backend can
 	// tell, usable. It does not mean the machine has joined a cluster -- that is
 	// Kubernetes' judgement, not the backend's.

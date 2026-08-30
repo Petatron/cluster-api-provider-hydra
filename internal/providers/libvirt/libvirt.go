@@ -151,6 +151,10 @@ type Provider struct {
 	// dial and not one per machine.
 	dial    chan struct{}
 	dialErr error
+
+	// dialer is the transport, retained so a stalled connection can be dropped
+	// without waiting on the daemon to acknowledge it.
+	dialer *trackingDialer
 }
 
 var _ providers.MachineProvider = (*Provider)(nil)
@@ -176,7 +180,8 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	lv := golibvirt.NewWithDialer(dialer)
+	tracked := newTrackingDialer(dialer)
+	lv := golibvirt.NewWithDialer(tracked)
 
 	uri := golibvirt.QEMUSystem
 	if cfg.URI != "" {
@@ -199,16 +204,17 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 
 	select {
 	case <-ctx.Done():
-		// Closing the transport releases the parked handshake rather than leaving
-		// it attached to a connection nothing will ever read.
-		_ = lv.Disconnect()
+		// Force-close rather than Disconnect. Disconnect would send a close RPC and
+		// wait for a reply from the very daemon that has stopped replying, so it
+		// would block here just as the handshake did.
+		tracked.forceClose()
 		return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, ctx.Err())
 	case err := <-done:
 		if err != nil {
 			return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, err)
 		}
 	}
-	return &Provider{cfg: cfg, lv: lv, uri: uri}, nil
+	return &Provider{cfg: cfg, lv: lv, uri: uri, dialer: tracked}, nil
 }
 
 // Close releases the libvirt connection.
@@ -270,6 +276,11 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// Abort the dial rather than abandoning it. Left running, p.dial stays
+		// non-nil and every later provider call would join the same permanently
+		// stuck attempt. Force-closing makes ConnectToURI return, so the goroutine
+		// records its error and clears p.dial, letting the next call redial.
+		p.dialer.forceClose()
 		return fmt.Errorf("libvirt: connecting to %q: %w", p.uri, ctx.Err())
 	case <-done:
 		p.mu.Lock()
@@ -293,12 +304,14 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 func (p *Provider) recycle() {
 	// Tolerates a zero Provider so the call wrappers can be exercised without a
 	// connection, and so a timeout during construction cannot panic.
-	if p == nil || p.lv == nil {
+	if p == nil || p.dialer == nil {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_ = p.lv.Disconnect()
+	// Force-close, never Disconnect. Disconnect sends a ProcConnectClose RPC and
+	// waits for the reply -- from the daemon that has already stopped replying,
+	// which is the only reason this is being called. It would block forever and
+	// the parked RPC it was meant to release would stay parked.
+	p.dialer.forceClose()
 }
 
 // Name implements providers.MachineProvider.
@@ -672,7 +685,7 @@ func (p *Provider) lookupByUUID(ctx context.Context, id string) (golibvirt.Domai
 }
 
 func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*providers.MachineState, error) {
-	state := &providers.MachineState{ID: formatUUID(dom.UUID)}
+	state := &providers.MachineState{ID: formatUUID(dom.UUID), Name: dom.Name}
 
 	st, _, err := call2(ctx, p, func() (int32, int32, error) { return p.lv.DomainGetState(dom, 0) })
 	if err != nil {

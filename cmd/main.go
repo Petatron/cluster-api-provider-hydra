@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"sync"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -39,6 +41,7 @@ import (
 
 	infrastructurev1alpha1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/controller"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 	libvirtprovider "github.com/Petatron/cluster-api-provider-hydra/internal/providers/libvirt"
 	// +kubebuilder:scaffold:imports
 )
@@ -202,41 +205,55 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The backend is constructed here and injected, so the reconciler depends on
-	// the MachineProvider interface rather than on libvirt. Adding a second
-	// backend is a change to this block, not to the controller.
-	// SetupSignalHandler must be called exactly once -- a second call panics --
-	// so the same context bounds the initial libvirt handshake and the manager.
-	// That also means a SIGTERM during a stalled connect aborts startup instead
-	// of waiting out the timeout.
+	// SetupSignalHandler must be called exactly once -- a second call panics -- so
+	// the same context bounds the libvirt handshake and the manager. A SIGTERM
+	// during a stalled connect therefore aborts rather than waiting out the
+	// timeout.
 	signalCtx := ctrl.SetupSignalHandler()
 
-	machineProvider, err := libvirtprovider.New(signalCtx, libvirtprovider.Config{
+	// The backend is built on first reconcile, not here.
+	//
+	// Connecting at startup meant a missing storage pool, or a hypervisor that
+	// happened to be down, crash-looped the manager before its health probes came
+	// up. The operator saw a restart count rather than a message, and the
+	// checked-in e2e suite could never observe a Running manager. Deferring it
+	// puts the reason on the HydraMachine as a terminal condition instead.
+	libvirtCfg := libvirtprovider.Config{
 		URI:         libvirtURI,
 		RemoteAddr:  libvirtRemoteAddr,
 		Insecure:    libvirtInsecure,
 		PKIPath:     libvirtPKIPath,
 		StoragePool: libvirtPool,
 		BaseImage:   libvirtBaseImage,
-	})
-	if err != nil {
-		setupLog.Error(err, "Failed to connect to libvirt",
-			"uri", libvirtURI, "remoteAddr", libvirtRemoteAddr)
-		os.Exit(1)
 	}
-	if libvirtInsecure && libvirtRemoteAddr != "" {
-		setupLog.Info("Using plaintext TCP to reach libvirt; this is only safe across a trusted tunnel")
-	}
+
+	var providerMu sync.Mutex
+	var machineProvider *libvirtprovider.Provider
 	defer func() {
-		if err := machineProvider.Close(); err != nil {
-			setupLog.Error(err, "Failed to close the libvirt connection")
+		providerMu.Lock()
+		defer providerMu.Unlock()
+		if machineProvider != nil {
+			if err := machineProvider.Close(); err != nil {
+				setupLog.Error(err, "Failed to close the libvirt connection")
+			}
 		}
 	}()
 
+	newProvider := func(ctx context.Context) (providers.MachineProvider, error) {
+		p, err := libvirtprovider.New(ctx, libvirtCfg)
+		if err != nil {
+			return nil, err
+		}
+		providerMu.Lock()
+		machineProvider = p
+		providerMu.Unlock()
+		return p, nil
+	}
+
 	if err := (&controller.HydraMachineReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Provider: machineProvider,
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		NewProvider: newProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")
 		os.Exit(1)

@@ -19,6 +19,7 @@ package libvirt
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -166,3 +167,60 @@ func TestRecycleToleratesNoConnection(t *testing.T) {
 	var nilProvider *Provider
 	nilProvider.recycle()
 }
+
+// forceClose exists because go-libvirt's Disconnect negotiates: it sends a close
+// RPC and waits for the reply. In the only case that matters -- a daemon that
+// has stopped replying -- that blocks exactly as hard as the call it was meant
+// to rescue. Closing the socket underneath does not negotiate.
+func TestTrackingDialerForceClosesTheConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Accept and never speak, which is the failure being modelled.
+			defer func() { _ = c.Close() }()
+		}
+	}()
+
+	d := newTrackingDialer(stubDialer{addr: ln.Addr().String()})
+	conn, err := d.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	// A read would block indefinitely against this listener; forceClose must make
+	// it return instead.
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf)
+		readErr <- err
+	}()
+
+	d.forceClose()
+
+	select {
+	case <-readErr:
+		// Released, which is the point.
+	case <-time.After(5 * time.Second):
+		t.Fatal("forceClose did not release a blocked read")
+	}
+
+	// Idempotent: teardown paths may call it more than once.
+	d.forceClose()
+}
+
+func TestTrackingDialerForceCloseWithoutConnection(t *testing.T) {
+	newTrackingDialer(stubDialer{addr: "127.0.0.1:1"}).forceClose()
+}
+
+type stubDialer struct{ addr string }
+
+func (s stubDialer) Dial() (net.Conn, error) { return net.Dial("tcp", s.addr) }

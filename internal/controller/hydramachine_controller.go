@@ -18,8 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -40,6 +43,16 @@ import (
 // running VM that nothing references and nothing will ever clean up.
 const MachineFinalizer = "hydramachine.infrastructure.cluster.x-k8s.io/finalizer"
 
+// maxReadableNamePrefix bounds the human-readable half of a backend machine
+// name. With the 20-character digest and separators this keeps the whole name
+// under 64 characters, comfortably inside the 255-byte filename limit that
+// directory-backed libvirt pools impose once ".qcow2" is appended.
+const maxReadableNamePrefix = 40
+
+// maxStatusAddresses mirrors the MaxItems on status.addresses in the CRD. The
+// two must stay in step: exceeding it makes the API server reject the patch.
+const maxStatusAddresses = 32
+
 // requeueWhileProvisioning is how long to wait before re-checking a machine that
 // exists but is not yet reporting ready.
 const requeueWhileProvisioning = 15 * time.Second
@@ -58,7 +71,46 @@ type HydraMachineReconciler struct {
 	// Provider is the infrastructure backend. It is an interface so the
 	// reconciler can be tested exhaustively against a fake, and so a second
 	// backend requires no controller changes.
+	//
+	// Tests set this directly. In production it is left nil and built on first
+	// use from NewProvider.
 	Provider providers.MachineProvider
+
+	// NewProvider builds the backend on first reconcile.
+	//
+	// Connecting lazily rather than at startup is deliberate. Building it in
+	// main() meant a missing storage pool, or a hypervisor that was simply down,
+	// crash-looped the manager before its health probes ever came up -- so the
+	// operator saw a restart count instead of a message, and the checked-in e2e
+	// suite could never observe a Running manager at all. Failing here instead
+	// puts the reason on the object as a terminal condition, where it is visible
+	// and survives being read later.
+	NewProvider func(context.Context) (providers.MachineProvider, error)
+
+	// mu guards lazy construction of Provider.
+	mu sync.Mutex
+}
+
+// provider returns the backend, building it on first use.
+//
+// Only a successful construction is cached, so a hypervisor that was unreachable
+// at first reconcile is retried rather than remembered as broken.
+func (r *HydraMachineReconciler) provider(ctx context.Context) (providers.MachineProvider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.Provider != nil {
+		return r.Provider, nil
+	}
+	if r.NewProvider == nil {
+		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
+	}
+	p, err := r.NewProvider(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("connecting to the infrastructure backend: %w", err)
+	}
+	r.Provider = p
+	return p, nil
 }
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;create;update;patch;delete
@@ -89,14 +141,22 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	prov, err := r.provider(ctx)
+	if err != nil {
+		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
+	}
+
 	if !machine.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, machine)
+		return r.reconcileDelete(ctx, prov, machine)
 	}
 	log.V(1).Info("reconciling machine", "name", machine.Name)
-	return r.reconcileNormal(ctx, machine)
+	return r.reconcileNormal(ctx, prov, machine)
 }
 
-func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, machine *infrav1.HydraMachine) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (ctrl.Result, error) {
 	// The finalizer must be persisted before any infrastructure exists.
 	// Registering it afterwards leaves a window where a delete would remove the
 	// object and strand the VM.
@@ -108,7 +168,7 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, machine *i
 		}
 	}
 
-	state, err := r.ensureMachine(ctx, machine)
+	state, err := r.ensureMachine(ctx, prov, machine)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -135,13 +195,18 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, machine *i
 
 // ensureMachine returns the machine's current state, creating it if it does not
 // exist yet.
-func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, machine *infrav1.HydraMachine) (*providers.MachineState, error) {
+func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (*providers.MachineState, error) {
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
-		id, err := r.machineIDFor(*machine.Spec.ProviderID)
+		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
 			return nil, err
 		}
-		state, err := r.Provider.Get(ctx, id)
+		state, err := prov.Get(ctx, id)
+		if err == nil {
+			if ownErr := verifyOwnership(machine, state); ownErr != nil {
+				return nil, ownErr
+			}
+		}
 		if err != nil {
 			if errors.Is(err, providers.ErrNotFound) {
 				// The machine was deleted out from under us. Recreating is not an
@@ -161,12 +226,12 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, machine *inf
 	// safe: if a previous reconcile created the machine but crashed before
 	// persisting the providerID, this call returns that same machine rather than
 	// creating a second one.
-	state, err := r.Provider.Create(ctx, specFor(machine))
+	state, err := prov.Create(ctx, specFor(machine))
 	if err != nil {
 		return nil, fmt.Errorf("creating machine: %w", err)
 	}
 
-	providerID := providers.ProviderID(r.Provider.Name(), state.ID)
+	providerID := providers.ProviderID(prov.Name(), state.ID)
 	patch := client.MergeFrom(machine.DeepCopy())
 	machine.Spec.ProviderID = &providerID
 	if err := r.Patch(ctx, machine, patch); err != nil {
@@ -178,12 +243,12 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, machine *inf
 	return state, nil
 }
 
-func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *infrav1.HydraMachine) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(machine, MachineFinalizer) {
 		return ctrl.Result{}, nil
 	}
 
-	id, err := r.deletionTargetFor(ctx, machine)
+	id, err := r.deletionTargetFor(ctx, prov, machine)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -192,7 +257,7 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 	}
 
 	if id != "" {
-		if err := r.Provider.Delete(ctx, id); err != nil {
+		if err := prov.Delete(ctx, id); err != nil {
 			if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
@@ -206,7 +271,7 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 	// Releasing the finalizer at that point would orphan the disk with nothing
 	// left referencing it. DeleteByName is idempotent, so the common case where
 	// everything was already removed costs one no-op lookup.
-	if err := r.Provider.DeleteByName(ctx, backendName(machine)); err != nil {
+	if err := prov.DeleteByName(ctx, backendName(machine)); err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -230,20 +295,35 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, machine *i
 //
 // Returns an empty ID when no providerID was persisted, in which case the
 // caller must DeleteByName so a volume-only leftover is still removed.
-func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, machine *infrav1.HydraMachine) (string, error) {
+func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (string, error) {
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
-		id, err := r.machineIDFor(*machine.Spec.ProviderID)
+		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
 			// An unusable providerID identifies nothing, and blocking deletion
 			// forever over it is worse than proceeding. Fall through to the name.
 			logf.FromContext(ctx).Error(err, "providerID unusable during deletion; falling back to name lookup",
 				"providerID", *machine.Spec.ProviderID)
 		} else {
-			return id, nil
+			// Confirm the ID actually resolves to this object's machine before
+			// anything destructive happens. A providerID supplied at creation time
+			// could otherwise point deletion at an unrelated domain.
+			state, err := prov.Get(ctx, id)
+			switch {
+			case err == nil:
+				if ownErr := verifyOwnership(machine, state); ownErr != nil {
+					return "", ownErr
+				}
+				return id, nil
+			case errors.Is(err, providers.ErrNotFound):
+				// Nothing under that ID; fall through to the name lookup, which is
+				// scoped to this object by construction.
+			default:
+				return "", fmt.Errorf("confirming ownership before deletion: %w", err)
+			}
 		}
 	}
 
-	state, err := r.Provider.FindByName(ctx, backendName(machine))
+	state, err := prov.FindByName(ctx, backendName(machine))
 	if err != nil {
 		if errors.Is(err, providers.ErrNotFound) {
 			return "", nil
@@ -255,20 +335,36 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, machine 
 	return state.ID, nil
 }
 
+// verifyOwnership refuses to act on a machine this object does not own.
+//
+// providerID is writable at creation, so anyone who can create a HydraMachine
+// can point it at an unrelated machine's ID. Format and backend checks do not
+// catch that -- a well-formed UUID for someone else's domain passes both. Only
+// comparing the resolved machine's name against this object's derived name
+// does, and without it deletion would destroy that unrelated machine.
+func verifyOwnership(machine *infrav1.HydraMachine, state *providers.MachineState) error {
+	want := backendName(machine)
+	if state.Name != want {
+		return fmt.Errorf("%w: providerID resolves to machine %q, which is not owned by this HydraMachine (expected %q)",
+			providers.ErrTerminal, state.Name, want)
+	}
+	return nil
+}
+
 // machineIDFor validates that a providerID belongs to this backend and returns
 // its machine ID.
 //
 // The backend segment is not decoration. Handing another backend's ID to this
 // provider could query an unrelated machine that happens to share an ID, or
 // report that a perfectly healthy machine has vanished.
-func (r *HydraMachineReconciler) machineIDFor(providerID string) (string, error) {
+func (r *HydraMachineReconciler) machineIDFor(prov providers.MachineProvider, providerID string) (string, error) {
 	backend, id, err := providers.ParseProviderID(providerID)
 	if err != nil {
 		return "", fmt.Errorf("stored providerID is unusable: %w", err)
 	}
-	if backend != r.Provider.Name() {
+	if backend != prov.Name() {
 		return "", fmt.Errorf("%w: providerID %q belongs to backend %q, but this controller runs %q",
-			providers.ErrTerminal, providerID, backend, r.Provider.Name())
+			providers.ErrTerminal, providerID, backend, prov.Name())
 	}
 	return id, nil
 }
@@ -305,12 +401,13 @@ func (r *HydraMachineReconciler) updateStatus(ctx context.Context, machine *infr
 	}
 	apimeta.SetStatusCondition(&machine.Status.Conditions, cond)
 
-	// A machine that is running but has not yet reported a failure is no longer
-	// failing. Leaving a stale terminal condition on the object would keep
-	// alarming about something that has since resolved.
-	if state.Ready {
-		apimeta.RemoveStatusCondition(&machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)
-	}
+	// Any successful provider observation means the previous terminal failure is
+	// no longer true, whether or not the machine is ready yet. Waiting for Ready
+	// would leave a stale ProvisioningFailed on an object whose configuration an
+	// operator has already fixed and which is now provisioning normally -- and
+	// that condition is exactly what a MachineHealthCheck might act on. Ongoing
+	// readiness is represented separately, by Ready=False.
+	apimeta.RemoveStatusCondition(&machine.Status.Conditions, infrav1.MachineProvisioningFailedCondition)
 
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("updating status: %w", err)
@@ -418,13 +515,24 @@ func hasIPAddress(addrs []providers.Address) bool {
 // delete -- each other's VM. The object UID closes that, and also ensures a
 // deleted-and-recreated object does not inherit its predecessor's machine.
 func backendName(machine *infrav1.HydraMachine) string {
-	// The full UID, not a prefix. Eight hex characters is 32 bits, where a
-	// birthday collision becomes plausible in tens of thousands of objects --
-	// and a collision here means two HydraMachines adopting and then deleting
-	// the same VM, which is the exact failure this name exists to prevent.
-	// Trading a guarantee for brevity is a poor bargain when the full value
-	// still leaves the domain and volume names within normal filesystem limits.
-	return fmt.Sprintf("%s-%s-%s", machine.Namespace, machine.Name, machine.UID)
+	// Uniqueness comes from a hash over the full namespace, name and UID -- not
+	// from a truncated UID, where 32 bits makes a birthday collision plausible in
+	// tens of thousands of objects, and a collision means two HydraMachines
+	// adopting and then deleting the same VM.
+	//
+	// The readable prefix is bounded because the name is not merely a label: it
+	// becomes a libvirt domain name and, with ".qcow2" appended, a filename.
+	// A namespace may be 63 characters and an object name 253, so concatenating
+	// them raw exceeds the 255-byte limit of directory-backed pools and a
+	// perfectly valid HydraMachine could never provision.
+	sum := sha256.Sum256([]byte(machine.Namespace + "/" + machine.Name + "/" + string(machine.UID)))
+	digest := hex.EncodeToString(sum[:])[:20] // 80 bits
+
+	readable := machine.Namespace + "-" + machine.Name
+	if len(readable) > maxReadableNamePrefix {
+		readable = readable[:maxReadableNamePrefix]
+	}
+	return fmt.Sprintf("%s-%s", readable, digest)
 }
 
 // specFor converts the Kubernetes API object into the backend-neutral spec.
@@ -449,16 +557,34 @@ func specFor(machine *infrav1.HydraMachine) providers.MachineSpec {
 	return spec
 }
 
+// toMachineAddresses converts, deduplicates and caps the provider's addresses.
+//
+// The cap is not cosmetic. status.addresses has MaxItems=32 in the CRD, and the
+// provider result is unbounded -- a multi-homed guest reporting more than that
+// would make every status patch rejected by the API server, after its VM had
+// already been created. The machine would exist and be permanently unrecordable.
+//
+// Order is preserved so the result is deterministic and does not churn the
+// object on every reconcile.
 func toMachineAddresses(addrs []providers.Address) []clusterv1.MachineAddress {
 	if len(addrs) == 0 {
 		return nil
 	}
-	out := make([]clusterv1.MachineAddress, 0, len(addrs))
+	seen := make(map[clusterv1.MachineAddress]struct{}, len(addrs))
+	out := make([]clusterv1.MachineAddress, 0, min(len(addrs), maxStatusAddresses))
 	for _, a := range addrs {
-		out = append(out, clusterv1.MachineAddress{
+		converted := clusterv1.MachineAddress{
 			Type:    clusterv1.MachineAddressType(a.Type),
 			Address: a.Address,
-		})
+		}
+		if _, dup := seen[converted]; dup {
+			continue
+		}
+		seen[converted] = struct{}{}
+		out = append(out, converted)
+		if len(out) == maxStatusAddresses {
+			break
+		}
 	}
 	return out
 }

@@ -92,6 +92,7 @@ func (p *Provider) Create(_ context.Context, spec providers.MachineSpec) (*provi
 	id := fmt.Sprintf("fake-%d", p.nextID)
 	state := &providers.MachineState{
 		ID:    id,
+		Name:  spec.Name,
 		Ready: p.ReadyOnCreate,
 		Addresses: []providers.Address{
 			{Type: providers.AddressTypeHostname, Address: spec.Name},
