@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"sync"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -39,6 +41,8 @@ import (
 
 	infrastructurev1alpha1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/controller"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
+	libvirtprovider "github.com/Petatron/cluster-api-provider-hydra/internal/providers/libvirt"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +65,8 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	var libvirtURI, libvirtRemoteAddr, libvirtPool, libvirtBaseImage, libvirtPKIPath string
+	var libvirtInsecure bool
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -69,6 +75,20 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&libvirtURI, "libvirt-uri", "qemu:///system",
+		"libvirt connection URI the provider drives.")
+	flag.StringVar(&libvirtRemoteAddr, "libvirt-remote-addr", "",
+		"host:port of a remote libvirt daemon. Empty uses the local socket. Remote "+
+			"connections use TLS; set --libvirt-insecure for plaintext TCP over a trusted tunnel.")
+	flag.BoolVar(&libvirtInsecure, "libvirt-insecure", false,
+		"Dial the remote libvirt daemon over raw TCP instead of TLS. Only for a trusted tunnel.")
+	flag.StringVar(&libvirtPKIPath, "libvirt-pki-path", "",
+		"Directory containing clientcert.pem, clientkey.pem and cacert.pem for TLS. "+
+			"Empty uses go-libvirt's default search paths.")
+	flag.StringVar(&libvirtPool, "libvirt-storage-pool", "",
+		"libvirt storage pool that machine disks are created in. Required.")
+	flag.StringVar(&libvirtBaseImage, "libvirt-base-image", "",
+		"volume name of the backing image machines are cloned from. Required.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -185,9 +205,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	// SetupSignalHandler must be called exactly once -- a second call panics -- so
+	// the same context bounds the libvirt handshake and the manager. A SIGTERM
+	// during a stalled connect therefore aborts rather than waiting out the
+	// timeout.
+	signalCtx := ctrl.SetupSignalHandler()
+
+	// The backend is built on first reconcile, not here.
+	//
+	// Connecting at startup meant a missing storage pool, or a hypervisor that
+	// happened to be down, crash-looped the manager before its health probes came
+	// up. The operator saw a restart count rather than a message, and the
+	// checked-in e2e suite could never observe a Running manager. Deferring it
+	// puts the reason on the HydraMachine as a terminal condition instead.
+	libvirtCfg := libvirtprovider.Config{
+		URI:         libvirtURI,
+		RemoteAddr:  libvirtRemoteAddr,
+		Insecure:    libvirtInsecure,
+		PKIPath:     libvirtPKIPath,
+		StoragePool: libvirtPool,
+		BaseImage:   libvirtBaseImage,
+	}
+
+	var providerMu sync.Mutex
+	var machineProvider *libvirtprovider.Provider
+	defer func() {
+		providerMu.Lock()
+		defer providerMu.Unlock()
+		if machineProvider != nil {
+			if err := machineProvider.Close(); err != nil {
+				setupLog.Error(err, "Failed to close the libvirt connection")
+			}
+		}
+	}()
+
+	newProvider := func(ctx context.Context) (providers.MachineProvider, error) {
+		p, err := libvirtprovider.New(ctx, libvirtCfg)
+		if err != nil {
+			return nil, err
+		}
+		providerMu.Lock()
+		machineProvider = p
+		providerMu.Unlock()
+		return p, nil
+	}
+
 	if err := (&controller.HydraMachineReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		NewProvider: newProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")
 		os.Exit(1)
@@ -204,7 +270,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}

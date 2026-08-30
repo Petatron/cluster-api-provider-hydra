@@ -103,15 +103,20 @@ type HydraMachineSpec struct {
 	VCPUs int32 `json:"vcpus"`
 
 	// memory is the RAM the machine is given, as a Kubernetes quantity, for
-	// example "8Gi".
+	// example "8Gi". Must be greater than zero -- a zero or negative value would
+	// otherwise reach libvirt as domain XML, and because this field is immutable
+	// the resulting object could never be corrected, only deleted.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="memory is immutable; replace the machine instead"
+	// +kubebuilder:validation:XValidation:rule="quantity(self).isGreaterThan(quantity('0'))",message="memory must be greater than zero"
 	Memory resource.Quantity `json:"memory"`
 
 	// diskSize is the size of the machine's root disk, as a Kubernetes quantity,
-	// for example "40Gi".
+	// for example "40Gi". Must be greater than zero, for the same reason as
+	// memory.
 	// +required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="diskSize is immutable; replace the machine instead"
+	// +kubebuilder:validation:XValidation:rule="quantity(self).isGreaterThan(quantity('0'))",message="diskSize must be greater than zero"
 	DiskSize resource.Quantity `json:"diskSize"`
 
 	// image is the base image the machine boots from.
@@ -200,6 +205,10 @@ const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady
 	// condition by Cluster API.
 	MachineReadyCondition = "Ready"
+
+	// MachinePausedCondition reports that reconciliation is suspended because the
+	// object carries the Cluster API paused annotation.
+	MachinePausedCondition = "Paused"
 
 	// MachineProvisioningFailedCondition reports a failure the provider cannot
 	// recover from on its own. The v1beta2 contract removed special treatment of

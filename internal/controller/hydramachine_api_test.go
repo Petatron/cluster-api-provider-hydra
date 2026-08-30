@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -28,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
 // These exercise the CRD schema against a real API server, which is the only
@@ -105,6 +107,35 @@ var _ = Describe("HydraMachine API", func() {
 			}))
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("vcpus"))
+		})
+	})
+
+	Context("capacity must be positive", func() {
+		// These fields are immutable, so a zero or negative value admitted here
+		// produces an object that can never be corrected -- only deleted -- while
+		// the resulting libvirt errors are classified retryable and it reconciles
+		// forever.
+		It("rejects zero memory", func() {
+			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
+				m.Spec.Memory = resource.MustParse("0")
+			}))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("greater than zero"))
+		})
+
+		It("rejects negative memory", func() {
+			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
+				m.Spec.Memory = resource.MustParse("-1Gi")
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("rejects zero disk", func() {
+			err := k8sClient.Create(ctx, newMachine(func(m *infrav1.HydraMachine) {
+				m.Spec.DiskSize = resource.MustParse("0")
+			}))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("greater than zero"))
 		})
 	})
 
@@ -328,3 +359,32 @@ var _ = Describe("HydraMachineTemplate API", func() {
 		Expect(cloned.ProviderID).To(BeNil())
 	})
 })
+
+// status.addresses has MaxItems=32 in the CRD while the provider result is
+// unbounded. Exceeding it makes the API server reject every status patch after
+// the VM already exists -- a machine that runs but can never be recorded.
+func TestToMachineAddressesCapsAndDeduplicates(t *testing.T) {
+	many := make([]providers.Address, 0, 100)
+	for i := range 100 {
+		many = append(many, providers.Address{
+			Type:    providers.AddressTypeInternalIP,
+			Address: fmt.Sprintf("10.0.0.%d", i),
+		})
+	}
+	got := toMachineAddresses(many)
+	if len(got) != maxStatusAddresses {
+		t.Fatalf("len = %d, want the schema cap of %d", len(got), maxStatusAddresses)
+	}
+	if got[0].Address != "10.0.0.0" {
+		t.Errorf("order not preserved: first = %q", got[0].Address)
+	}
+
+	dupes := []providers.Address{
+		{Type: providers.AddressTypeInternalIP, Address: "10.0.0.1"},
+		{Type: providers.AddressTypeInternalIP, Address: "10.0.0.1"},
+		{Type: providers.AddressTypeHostname, Address: "worker"},
+	}
+	if got := toMachineAddresses(dupes); len(got) != 2 {
+		t.Errorf("len = %d, want 2 after deduplication", len(got))
+	}
+}

@@ -3,6 +3,7 @@ module github.com/Petatron/cluster-api-provider-hydra
 go 1.26.0
 
 require (
+	github.com/digitalocean/go-libvirt v0.0.0-20260814190004-1a83157e1858
 	github.com/onsi/ginkgo/v2 v2.32.0
 	github.com/onsi/gomega v1.42.1
 	k8s.io/apimachinery v0.36.3
@@ -68,6 +69,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
 	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect

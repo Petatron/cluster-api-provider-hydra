@@ -102,12 +102,15 @@ spec:
                         - type: string
                         description: |-
                           diskSize is the size of the machine's root disk, as a Kubernetes quantity,
-                          for example "40Gi".
+                          for example "40Gi". Must be greater than zero, for the same reason as
+                          memory.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                         x-kubernetes-validations:
                         - message: diskSize is immutable; replace the machine instead
                           rule: self == oldSelf
+                        - message: diskSize must be greater than zero
+                          rule: quantity(self).isGreaterThan(quantity('0'))
                       image:
                         description: image is the base image the machine boots from.
                         properties:
@@ -149,12 +152,16 @@ spec:
                         - type: string
                         description: |-
                           memory is the RAM the machine is given, as a Kubernetes quantity, for
-                          example "8Gi".
+                          example "8Gi". Must be greater than zero -- a zero or negative value would
+                          otherwise reach libvirt as domain XML, and because this field is immutable
+                          the resulting object could never be corrected, only deleted.
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                         x-kubernetes-int-or-string: true
                         x-kubernetes-validations:
                         - message: memory is immutable; replace the machine instead
                           rule: self == oldSelf
+                        - message: memory must be greater than zero
+                          rule: quantity(self).isGreaterThan(quantity('0'))
                       networks:
                         description: |-
                           networks are the backend networks this machine attaches to, in order. The
