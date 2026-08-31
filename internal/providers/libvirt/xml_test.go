@@ -26,6 +26,9 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
+// testPool is the storage pool name the XML fixtures are built against.
+const testPool = "k8s-workers"
+
 func testSpec() providers.MachineSpec {
 	return providers.MachineSpec{
 		Name:        "worker-1",
@@ -38,7 +41,7 @@ func testSpec() providers.MachineSpec {
 }
 
 func TestDomainXMLIsWellFormedAndComplete(t *testing.T) {
-	out := domainXML(testSpec(), "k8s-workers", "worker-1.qcow2")
+	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -76,7 +79,7 @@ func TestDomainXMLEscapesNames(t *testing.T) {
 	spec := testSpec()
 	spec.Name = `evil"><name>pwned</name><x a="`
 
-	out := domainXML(spec, "pool", "vol")
+	out := domainXML(spec, "pool", "vol", "")
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatalf("generated XML does not parse: %v", err)
@@ -169,7 +172,7 @@ func TestIsRoutable(t *testing.T) {
 // absent, undefine the domain, and strand the real disk with nothing pointing
 // at it.
 func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
-	out := domainXML(testSpec(), "pool-the-machine-was-built-in", "worker-1.qcow2")
+	out := domainXML(testSpec(), "pool-the-machine-was-built-in", "worker-1.qcow2", "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -188,5 +191,87 @@ func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
 	}
 	if volume != "worker-1.qcow2" {
 		t.Errorf("disk volume = %q, want worker-1.qcow2", volume)
+	}
+}
+
+// A machine with bootstrap data gets a second disk. Everything about deletion
+// depends on that disk being visible in the domain XML, because that is where
+// teardown looks for what to reclaim.
+func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
+	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "worker-1-cidata.iso")
+
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated domain XML does not parse: %v\n%s", err, out)
+	}
+
+	if len(parsed.Devices.Disks) != 2 {
+		t.Fatalf("expected a root disk and a cloud-init CD-ROM, got %d disks", len(parsed.Devices.Disks))
+	}
+
+	var cdrom *diskDef
+	for i := range parsed.Devices.Disks {
+		if parsed.Devices.Disks[i].Device == "cdrom" {
+			cdrom = &parsed.Devices.Disks[i]
+		}
+	}
+	if cdrom == nil {
+		t.Fatalf("no CD-ROM device in %+v", parsed.Devices.Disks)
+	}
+	if cdrom.Source.Volume != "worker-1-cidata.iso" {
+		t.Errorf("cdrom volume = %q, want worker-1-cidata.iso", cdrom.Source.Volume)
+	}
+	if cdrom.Source.Pool != testPool {
+		t.Errorf("cdrom pool = %q, want k8s-workers", cdrom.Source.Pool)
+	}
+	// An ISO read as qcow2 is not a filesystem cloud-init can mount.
+	if cdrom.Driver.Type != formatRaw {
+		t.Errorf("cdrom driver type = %q, want %s", cdrom.Driver.Type, formatRaw)
+	}
+	// A writable datasource would let a guest rewrite its own bootstrap data,
+	// and a CD-ROM that is not read-only is not what cloud images expect.
+	if cdrom.ReadOnly == nil {
+		t.Error("cloud-init CD-ROM is not marked read-only")
+	}
+}
+
+// The no-bootstrap-data case has to stay clean: an empty cidata volume name must
+// attach no device at all rather than one pointing at "".
+func TestDomainXMLOmitsCloudInitWhenAbsent(t *testing.T) {
+	out := domainXML(testSpec(), "pool", "vol", "")
+
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated domain XML does not parse: %v", err)
+	}
+	if len(parsed.Devices.Disks) != 1 {
+		t.Fatalf("expected only the root disk, got %+v", parsed.Devices.Disks)
+	}
+	if strings.Contains(out, "cdrom") {
+		t.Error("domain XML mentions a cdrom with no bootstrap data")
+	}
+	// The root disk must never inherit the CD-ROM's read-only flag.
+	if parsed.Devices.Disks[0].ReadOnly != nil {
+		t.Error("root disk is marked read-only")
+	}
+}
+
+func TestRawVolumeXMLHasNoBackingStore(t *testing.T) {
+	out := rawVolumeXML("worker-1-cidata.iso", 366592)
+
+	var parsed volumeDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated volume XML does not parse: %v\n%s", err, out)
+	}
+	if parsed.Capacity.Value != 366592 {
+		t.Errorf("capacity = %d, want 366592", parsed.Capacity.Value)
+	}
+	if parsed.Target.Format.Type != formatRaw {
+		t.Errorf("format = %q, want %s", parsed.Target.Format.Type, formatRaw)
+	}
+	// A backing store here would make libvirt read the base image underneath the
+	// uploaded ISO.
+	if parsed.BackingSt != nil {
+		t.Errorf("cloud-init volume has a backing store: %+v", parsed.BackingSt)
 	}
 }

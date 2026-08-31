@@ -251,8 +251,12 @@ func main() {
 	}
 
 	if err := (&controller.HydraMachineReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// Uncached, and only used for bootstrap data Secrets. A cached read would
+		// start a cluster-wide Secret informer and hold every Secret in the
+		// cluster in this process's memory.
+		APIReader:   mgr.GetAPIReader(),
 		NewProvider: newProvider,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")

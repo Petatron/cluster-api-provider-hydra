@@ -39,6 +39,10 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers/fake"
 )
 
+// foreignMachineName stands for a backend machine this controller does not own,
+// used to prove that nothing destructive touches it.
+const foreignMachineName = "someone-elses-machine"
+
 // renamedProvider presents another provider under a different backend name, to
 // simulate a providerID written by a different backend.
 type renamedProvider struct {
@@ -69,9 +73,10 @@ var _ = Describe("HydraMachine Reconciler", func() {
 	BeforeEach(func() {
 		provider = fake.New()
 		r = &HydraMachineReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Provider: provider,
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Provider:  provider,
 		}
 		machine = newMachine(nil)
 		key = client.ObjectKeyFromObject(machine)
@@ -318,7 +323,7 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			// providerID is writable at creation, so anyone able to create a
 			// HydraMachine can aim it at somebody else's VM. Format and backend
 			// checks both pass for a well-formed foreign ID.
-			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: "someone-elses-machine"})
+			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: foreignMachineName})
 			Expect(err).NotTo(HaveOccurred())
 
 			pid := providers.ProviderID(provider.Name(), foreign.ID)
@@ -332,7 +337,7 @@ var _ = Describe("HydraMachine Reconciler", func() {
 		})
 
 		It("will not delete a machine it does not own", func() {
-			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: "someone-elses-machine"})
+			foreign, err := provider.Create(ctx, providers.MachineSpec{Name: foreignMachineName})
 			Expect(err).NotTo(HaveOccurred())
 
 			pid := providers.ProviderID(provider.Name(), foreign.ID)

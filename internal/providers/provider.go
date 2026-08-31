@@ -114,11 +114,29 @@ type MachineSpec struct {
 	Image    Image
 	Networks []Network
 
+	// Hostname is the name the machine should call itself, and through it the
+	// name it registers in Kubernetes under.
+	//
+	// It is separate from Name because the two answer different questions. Name
+	// must be globally unique on the backend and is derived from a hash, which
+	// makes it unsuitable as a node name; Hostname is the human-facing identity
+	// and comes from the Cluster API Machine.
+	//
+	// A backend that cannot set a hostname may ignore this, but should expect
+	// every machine cloned from one base image to answer to the same name.
+	Hostname string
+
 	// BootstrapData is cloud-init user-data, attached to the machine so it can
-	// configure itself on first boot. Empty until PET-9 wires up the Cluster API
-	// kubeadm bootstrap provider; a machine created with no bootstrap data boots
-	// but never joins a cluster, which is a useful state for testing the
-	// infrastructure half on its own.
+	// configure itself on first boot.
+	//
+	// Empty is a supported state, not a missing value: a machine created with no
+	// bootstrap data boots but never joins a cluster, which is how the
+	// infrastructure half is exercised without Cluster API in the picture.
+	//
+	// Backends that cannot deliver it MUST fail rather than ignore it. Silently
+	// dropping it produces a machine that comes up, looks healthy to the backend,
+	// and never joins anything -- a failure that only surfaces much later, as a
+	// Machine that never gets a Node.
 	BootstrapData []byte
 }
 
@@ -168,6 +186,12 @@ type MachineProvider interface {
 	//
 	// Implementations must therefore look for an existing machine by name first,
 	// and return it rather than creating another.
+	//
+	// Adoption must depend on nothing but spec.Name. A caller recovering from
+	// that crash window may be unable to supply the rest -- bootstrap data in
+	// particular is fetched from a Secret that can be rotated or cleaned up once
+	// the machine is running -- so an implementation that consulted other fields
+	// while adopting would make the machine unrecoverable.
 	Create(ctx context.Context, spec MachineSpec) (*MachineState, error)
 
 	// Get returns the machine's current state, or ErrNotFound.

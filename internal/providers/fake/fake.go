@@ -43,6 +43,12 @@ type Provider struct {
 	CreateCalls int
 	DeleteCalls int
 
+	// LastSpec is the spec of the most recent Create, recorded so a test can
+	// assert what actually reached the backend. Bootstrap data in particular is
+	// only observable here: it is deliberately absent from the API object, so
+	// there is nowhere else to check that the controller passed it on.
+	LastSpec providers.MachineSpec
+
 	// Injected failures. Set to make the corresponding call fail.
 	CreateErr error
 	GetErr    error
@@ -80,6 +86,7 @@ func (p *Provider) Create(_ context.Context, spec providers.MachineSpec) (*provi
 	defer p.mu.Unlock()
 
 	p.CreateCalls++
+	p.LastSpec = spec
 	if p.CreateErr != nil {
 		return nil, p.CreateErr
 	}

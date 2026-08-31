@@ -119,29 +119,48 @@ spec:
         # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
         resources:
           limits:
+            # A memory-backed emptyDir is charged to the container's memory
+            # allowance, so the /tmp mount above has to fit inside this number
+            # alongside the manager itself.
             cpu: 500m
-            memory: 128Mi
+            memory: 192Mi
           requests:
             cpu: 10m
             memory: 64Mi
-        # Replace the empty list -- do not add a second volumeMounts key, which
+        # Add to this list -- do not introduce a second volumeMounts key, which
         # YAML parsers may ignore in favour of this one.
-        volumeMounts: []
-        # [REMOTE-TLS] Replace the empty list with:
+        volumeMounts:
+          # Required, not optional. The root filesystem is read-only, and
+          # rendering a machine's cloud-init image stages it through a temporary
+          # directory; without somewhere writable the manager cannot provision
+          # any machine that has bootstrap data.
+          - name: tmp
+            mountPath: /tmp
+        # [REMOTE-TLS] Add:
         #   - name: libvirt-pki
         #     mountPath: /etc/pki/libvirt
         #     readOnly: true
         # [LOCAL-LIBVIRT] To drive libvirt over the host's local socket instead
-        # of a remote address, replace volumeMounts and volumes with the entries
-        # below and pin the pod to the hypervisor node with a nodeSelector.
+        # of a remote address, add the entries below and pin the pod to the
+        # hypervisor node with a nodeSelector. Add, not replace -- the tmp mount
+        # above is required in every configuration.
         # Without the mount the socket does not exist inside the pod and the
         # manager fails at startup; without the pin it may land on a node that
         # has no libvirt at all. A remote address avoids both problems and does
         # not assume the controller shares a host with the hypervisor.
         #   - name: libvirt-sock
         #     mountPath: /var/run/libvirt/libvirt-sock
-      # Replace the empty list -- do not add a second volumes key.
-      volumes: []
+      # Add to this list -- do not introduce a second volumes key.
+      volumes:
+        # Memory-backed on purpose. What is staged here is a machine's
+        # cloud-init user-data, which carries a live cluster join token, and a
+        # tmpfs keeps it off any disk -- including the node's. The size limit is
+        # far above a real image (a few hundred kilobytes) and bounded so a
+        # runaway cannot consume the pod's whole memory allowance.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
       # [REMOTE-TLS] Companion to the PKI mount above:
       #   - name: libvirt-pki
       #     secret:

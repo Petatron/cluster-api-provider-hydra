@@ -31,8 +31,10 @@ import (
 const (
 	unitBytes     = "bytes"
 	formatQcow2   = "qcow2"
+	formatRaw     = "raw"
 	modelVirtio   = "virtio"
 	diskBusVirtio = modelVirtio
+	diskBusSATA   = "sata"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -83,7 +85,12 @@ type diskDef struct {
 	Driver diskDriverDef `xml:"driver"`
 	Source diskSourceDef `xml:"source"`
 	Target diskTargetDef `xml:"target"`
+	// ReadOnly renders as a bare <readonly/> element when set. A nil pointer is
+	// omitted, which is what keeps it off the writable root disk.
+	ReadOnly *readOnlyDef `xml:"readonly,omitempty"`
 }
+
+type readOnlyDef struct{}
 
 type diskDriverDef struct {
 	Name string `xml:"name,attr"`
@@ -163,7 +170,11 @@ type volBackingDef struct {
 }
 
 // domainXML renders the libvirt domain definition for a machine.
-func domainXML(spec providers.MachineSpec, pool, volume string) string {
+//
+// cidataVolume names the cloud-init NoCloud image, attached as a CD-ROM. An
+// empty value attaches nothing, which is the no-bootstrap-data case: the machine
+// boots the base image and configures nothing.
+func domainXML(spec providers.MachineSpec, pool, volume, cidataVolume string) string {
 	d := domainDef{
 		Type:   "kvm",
 		Name:   spec.Name,
@@ -193,6 +204,23 @@ func domainXML(spec providers.MachineSpec, pool, volume string) string {
 			}},
 		},
 	}
+	if cidataVolume != "" {
+		// SATA rather than virtio, and sda rather than vda. cloud-init's NoCloud
+		// datasource finds this by filesystem label, so the bus does not strictly
+		// matter -- but a virtio CD-ROM is not something every guest image's
+		// initramfs has drivers for at the point cloud-init runs, and a SATA
+		// optical device is the configuration base cloud images are built and
+		// tested against.
+		d.Devices.Disks = append(d.Devices.Disks, diskDef{
+			Type:     "volume",
+			Device:   "cdrom",
+			Driver:   diskDriverDef{Name: "qemu", Type: formatRaw},
+			Source:   diskSourceDef{Pool: pool, Volume: cidataVolume},
+			Target:   diskTargetDef{Dev: "sda", Bus: diskBusSATA},
+			ReadOnly: &readOnlyDef{},
+		})
+	}
+
 	for _, n := range spec.Networks {
 		d.Devices.Interfaces = append(d.Devices.Interfaces, interfaceDef{
 			Type:   "bridge",
@@ -222,6 +250,25 @@ func volumeXML(name, baseImage string, sizeBytes int64) string {
 			Path:   baseImage,
 			Format: volFormatDef{Type: formatQcow2},
 		},
+	}
+	out, err := xml.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// rawVolumeXML renders a plain raw volume with no backing store, used for the
+// cloud-init image.
+//
+// Unlike a machine's root disk this is not a copy-on-write clone of anything --
+// it is a few hundred kilobytes of ISO9660 uploaded verbatim, and giving it a
+// backing store would make libvirt read the base image underneath it.
+func rawVolumeXML(name string, sizeBytes int64) string {
+	v := volumeDef{
+		Name:     name,
+		Capacity: volCapacityDef{Unit: unitBytes, Value: sizeBytes},
+		Target:   volTargetDef{Format: volFormatDef{Type: formatRaw}},
 	}
 	out, err := xml.Marshal(v)
 	if err != nil {
