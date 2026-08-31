@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -91,10 +92,11 @@ type linkage struct {
 func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *infrav1.HydraMachine) (*linkage, error) {
 	log := logf.FromContext(ctx)
 
-	name := ownerMachineName(machine)
-	if name == "" {
+	ref := ownerMachineRef(machine)
+	if ref == nil {
 		return &linkage{}, nil
 	}
+	name := ref.Name
 
 	owner := &clusterv1.Machine{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: name}, owner); err != nil {
@@ -111,6 +113,19 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 			return &linkage{ownerName: name}, nil
 		}
 		return nil, fmt.Errorf("reading owner Machine %q: %w", name, err)
+	}
+
+	// A name is not an identity. If the referenced Machine was deleted and
+	// another created under the same name while this object survived, the lookup
+	// above would silently return the new one -- and this HydraMachine would
+	// start taking its bootstrap Secret and its Cluster from an object that does
+	// not own it. The owner reference records the UID precisely so that
+	// substitution is detectable, so treat a mismatch exactly like the object
+	// being absent, which is what it is.
+	if ref.UID != "" && owner.UID != ref.UID {
+		log.V(1).Info("Owner Machine name is reused by a different object",
+			"machine", name, "want", ref.UID, "got", owner.UID)
+		return &linkage{ownerName: name}, nil
 	}
 
 	link := &linkage{ownerName: name, machine: owner}
@@ -139,8 +154,11 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 	return link, nil
 }
 
-// ownerMachineName returns the name of the Cluster API Machine owning this
-// object, or "" when nothing does.
+// ownerMachineRef returns the owner reference naming the Cluster API Machine
+// that owns this object, or nil when nothing does.
+//
+// The whole reference is returned rather than just the name, because the UID is
+// what makes the reference an identity instead of a label -- see resolveLinkage.
 //
 // This is deliberately a local implementation rather than sigs.k8s.io/cluster-api's
 // util.GetOwnerMachine. That helper lives in the main Cluster API module, which
@@ -148,8 +166,9 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 // in the full module to walk a slice of owner references would grow the
 // dependency graph considerably for fifteen lines of logic whose contract, an
 // owner reference of kind Machine in the cluster.x-k8s.io group, is stable.
-func ownerMachineName(machine *infrav1.HydraMachine) string {
-	for _, ref := range machine.OwnerReferences {
+func ownerMachineRef(machine *infrav1.HydraMachine) *metav1.OwnerReference {
+	for i := range machine.OwnerReferences {
+		ref := &machine.OwnerReferences[i]
 		if ref.Kind != machineKind {
 			continue
 		}
@@ -159,10 +178,10 @@ func ownerMachineName(machine *infrav1.HydraMachine) string {
 		// A core-group apiVersion such as "v1" carries no slash, and Cut reports
 		// that as not-found -- correct here, since Machine is never core.
 		if group, _, found := strings.Cut(ref.APIVersion, "/"); found && group == clusterv1.GroupVersion.Group {
-			return ref.Name
+			return ref
 		}
 	}
-	return ""
+	return nil
 }
 
 // pausedReason explains why reconciliation is suspended, or returns "".

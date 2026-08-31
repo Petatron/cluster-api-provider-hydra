@@ -191,3 +191,33 @@ func keysOf(m map[string]string) []string {
 	}
 	return out
 }
+
+// The caller maps ErrInvalid to a terminal condition a MachineHealthCheck may
+// act on, so the two classes must not be conflated: an operational failure
+// reported as unrecoverable invites remediation of a machine that was fine.
+func TestInvalidInputIsDistinguishable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		meta Metadata
+		data []byte
+	}{
+		{"no user data", Metadata{InstanceID: "x"}, nil},
+		{"oversized user data", Metadata{InstanceID: "x"}, bytes.Repeat([]byte("a"), maxUserDataBytes+1)},
+		{"missing instance id", Metadata{Hostname: testHostname}, []byte("#cloud-config\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ISO(tc.meta, tc.data)
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error = %v, want it to wrap ErrInvalid", err)
+			}
+		})
+	}
+}
+
+// Rendering valid input must not report ErrInvalid, or every staging failure
+// would be misclassified as unrecoverable.
+func TestSuccessfulRenderIsNotInvalid(t *testing.T) {
+	if _, err := ISO(Metadata{InstanceID: "x", Hostname: testHostname}, []byte("#cloud-config\n")); err != nil {
+		t.Fatalf("ISO() returned error on valid input: %v", err)
+	}
+}

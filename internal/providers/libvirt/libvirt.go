@@ -482,9 +482,16 @@ func (p *Provider) ensureCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 		Hostname:   spec.Hostname,
 	}, spec.BootstrapData)
 	if err != nil {
-		// Bad bootstrap data cannot be fixed by retrying, and a machine created
-		// without its cloud-init would come up unconfigured and never join.
-		return "", fmt.Errorf("%w: libvirt: rendering cloud-init for %q: %v", providers.ErrTerminal, spec.Name, err)
+		if errors.Is(err, cloudinit.ErrInvalid) {
+			// Bad bootstrap data cannot be fixed by retrying, and a machine created
+			// without its cloud-init would come up unconfigured and never join.
+			return "", fmt.Errorf("%w: libvirt: rendering cloud-init for %q: %v", providers.ErrTerminal, spec.Name, err)
+		}
+		// Everything else here is the environment, not the input: staging the
+		// image needs a writable temporary directory, and a full or unmounted one
+		// fails now and succeeds later. Reporting that as terminal would raise a
+		// condition an operator or MachineHealthCheck may remediate on.
+		return "", fmt.Errorf("libvirt: rendering cloud-init for %q: %w", spec.Name, err)
 	}
 
 	volName := cidataVolumeName(spec.Name)

@@ -271,19 +271,36 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		return state, nil
 	}
 
-	// Bootstrap data is fetched here, on the create path only, and deliberately
-	// not above. A machine that already exists must never be blocked on it: the
-	// Secret is consumed once at first boot, and re-requiring it would strand a
-	// running, healthy machine the moment its Secret was rotated or cleaned up.
-	bootstrapData, err := r.bootstrapDataFor(ctx, link)
-	if err != nil {
-		return nil, err
+	// No providerID yet, which means one of two things: no machine has been made,
+	// or one was made and the patch recording its ID failed. Ask before deciding,
+	// because only the first case needs bootstrap data.
+	//
+	// Fetching it unconditionally would make recovery from that crash window
+	// depend on the Secret still existing. It may not -- it can be rotated, or
+	// cleaned up once the machine is up -- and then this would wait forever on
+	// data the machine already consumed, never reaching the idempotent Create
+	// that would have rediscovered it. The providerID could never be recorded,
+	// for a machine that is running perfectly well.
+	var bootstrapData []byte
+	switch _, findErr := prov.FindByName(ctx, backendName(machine)); {
+	case findErr == nil:
+		// Already exists. Create adopts it below -- including starting it if a
+		// previous attempt defined it without ever starting it -- and by contract
+		// does not read the spec to do so.
+		logf.FromContext(ctx).Info("Adopting a machine whose providerID was never recorded",
+			"name", backendName(machine))
+	case errors.Is(findErr, providers.ErrNotFound):
+		var err error
+		if bootstrapData, err = r.bootstrapDataFor(ctx, link); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("searching for an existing machine: %w", findErr)
 	}
 
-	// No providerID yet. Create is idempotent on name, which is what makes this
-	// safe: if a previous reconcile created the machine but crashed before
-	// persisting the providerID, this call returns that same machine rather than
-	// creating a second one.
+	// Create is idempotent on name, which is what makes this safe: if a previous
+	// reconcile created the machine but crashed before persisting the providerID,
+	// this call returns that same machine rather than creating a second one.
 	state, err := prov.Create(ctx, specFor(machine, bootstrapData))
 	if err != nil {
 		return nil, fmt.Errorf("creating machine: %w", err)
@@ -666,9 +683,16 @@ func hostnameFor(machine *infrav1.HydraMachine) string {
 	sum := sha256.Sum256([]byte(machine.Namespace + "/" + machine.Name + "/" + string(machine.UID)))
 	digest := hex.EncodeToString(sum[:])[:8]
 
-	// TrimRight matters: a name cut mid-word can end in a hyphen, and a hostname
-	// label may not start or end with one.
-	prefix := strings.TrimRight(machine.Name[:maxHostnameLength-len(digest)-1], "-")
+	// Trim both hyphens and dots at the cut. A Kubernetes name may contain
+	// dot-separated DNS labels, so a cut landing just after a dot would produce
+	// "prefix.-digest", whose next label begins with a hyphen -- rejected, which
+	// puts the machine right back on the base image's shared hostname.
+	prefix := strings.TrimRight(machine.Name[:maxHostnameLength-len(digest)-1], "-.")
+	if prefix == "" {
+		// Not reachable for a name the API server accepted, since those begin with
+		// an alphanumeric. Guarded anyway: a bare "-digest" is not a valid label.
+		return digest
+	}
 	return prefix + "-" + digest
 }
 

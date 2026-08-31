@@ -51,10 +51,21 @@ const VolumeLabel = "cidata"
 // kilobytes; a megabyte is far beyond any legitimate use.
 const maxUserDataBytes = 1 << 20
 
+// ErrInvalid marks input that can never produce an image, however many times it
+// is retried.
+//
+// The distinction is load-bearing for the caller, not cosmetic. A provider maps
+// this to a terminal condition that a MachineHealthCheck may act on, so the
+// errors that do NOT wrap it -- staging a temporary directory, writing the image
+// -- must stay separable: a full disk is an operational failure that will pass,
+// and reporting it as unrecoverable invites remediation of a machine that was
+// about to be fine.
+var ErrInvalid = errors.New("cloudinit: invalid input")
+
 // ErrNoUserData reports that there is nothing to deliver. Callers should skip
 // attaching a datasource entirely rather than producing an empty one, which
 // cloud-init would read as an instruction to configure nothing.
-var ErrNoUserData = errors.New("cloudinit: no user data")
+var ErrNoUserData = fmt.Errorf("%w: no user data", ErrInvalid)
 
 // Metadata is the small amount of instance identity NoCloud carries alongside
 // the user-data.
@@ -85,16 +96,18 @@ func ISO(meta Metadata, userData []byte) ([]byte, error) {
 		return nil, ErrNoUserData
 	}
 	if len(userData) > maxUserDataBytes {
-		return nil, fmt.Errorf("cloudinit: user data is %d bytes, which exceeds the %d byte limit",
-			len(userData), maxUserDataBytes)
+		return nil, fmt.Errorf("%w: user data is %d bytes, which exceeds the %d byte limit",
+			ErrInvalid, len(userData), maxUserDataBytes)
 	}
 	if meta.InstanceID == "" {
-		return nil, errors.New("cloudinit: instance id is required")
+		return nil, fmt.Errorf("%w: instance id is required", ErrInvalid)
 	}
 
 	metaData, err := metadataYAML(meta)
 	if err != nil {
-		return nil, err
+		// Marshalling a map of strings, so this is unreachable in practice --
+		// but it is a property of the input, not of the environment.
+		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 
 	// NewWriter stages content in a temporary directory, so the user-data --

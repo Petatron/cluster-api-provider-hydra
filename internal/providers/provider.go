@@ -186,6 +186,12 @@ type MachineProvider interface {
 	//
 	// Implementations must therefore look for an existing machine by name first,
 	// and return it rather than creating another.
+	//
+	// Adoption must depend on nothing but spec.Name. A caller recovering from
+	// that crash window may be unable to supply the rest -- bootstrap data in
+	// particular is fetched from a Secret that can be rotated or cleaned up once
+	// the machine is running -- so an implementation that consulted other fields
+	// while adopting would make the machine unrecoverable.
 	Create(ctx context.Context, spec MachineSpec) (*MachineState, error)
 
 	// Get returns the machine's current state, or ErrNotFound.

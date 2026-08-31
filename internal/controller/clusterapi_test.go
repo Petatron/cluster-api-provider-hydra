@@ -95,6 +95,7 @@ func ownerMachine(dataSecret *string) *clusterv1.Machine {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "capi-" + name,
 			Namespace: linkNamespace,
+			UID:       types.UID("uid-capi-" + name),
 			Labels:    map[string]string{clusterv1.ClusterNameLabel: linkClusterName},
 		},
 		Spec: clusterv1.MachineSpec{
@@ -271,6 +272,28 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(ready.Reason).NotTo(Equal("WaitingForBootstrapData"))
 		})
 
+		It("recovers an unrecorded providerID even when the Secret is gone", func() {
+			// The window Create's idempotency exists for: the machine was made and
+			// the patch recording its ID failed. Bootstrap data was consumed at
+			// first boot and may since have been rotated away -- requiring it here
+			// would wait forever and the providerID could never be recorded, for a
+			// machine that is running perfectly well.
+			secretName := linkSecretName
+			r := build(ownerMachine(&secretName)) // Machine names a Secret that does not exist
+
+			state, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			out := reload(r)
+			Expect(out.Spec.ProviderID).NotTo(BeNil())
+			Expect(*out.Spec.ProviderID).To(Equal(providers.ProviderID(provider.Name(), state.ID)))
+			// Adopted, not duplicated.
+			Expect(provider.Count()).To(Equal(1))
+		})
+
 		It("provisions with no bootstrap data when nothing owns it", func() {
 			// A HydraMachine created directly is the documented way to exercise the
 			// infrastructure half on its own: it boots and never joins a cluster.
@@ -341,6 +364,21 @@ var _ = Describe("Cluster API linkage", func() {
 
 		It("leaves a name that already fits alone", func() {
 			Expect(hostnameFor(hm)).To(Equal(linkMachineName))
+		})
+
+		It("never leaves a dot at the cut, which would start a label with a hyphen", func() {
+			// Names may contain dot-separated DNS labels. A cut landing just after
+			// a dot yields "prefix.-digest", whose next label begins with a hyphen
+			// -- rejected, which puts the machine back on the base image's shared
+			// hostname.
+			name := strings.Repeat("a", 53) + "." + strings.Repeat("b", 150)
+			got := hostnameFor(&infrav1.HydraMachine{ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: linkNamespace, UID: "uid",
+			}})
+
+			Expect(got).NotTo(ContainSubstring(".-"))
+			Expect(got).NotTo(HaveSuffix("."))
+			Expect(len(got)).To(BeNumerically("<=", maxHostnameLength))
 		})
 
 		It("never ends a truncated hostname with a hyphen", func() {
@@ -455,14 +493,34 @@ var _ = Describe("Cluster API linkage", func() {
 				{APIVersion: "example.com/v1", Kind: machineKind, Name: foreignMachineName},
 				{APIVersion: "v1", Kind: machineKind, Name: "core-group-machine"},
 			}
-			Expect(ownerMachineName(hm)).To(BeEmpty())
+			Expect(ownerMachineRef(hm)).To(BeNil())
 		})
 
 		It("matches a Machine on group alone, across contract versions", func() {
 			hm.OwnerReferences = []metav1.OwnerReference{
 				{APIVersion: "cluster.x-k8s.io/v1beta1", Kind: machineKind, Name: "older-contract"},
 			}
-			Expect(ownerMachineName(hm)).To(Equal("older-contract"))
+			ref := ownerMachineRef(hm)
+			Expect(ref).NotTo(BeNil())
+			Expect(ref.Name).To(Equal("older-contract"))
+		})
+
+		It("refuses a Machine that has taken over the owner's name", func() {
+			// A name is not an identity. If the real owner was deleted and another
+			// Machine created under the same name, following it would take this
+			// object's bootstrap Secret and Cluster from something that does not
+			// own it. Treated as absent, which is what the real owner is.
+			imposter := ownerMachine(nil)
+			imposter.UID = "a-completely-different-machine"
+			r := build(imposter)
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForOwnerMachine"))
 		})
 	})
 
