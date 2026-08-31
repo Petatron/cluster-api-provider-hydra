@@ -201,12 +201,13 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 
 	state, err := r.ensureMachine(ctx, prov, machine, link)
 	if reason := waitReasonFor(err); reason != "" {
-		// Not a failure. Cluster API populates a machine's owner and its bootstrap
-		// Secret asynchronously, so every machine it creates passes through these
-		// states on its way up. They get their own reasons -- an operator watching
-		// a machine that never joins needs to know whether it is waiting on the
-		// Machine controller, on CABPK, or on the hypervisor, and
-		// "ProvisioningFailedRetrying" would answer none of the three.
+		// Not a failure. Cluster API populates a machine's owner, its cluster's
+		// infrastructure and its bootstrap Secret asynchronously, so every machine
+		// it creates passes through these states on its way up. Each gets its own
+		// reason -- an operator watching a machine that never joins needs to know
+		// whether it is waiting on the Machine controller, on the infrastructure
+		// cluster, on CABPK, or on the hypervisor, and
+		// "ProvisioningFailedRetrying" would answer none of them.
 		if statusErr := r.recordWaiting(ctx, machine, reason, err.Error()); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -290,6 +291,13 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		logf.FromContext(ctx).Info("Adopting a machine whose providerID was never recorded",
 			"name", backendName(machine))
 	case errors.Is(findErr, providers.ErrNotFound):
+		// Nothing exists, so this really is a create. Both gates belong here and
+		// not earlier: an existing machine being adopted above must not be blocked
+		// on the cluster or on a Secret it already consumed, which is the recovery
+		// path FindByName exists to protect.
+		if err := clusterReadyForCreate(link); err != nil {
+			return nil, err
+		}
 		var err error
 		if bootstrapData, err = r.bootstrapDataFor(ctx, link); err != nil {
 			return nil, err
@@ -553,6 +561,10 @@ func waitReasonFor(err error) string {
 	switch {
 	case errors.Is(err, errWaitingForOwner):
 		return "WaitingForOwnerMachine"
+	case errors.Is(err, errWaitingForCluster):
+		return "WaitingForCluster"
+	case errors.Is(err, errWaitingForClusterInfra):
+		return "WaitingForClusterInfrastructure"
 	case errors.Is(err, errWaitingForBootstrap):
 		return "WaitingForBootstrapData"
 	default:

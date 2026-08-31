@@ -110,6 +110,20 @@ func ownerMachine(dataSecret *string) *clusterv1.Machine {
 	}
 }
 
+// readyCluster is a Cluster that has reported its infrastructure provisioned,
+// which is the precondition the contract puts on creating any machine.
+func readyCluster() *clusterv1.Cluster {
+	provisioned := true
+	return &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: linkClusterName, Namespace: linkNamespace},
+		Status: clusterv1.ClusterStatus{
+			Initialization: clusterv1.ClusterInitializationStatus{
+				InfrastructureProvisioned: &provisioned,
+			},
+		},
+	}
+}
+
 func bootstrapSecret(name string, data map[string][]byte) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: linkNamespace},
@@ -126,8 +140,10 @@ var _ = Describe("Cluster API linkage", func() {
 		key      types.NamespacedName
 	)
 
-	// build wires a reconciler over exactly the objects a spec cares about.
-	build := func(objs ...client.Object) *HydraMachineReconciler {
+	// buildWithoutCluster wires a reconciler over exactly the objects given, with
+	// no Cluster unless one is passed. Used by the specs that are about the
+	// Cluster itself.
+	buildWithoutCluster := func(objs ...client.Object) *HydraMachineReconciler {
 		s := linkScheme()
 		all := append([]client.Object{hm}, objs...)
 		c := fakeclient.NewClientBuilder().
@@ -138,6 +154,20 @@ var _ = Describe("Cluster API linkage", func() {
 		// In production APIReader is the manager's uncached reader. The fake
 		// client has no cache, so it stands in for both.
 		return &HydraMachineReconciler{Client: c, APIReader: c, Scheme: s, Provider: provider}
+	}
+
+	// build is the same, plus a ready Cluster when the spec did not bring one.
+	//
+	// Every machine here carries the cluster-name label, and creating one now
+	// requires that Cluster to be readable and provisioned -- so without this,
+	// every spec would be testing the cluster gate instead of its own subject.
+	build := func(objs ...client.Object) *HydraMachineReconciler {
+		for _, o := range objs {
+			if _, ok := o.(*clusterv1.Cluster); ok {
+				return buildWithoutCluster(objs...)
+			}
+		}
+		return buildWithoutCluster(append(objs, readyCluster())...)
 	}
 
 	reload := func(r *HydraMachineReconciler) *infrav1.HydraMachine {
@@ -394,10 +424,11 @@ var _ = Describe("Cluster API linkage", func() {
 
 	Context("pausing", func() {
 		pausedCluster := func(paused bool) *clusterv1.Cluster {
-			return &clusterv1.Cluster{
-				ObjectMeta: metav1.ObjectMeta{Name: linkClusterName, Namespace: linkNamespace},
-				Spec:       clusterv1.ClusterSpec{Paused: &paused},
-			}
+			// Provisioned, so these specs isolate pausing rather than also
+			// tripping the cluster-infrastructure gate.
+			c := readyCluster()
+			c.Spec.Paused = &paused
+			return c
 		}
 
 		It("honours spec.paused on the owning Cluster", func() {
@@ -449,18 +480,80 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.Count()).To(Equal(1))
 		})
 
-		It("keeps reconciling when the Cluster has been deleted", func() {
-			// A Cluster is removed while its Machines are still being torn down.
-			// Failing here would block exactly the deletions that must still run.
+		It("does not create a machine while the Cluster cannot be read", func() {
+			// The contract stops normal provisioning when the Cluster is not
+			// findable. Creating here would attach a VM to a cluster that may have
+			// been deleted, or that the cache has simply not caught up with.
 			secretName := linkSecretName
-			r := build(
+			r := buildWithoutCluster(
 				ownerMachine(&secretName),
 				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
 			)
 
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForCluster"))
+		})
+
+		It("still tears down when the Cluster has been deleted", func() {
+			// The wait above must not reach deletion. A Cluster is removed while
+			// its Machines are still being torn down, so blocking there would wedge
+			// the finalizer on every machine in the cluster.
+			hm.Finalizers = []string{MachineFinalizer}
+			now := metav1.Now()
+			hm.DeletionTimestamp = &now
+			r := buildWithoutCluster(ownerMachine(nil))
+
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(provider.Count()).To(Equal(1))
+
+			err = r.Get(ctx, key, &infrav1.HydraMachine{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"the finalizer should have been released and the object collected")
+		})
+
+		It("waits until the Cluster reports its infrastructure provisioned", func() {
+			// Shared cluster infrastructure -- networks, load balancers, whatever
+			// the infrastructure cluster owns -- has to exist before a machine is
+			// attached to it.
+			unprovisioned := readyCluster()
+			unprovisioned.Status.Initialization.InfrastructureProvisioned = nil
+
+			secretName := linkSecretName
+			r := build(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				unprovisioned,
+			)
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForClusterInfrastructure"))
+		})
+
+		It("does not block an already-created machine on the Cluster", func() {
+			// The gate is on creation only. Blocking observation would flip a
+			// healthy machine to not-ready every time the cache lagged, and
+			// blocking adoption would break the providerID recovery path.
+			r := buildWithoutCluster(ownerMachine(nil))
+
+			state, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			out := reload(r)
+			Expect(out.Spec.ProviderID).NotTo(BeNil())
+			Expect(*out.Spec.ProviderID).To(Equal(providers.ProviderID(provider.Name(), state.ID)))
 		})
 
 		It("records the reason that is currently in effect", func() {

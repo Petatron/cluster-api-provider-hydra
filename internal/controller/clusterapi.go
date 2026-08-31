@@ -64,6 +64,19 @@ var errWaitingForBootstrap = errors.New("waiting for bootstrap data")
 // different fix, and an operator needs to be able to tell them apart.
 var errWaitingForOwner = errors.New("waiting for the owning Machine")
 
+// errWaitingForCluster reports that the Cluster this machine belongs to cannot
+// be read, and errWaitingForClusterInfra that it exists but its infrastructure
+// is not provisioned yet.
+//
+// The Cluster API contract requires an infrastructure provider to hold off
+// normal provisioning in both cases: shared cluster infrastructure -- networks,
+// load balancers, whatever the infrastructure cluster owns -- has to exist
+// before machines are attached to it. Both are waits, never failures.
+var (
+	errWaitingForCluster      = errors.New("waiting for the Cluster")
+	errWaitingForClusterInfra = errors.New("waiting for cluster infrastructure")
+)
+
 // linkage is the Cluster API context surrounding a HydraMachine.
 //
 // Both fields may be nil, and nil is a supported state rather than an error:
@@ -77,6 +90,12 @@ type linkage struct {
 	// now" -- two situations that must not be treated alike, because the first
 	// provisions and the second must wait.
 	ownerName string
+
+	// clusterName is the Cluster named by the cluster-name label, whether or not
+	// that Cluster could be read -- the same distinction ownerName draws, for the
+	// same reason. A Cluster that is merely unreadable must not look like a
+	// machine that belongs to no cluster at all.
+	clusterName string
 
 	machine *clusterv1.Machine
 	cluster *clusterv1.Cluster
@@ -138,13 +157,16 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 		return link, nil
 	}
 
+	link.clusterName = clusterName
+
 	cluster := &clusterv1.Cluster{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: clusterName}, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
-			// A named but absent Cluster only costs us the spec.paused check. That
-			// is worth trading away: a Cluster is deleted while its Machines are
-			// still being torn down, so failing here would block exactly the
-			// deletions that must still run.
+			// Not an error, and not "no cluster" either. Returning here leaves
+			// clusterName set, which is what makes creation wait while deletion
+			// proceeds -- a Cluster is removed while its Machines are still being
+			// torn down, so failing outright would block exactly the deletions that
+			// must still run.
 			log.V(1).Info("Cluster named by label does not exist", "cluster", clusterName)
 			return link, nil
 		}
@@ -205,6 +227,33 @@ func pausedReason(machine *infrav1.HydraMachine, link *linkage) string {
 		return fmt.Sprintf("the %s annotation on Cluster %q", clusterv1.PausedAnnotation, link.cluster.Name)
 	}
 	return ""
+}
+
+// clusterReadyForCreate reports why a machine must not be created yet, or nil.
+//
+// Called only from the create path, never from deletion and never when merely
+// observing a machine that already exists. That placement is the point: the
+// contract asks providers to hold off *provisioning* until cluster
+// infrastructure is ready, and applying the same gate to teardown would wedge
+// finalizers, while applying it to observation would flip a healthy machine to
+// not-ready every time the cache lagged.
+func clusterReadyForCreate(link *linkage) error {
+	if link.clusterName == "" {
+		// Not part of a cluster. A standalone HydraMachine has no shared
+		// infrastructure to wait for.
+		return nil
+	}
+	if link.cluster == nil {
+		return fmt.Errorf("%w: Cluster %q is not visible yet", errWaitingForCluster, link.clusterName)
+	}
+	if provisioned := link.cluster.Status.Initialization.InfrastructureProvisioned; provisioned == nil || !*provisioned {
+		// Creating a machine before the cluster's own infrastructure exists gives
+		// it nothing to attach to -- no network, no load balancer, depending on
+		// what the infrastructure cluster owns.
+		return fmt.Errorf("%w: Cluster %q has not reported its infrastructure provisioned",
+			errWaitingForClusterInfra, link.clusterName)
+	}
+	return nil
 }
 
 // bootstrapDataFor fetches the cloud-init user-data the machine must boot with.
