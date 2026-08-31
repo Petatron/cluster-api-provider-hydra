@@ -18,11 +18,13 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -132,7 +134,9 @@ var _ = Describe("Cluster API linkage", func() {
 			WithObjects(all...).
 			WithStatusSubresource(&infrav1.HydraMachine{}).
 			Build()
-		return &HydraMachineReconciler{Client: c, Scheme: s, Provider: provider}
+		// In production APIReader is the manager's uncached reader. The fake
+		// client has no cache, so it stands in for both.
+		return &HydraMachineReconciler{Client: c, APIReader: c, Scheme: s, Provider: provider}
 	}
 
 	reload := func(r *HydraMachineReconciler) *infrav1.HydraMachine {
@@ -279,14 +283,74 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.LastSpec.BootstrapData).To(BeEmpty())
 		})
 
-		It("treats an owner reference to a deleted Machine as standalone", func() {
-			// Garbage collection will remove this object shortly. Blocking on the
-			// corpse in the meantime would wedge it.
+		It("waits, rather than provisioning, when the owning Machine is not visible", func() {
+			// An owner reference whose target cannot be read is NOT the standalone
+			// case. Provisioning through it would create a VM with no bootstrap
+			// data, and once providerID is persisted the Secret is never read
+			// again -- so that VM could never be repaired and would never join.
+			r := build()
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForOwnerMachine"))
+			Expect(ready.Message).To(ContainSubstring("capi-" + linkMachineName))
+		})
+
+		It("still tears down when the owning Machine is already gone", func() {
+			// The wait above must not reach deletion. A Machine is removed before
+			// the infrastructure it described, so blocking here would wedge the
+			// finalizer on every machine deleted in the normal order.
+			hm.Finalizers = []string{MachineFinalizer}
+			now := metav1.Now()
+			hm.DeletionTimestamp = &now
 			r := build()
 
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(provider.Count()).To(Equal(1))
+
+			out := &infrav1.HydraMachine{}
+			err = r.Get(ctx, key, out)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"the finalizer should have been released and the object collected")
+		})
+	})
+
+	Context("hostnames", func() {
+		It("bounds a name Linux would refuse, keeping it unique", func() {
+			// metadata.name allows 253 characters; Linux caps a hostname at 63.
+			// Passing a long one through does not fail loudly -- cloud-init simply
+			// does not set it, and every clone of the base image answers to the
+			// same name, which is the collision Hostname exists to prevent.
+			long := strings.Repeat("a", 200)
+
+			one := hostnameFor(&infrav1.HydraMachine{ObjectMeta: metav1.ObjectMeta{
+				Name: long, Namespace: linkNamespace, UID: "uid-one",
+			}})
+			two := hostnameFor(&infrav1.HydraMachine{ObjectMeta: metav1.ObjectMeta{
+				Name: long, Namespace: linkNamespace, UID: "uid-two",
+			}})
+
+			Expect(len(one)).To(BeNumerically("<=", maxHostnameLength))
+			// Truncation alone would trade one collision for another.
+			Expect(one).NotTo(Equal(two))
+		})
+
+		It("leaves a name that already fits alone", func() {
+			Expect(hostnameFor(hm)).To(Equal(linkMachineName))
+		})
+
+		It("never ends a truncated hostname with a hyphen", func() {
+			// A label may not start or end with one, and a name cut mid-word can.
+			name := strings.Repeat("a", 54) + strings.Repeat("-", 20)
+			got := hostnameFor(&infrav1.HydraMachine{ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: linkNamespace, UID: "uid",
+			}})
+			Expect(got).NotTo(HaveSuffix("-"))
+			Expect(len(got)).To(BeNumerically("<=", maxHostnameLength))
 		})
 	})
 

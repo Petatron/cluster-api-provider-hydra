@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,11 @@ const MachineFinalizer = "hydramachine.infrastructure.cluster.x-k8s.io/finalizer
 // directory-backed libvirt pools impose once ".qcow2" is appended.
 const maxReadableNamePrefix = 40
 
+// maxHostnameLength is the longest hostname a Linux guest will accept. The
+// kernel's HOST_NAME_MAX is 64 including the terminator, and a DNS label is
+// capped at the same 63 characters, so one bound covers both.
+const maxHostnameLength = 63
+
 // maxStatusAddresses mirrors the MaxItems on status.addresses in the CRD. The
 // two must stay in step: exceeding it makes the API server reject the patch.
 const maxStatusAddresses = 32
@@ -68,6 +74,14 @@ const requeueWhileHealthy = 5 * time.Minute
 type HydraMachineReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader reads directly from the API server, bypassing the shared cache.
+	//
+	// It exists for exactly one kind: bootstrap data Secrets. A cached read would
+	// start a cluster-wide Secret informer on first use and retain every Secret
+	// in the cluster in this process's memory -- for the sake of one key from a
+	// handful of them. See bootstrapDataFor.
+	APIReader client.Reader
 
 	// Provider is the infrastructure backend. It is an interface so the
 	// reconciler can be tested exhaustively against a fake, and so a second
@@ -118,7 +132,10 @@ func (r *HydraMachineReconciler) provider(ctx context.Context) (providers.Machin
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/finalizers,verbs=update
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;clusters,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// Secrets are read one at a time through the uncached APIReader, never listed
+// or watched -- so this grant is deliberately get-only. Widening it would make
+// a cluster-wide Secret informer possible again.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // Reconcile drives a HydraMachine towards its desired state.
 func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -183,13 +200,14 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 	}
 
 	state, err := r.ensureMachine(ctx, prov, machine, link)
-	if errors.Is(err, errWaitingForBootstrap) {
-		// Not a failure. The bootstrap provider publishes its Secret
-		// asynchronously, so every Cluster API machine passes through this state
-		// on its way up. Report it as a distinct reason -- an operator watching a
-		// machine that never joins needs to know whether it is waiting on CABPK or
-		// on the hypervisor, and "ProvisioningFailedRetrying" would answer neither.
-		if statusErr := r.recordWaiting(ctx, machine, "WaitingForBootstrapData", err.Error()); statusErr != nil {
+	if reason := waitReasonFor(err); reason != "" {
+		// Not a failure. Cluster API populates a machine's owner and its bootstrap
+		// Secret asynchronously, so every machine it creates passes through these
+		// states on its way up. They get their own reasons -- an operator watching
+		// a machine that never joins needs to know whether it is waiting on the
+		// Machine controller, on CABPK, or on the hypervisor, and
+		// "ProvisioningFailedRetrying" would answer none of the three.
+		if statusErr := r.recordWaiting(ctx, machine, reason, err.Error()); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: requeueWhileProvisioning}, nil
@@ -512,6 +530,19 @@ func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1
 	return nil
 }
 
+// waitReasonFor maps a wait to the condition reason that names it, or returns
+// "" for anything that is not a wait.
+func waitReasonFor(err error) string {
+	switch {
+	case errors.Is(err, errWaitingForOwner):
+		return "WaitingForOwnerMachine"
+	case errors.Is(err, errWaitingForBootstrap):
+		return "WaitingForBootstrapData"
+	default:
+		return ""
+	}
+}
+
 // recordWaiting reports that the machine is blocked on something that is
 // expected to arrive, as distinct from something that has gone wrong.
 //
@@ -615,6 +646,32 @@ func backendName(machine *infrav1.HydraMachine) string {
 	return fmt.Sprintf("%s-%s", readable, digest)
 }
 
+// hostnameFor derives a hostname the guest can actually accept.
+//
+// A Kubernetes object name may be 253 characters; Linux caps a hostname at 64
+// bytes including the terminator, and a DNS label at 63. Passing a long name
+// through verbatim does not fail loudly -- cloud-init simply does not set the
+// hostname, and the machine keeps the one baked into the base image. Every
+// clone of that image then answers to the same name, which is precisely the
+// collision Hostname exists to prevent.
+//
+// Truncation alone would trade that collision for a subtler one, so a digest of
+// the full identity is appended whenever the name does not fit. Two machines
+// sharing a 55-character prefix still get distinct hostnames.
+func hostnameFor(machine *infrav1.HydraMachine) string {
+	if len(machine.Name) <= maxHostnameLength {
+		return machine.Name
+	}
+
+	sum := sha256.Sum256([]byte(machine.Namespace + "/" + machine.Name + "/" + string(machine.UID)))
+	digest := hex.EncodeToString(sum[:])[:8]
+
+	// TrimRight matters: a name cut mid-word can end in a hyphen, and a hostname
+	// label may not start or end with one.
+	prefix := strings.TrimRight(machine.Name[:maxHostnameLength-len(digest)-1], "-")
+	return prefix + "-" + digest
+}
+
 // specFor converts the Kubernetes API object into the backend-neutral spec.
 //
 // This is the only place quantities are turned into bytes, so no backend has to
@@ -632,7 +689,7 @@ func specFor(machine *infrav1.HydraMachine, bootstrapData []byte) providers.Mach
 		// nodes`. Uniqueness still holds where it matters: Cluster API names
 		// Machines uniquely within a namespace, and a cluster's nodes come from
 		// one namespace.
-		Hostname:      machine.Name,
+		Hostname:      hostnameFor(machine),
 		BootstrapData: bootstrapData,
 		VCPUs:         machine.Spec.VCPUs,
 		MemoryBytes:   machine.Spec.Memory.Value(),
@@ -691,6 +748,10 @@ func toMachineAddresses(addrs []providers.Address) []clusterv1.MachineAddress {
 // TLS key, every application credential -- in a provider that needs one key
 // from a handful of them. The Machine watch covers the same event anyway, since
 // spec.bootstrap.dataSecretName is what changes when the Secret becomes usable.
+//
+// Not watching is only half of that guarantee. A cached Get starts the same
+// informer a watch would, so bootstrapDataFor reads through APIReader instead;
+// the two together are what keep Secrets out of this process.
 func (r *HydraMachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.HydraMachine{}).

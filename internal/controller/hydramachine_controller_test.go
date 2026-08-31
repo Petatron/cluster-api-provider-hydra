@@ -73,9 +73,10 @@ var _ = Describe("HydraMachine Reconciler", func() {
 	BeforeEach(func() {
 		provider = fake.New()
 		r = &HydraMachineReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Provider: provider,
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Provider:  provider,
 		}
 		machine = newMachine(nil)
 		key = client.ObjectKeyFromObject(machine)

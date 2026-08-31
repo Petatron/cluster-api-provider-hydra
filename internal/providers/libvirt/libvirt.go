@@ -37,6 +37,8 @@ import (
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
 	"github.com/Petatron/cluster-api-provider-hydra/internal/cloudinit"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
@@ -355,6 +357,27 @@ func (p *Provider) Name() string { return "libvirt" }
 func rootVolumeName(machineName string) string { return machineName + ".qcow2" }
 
 func cidataVolumeName(machineName string) string { return machineName + "-cidata.iso" }
+
+// partitionOwnedDisks splits a domain's disks into the ones this provider
+// created and the ones it did not.
+//
+// Deletion is keyed on the deterministic names Create uses rather than on
+// whatever the domain has attached, so a volume an operator added by hand is
+// never destroyed by a HydraMachine deletion.
+func partitionOwnedDisks(machineName string, disks []diskSource) (ours, foreign []diskSource) {
+	owned := map[string]struct{}{
+		rootVolumeName(machineName):   {},
+		cidataVolumeName(machineName): {},
+	}
+	for _, d := range disks {
+		if _, ok := owned[d.volume]; ok {
+			ours = append(ours, d)
+			continue
+		}
+		foreign = append(foreign, d)
+	}
+	return ours, foreign
+}
 
 // Create implements providers.MachineProvider.
 //
@@ -756,11 +779,25 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	if err != nil {
 		return err
 	}
-	// Every pool-backed disk, not just the first. A machine with bootstrap data
-	// has two -- its root qcow2 and its cloud-init ISO -- and stopping at one
-	// would undefine the domain, release the finalizer, and leave the other
-	// behind with nothing left referencing it.
-	for _, d := range disks {
+	// Every volume THIS PROVIDER created, not every volume attached.
+	//
+	// Two failure modes pull in opposite directions here. Reclaiming only the
+	// first disk would leave a machine's cloud-init ISO orphaned, since a machine
+	// with bootstrap data has two. Reclaiming every pool-backed disk would
+	// destroy a data volume an operator attached out of band -- unrecoverably,
+	// and on an operation they asked for on a different object.
+	//
+	// Matching the deterministic names Create uses satisfies both: the two
+	// volumes Hydra made are removed, and anything else is merely detached when
+	// the domain is undefined.
+	ours, foreign := partitionOwnedDisks(dom.Name, disks)
+	for _, d := range foreign {
+		// Worth saying out loud. An operator who attached this expects it to
+		// survive, and an operator who did not needs to know it was left behind.
+		logf.FromContext(ctx).Info("Leaving a volume this provider did not create",
+			"domain", dom.Name, "pool", d.pool, "volume", d.volume)
+	}
+	for _, d := range ours {
 		if err := p.deleteVolume(ctx, d.pool, d.volume); err != nil {
 			return err
 		}

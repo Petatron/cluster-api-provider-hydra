@@ -26,6 +26,9 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
+// testPool is the storage pool name the XML fixtures are built against.
+const testPool = "k8s-workers"
+
 func testSpec() providers.MachineSpec {
 	return providers.MachineSpec{
 		Name:        "worker-1",
@@ -38,7 +41,7 @@ func testSpec() providers.MachineSpec {
 }
 
 func TestDomainXMLIsWellFormedAndComplete(t *testing.T) {
-	out := domainXML(testSpec(), "k8s-workers", "worker-1.qcow2", "")
+	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -195,7 +198,7 @@ func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
 // depends on that disk being visible in the domain XML, because that is where
 // teardown looks for what to reclaim.
 func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
-	out := domainXML(testSpec(), "k8s-workers", "worker-1.qcow2", "worker-1-cidata.iso")
+	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "worker-1-cidata.iso")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -218,7 +221,7 @@ func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
 	if cdrom.Source.Volume != "worker-1-cidata.iso" {
 		t.Errorf("cdrom volume = %q, want worker-1-cidata.iso", cdrom.Source.Volume)
 	}
-	if cdrom.Source.Pool != "k8s-workers" {
+	if cdrom.Source.Pool != testPool {
 		t.Errorf("cdrom pool = %q, want k8s-workers", cdrom.Source.Pool)
 	}
 	// An ISO read as qcow2 is not a filesystem cloud-init can mount.

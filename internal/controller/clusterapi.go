@@ -56,6 +56,13 @@ const (
 // ProvisioningFailedRetrying on a machine that is proceeding exactly as designed.
 var errWaitingForBootstrap = errors.New("waiting for bootstrap data")
 
+// errWaitingForOwner reports that the object names an owning Machine that this
+// controller cannot currently see.
+//
+// Distinct from errWaitingForBootstrap because it is a different wait with a
+// different fix, and an operator needs to be able to tell them apart.
+var errWaitingForOwner = errors.New("waiting for the owning Machine")
+
 // linkage is the Cluster API context surrounding a HydraMachine.
 //
 // Both fields may be nil, and nil is a supported state rather than an error:
@@ -63,6 +70,13 @@ var errWaitingForBootstrap = errors.New("waiting for bootstrap data")
 // no bootstrap data. That is the documented way to exercise the infrastructure
 // half on its own -- the machine boots and never joins a cluster.
 type linkage struct {
+	// ownerName is the Machine named by an owner reference, whether or not that
+	// Machine could be read. Keeping it separate from machine is what lets the
+	// controller tell "nothing owns this" from "its owner is not visible right
+	// now" -- two situations that must not be treated alike, because the first
+	// provisions and the second must wait.
+	ownerName string
+
 	machine *clusterv1.Machine
 	cluster *clusterv1.Cluster
 }
@@ -85,16 +99,21 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 	owner := &clusterv1.Machine{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: name}, owner); err != nil {
 		if apierrors.IsNotFound(err) {
-			// The owner reference outlived the Machine. Kubernetes garbage
-			// collection will delete this object shortly; until then, treat it as
-			// standalone rather than blocking reconciliation on a corpse.
-			log.V(1).Info("Owner Machine no longer exists", "machine", name)
-			return &linkage{}, nil
+			// Deliberately NOT treated as standalone. An absent owner is usually
+			// transient -- a cache that has not caught up, or a Machine mid-delete --
+			// and provisioning through it would create a VM with no bootstrap data.
+			// That VM is unrepairable: once providerID is persisted the bootstrap
+			// Secret is never read again, so it would never join anything.
+			//
+			// ownerName is retained so callers can wait. Deletion is unaffected,
+			// because teardown never asks for bootstrap data.
+			log.V(1).Info("Owner Machine is not visible", "machine", name)
+			return &linkage{ownerName: name}, nil
 		}
 		return nil, fmt.Errorf("reading owner Machine %q: %w", name, err)
 	}
 
-	link := &linkage{machine: owner}
+	link := &linkage{ownerName: name, machine: owner}
 
 	clusterName := owner.Labels[clusterv1.ClusterNameLabel]
 	if clusterName == "" {
@@ -177,9 +196,14 @@ func pausedReason(machine *infrav1.HydraMachine, link *linkage) string {
 // of a spec that anyone with read access to the CRD can see.
 func (r *HydraMachineReconciler) bootstrapDataFor(ctx context.Context, link *linkage) ([]byte, error) {
 	if link.machine == nil {
-		// No Cluster API Machine, so no bootstrap provider to ask. Documented on
-		// providers.MachineSpec as a useful state: the VM boots, configures
-		// nothing, and never joins a cluster.
+		if link.ownerName != "" {
+			// Something owns this object; we just cannot see it yet. Waiting is the
+			// only safe answer -- see resolveLinkage.
+			return nil, fmt.Errorf("%w: owner Machine %q is not visible yet", errWaitingForOwner, link.ownerName)
+		}
+		// Nothing owns this object, so there is no bootstrap provider to ask.
+		// Documented on providers.MachineSpec as a useful state: the VM boots,
+		// configures nothing, and never joins a cluster.
 		return nil, nil
 	}
 
@@ -189,9 +213,18 @@ func (r *HydraMachineReconciler) bootstrapDataFor(ctx context.Context, link *lin
 			errWaitingForBootstrap, link.machine.Name)
 	}
 
+	// Read through the uncached APIReader, NOT the cached client.
+	//
+	// This is the whole reason the provider does not end up holding every Secret
+	// in the cluster. controller-runtime's client is cache-backed, and the first
+	// cached Get for a kind starts an informer for that kind cluster-wide -- so a
+	// single r.Get here would quietly retain every token, TLS key and application
+	// credential in memory, which is exactly what not watching Secrets was meant
+	// to avoid. An uncached read costs one API call per machine creation, once.
+	// It is also why the RBAC rule for secrets is get-only.
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: link.machine.Namespace, Name: *name}
-	if err := r.Get(ctx, key, secret); err != nil {
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Usually a race: the Machine is updated fractionally before the Secret
 			// is visible in this controller's cache. Waiting is right either way --
