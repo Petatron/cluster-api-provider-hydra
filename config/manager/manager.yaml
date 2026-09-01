@@ -149,7 +149,24 @@ spec:
         # has no libvirt at all. A remote address avoids both problems and does
         # not assume the controller shares a host with the hypervisor.
         #   - name: libvirt-sock
-        #     mountPath: /var/run/libvirt/libvirt-sock
+        #     mountPath: /run/libvirt/libvirt-sock
+        #
+        # THE MOUNT ALONE IS NOT ENOUGH. The socket is srw-rw---- root:libvirt,
+        # and this pod runs as nonroot uid 65532 -- so it is mounted, visible,
+        # and unopenable. The failure looks like a connection problem rather
+        # than a permission one, which is what makes it expensive.
+        # The pod must also join the host's libvirt group, via the pod-level
+        # securityContext further down:
+        #
+        #   securityContext:
+        #     runAsNonRoot: true
+        #     supplementalGroups: [<gid>]
+        #
+        # <gid> is the libvirt group on THAT host and is not portable -- it is
+        # 126 on Ubuntu 24.04 here, but read it rather than assume it:
+        #   getent group libvirt | cut -d: -f3
+        # Verified 2026-09-01 on hycluster-worker-0: with the group the socket
+        # is writable from the pod, without it it is not.
       # Add to this list -- do not introduce a second volumes key.
       volumes:
         # Memory-backed on purpose. What is staged here is a machine's
