@@ -23,7 +23,7 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
-// HydraMachineImage identifies the base image a machine boots from.
+// HydraImage identifies the base image a machine boots from.
 //
 // The image is named rather than described: Hydra resolves the name against
 // whatever the backend already holds, and only falls back to url when it does
@@ -33,7 +33,7 @@ import (
 //
 // +kubebuilder:validation:XValidation:rule="has(self.name) || has(self.url)",message="one of name or url must be set"
 // +kubebuilder:validation:XValidation:rule="!has(self.checksum) || has(self.url)",message="checksum is only meaningful alongside url"
-type HydraMachineImage struct {
+type HydraImage struct {
 	// name identifies a base image already known to the backend.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
@@ -59,8 +59,8 @@ type HydraMachineImage struct {
 	Checksum string `json:"checksum,omitempty"`
 }
 
-// HydraMachineNetworkAttachment attaches a machine to one backend network.
-type HydraMachineNetworkAttachment struct {
+// HydraNetworkAttachment attaches a machine to one backend network.
+type HydraNetworkAttachment struct {
 	// name is the backend network or bridge to attach to, for example "br0".
 	// Hydra does not interpret this value; it is passed to the backend, which
 	// decides what it means.
@@ -82,6 +82,8 @@ type HydraMachineNetworkAttachment struct {
 // enforcing that here turns a silently ignored edit into an immediate rejection.
 //
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.providerID) || (has(self.providerID) && self.providerID == oldSelf.providerID)",message="providerID is immutable once set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.image) || (has(self.image) && self.image == oldSelf.image)",message="image is immutable once set; replace the machine instead"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.networks) || (has(self.networks) && self.networks == oldSelf.networks)",message="networks are immutable once set; replace the machine instead"
 type HydraMachineSpec struct {
 	// providerID is the unique identifier for this machine, in the form
 	// hydra://<backend>/<id>. The controller sets it once the backing
@@ -120,22 +122,34 @@ type HydraMachineSpec struct {
 	DiskSize resource.Quantity `json:"diskSize"`
 
 	// image is the base image the machine boots from.
-	// +required
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="image is immutable; replace the machine instead"
-	Image HydraMachineImage `json:"image"`
+	//
+	// Optional since the owning HydraCluster can supply a default. Omitting it
+	// resolves in order: this field, then the cluster's baseImage, then the
+	// manager's --libvirt-base-image flag. It is only an error when all three are
+	// empty.
+	//
+	// Immutability is expressed on the spec rather than the field, because a
+	// field-level transition rule cannot describe "may be set once, then never
+	// changed" for an optional value.
+	// +optional
+	Image *HydraImage `json:"image,omitempty"`
 
 	// networks are the backend networks this machine attaches to, in order. The
 	// first attachment provides the machine's primary address.
 	//
 	// A list rather than a single value so that multi-homed machines do not
 	// require an API break later.
-	// +required
+	//
+	// Optional for the same reason as image: the owning HydraCluster can supply
+	// defaults. Unlike image there is no manager-flag fallback, and a machine
+	// that resolves to no networks is refused -- it would boot, satisfy the
+	// backend, and never reach an API server.
+	// +optional
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="networks are immutable; replace the machine instead"
-	Networks []HydraMachineNetworkAttachment `json:"networks"`
+	Networks []HydraNetworkAttachment `json:"networks,omitempty"`
 }
 
 // HydraMachineInitializationStatus provides observations of the HydraMachine

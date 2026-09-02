@@ -415,7 +415,8 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		return nil, fmt.Errorf("libvirt: looking up domain %q: %w", spec.Name, err)
 	}
 
-	pool, err := p.lookupPool(ctx)
+	// The cluster's pool when it named one, the manager's flag otherwise.
+	pool, err := p.lookupPoolNamed(ctx, spec.StoragePool)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +444,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	}
 
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainDefineXML(domainXML(spec, p.cfg.StoragePool, volName, cidataVol))
+		return p.lv.DomainDefineXML(domainXML(spec, pool.Name, volName, cidataVol))
 	})
 	if err != nil {
 		// Roll back both volumes so a failed define does not leave disks that
@@ -558,18 +559,18 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 	return nil
 }
 
-// lookupPool resolves the configured storage pool.
+// lookupPoolNamed resolves a pool by name, falling back to the configured
+// default when the name is empty.
+//
+// The name is a parameter rather than always the configured pool for two
+// reasons: deletion must target the pool a domain was actually built in rather
+// than whatever is configured now, and creation must honour the pool the
+// machine's cluster asked for.
 //
 // A pool that does not exist is configuration-shaped, not transient: retrying
 // will never conjure it. Classifying it as terminal is what makes the difference
 // between an operator seeing ProvisioningFailed and watching
 // ProvisioningFailedRetrying scroll past forever.
-func (p *Provider) lookupPool(ctx context.Context) (golibvirt.StoragePool, error) {
-	return p.lookupPoolNamed(ctx, p.cfg.StoragePool)
-}
-
-// lookupPoolNamed resolves a pool by name, so deletion can target the pool the
-// domain was actually built in rather than whatever is configured now.
 func (p *Provider) lookupPoolNamed(ctx context.Context, name string) (golibvirt.StoragePool, error) {
 	if name == "" {
 		name = p.cfg.StoragePool
@@ -624,6 +625,43 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 		return "", fmt.Errorf("libvirt: resolving path for image %q: %w", name, err)
 	}
 	return path, nil
+}
+
+// CheckInfrastructure implements providers.MachineProvider.
+//
+// Two things are worth checking and nothing else is: the pool exists and is
+// running, and the base image is a volume inside it. Those are exactly the
+// absences that make every machine in the cluster fail, and both are one RPC.
+func (p *Provider) CheckInfrastructure(ctx context.Context, spec providers.InfrastructureSpec) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	pool, err := p.lookupPoolNamed(ctx, spec.StoragePool)
+	if err != nil {
+		return err
+	}
+
+	// Defined but not running is its own failure, and a distinct one: the pool
+	// resolves, so a lookup succeeds, but every volume operation against it
+	// fails. Without this check that surfaces as a confusing per-machine error.
+	active, err := call(ctx, p, func() (int32, error) { return p.lv.StoragePoolIsActive(pool) })
+	if err != nil {
+		return fmt.Errorf("libvirt: checking whether storage pool %q is active: %w", pool.Name, err)
+	}
+	if active != 1 {
+		return fmt.Errorf("%w: libvirt: storage pool %q exists but is not running", providers.ErrTerminal, pool.Name)
+	}
+
+	// resolveBackingPath already classifies a missing image as terminal, and
+	// rejects a URL-only image the backend cannot fetch. Reusing it means the
+	// cluster-level check and the per-machine one cannot disagree.
+	if _, err := p.resolveBackingPath(ctx, pool, spec.Image); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Get implements providers.MachineProvider.

@@ -164,7 +164,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// it would not expect the controller to keep destroying infrastructure
 	// underneath them. The finalizer stays, so deletion resumes once the pause is
 	// lifted -- and the Cluster watch is what notices that it has been.
-	if reason := pausedReason(machine, link); reason != "" {
+	if reason := pausedReason(machine.Annotations, link.cluster); reason != "" {
 		log.V(1).Info("Reconciliation is paused", "name", machine.Name, "reason", reason)
 		return ctrl.Result{}, r.setPaused(ctx, machine, reason)
 	}
@@ -309,7 +309,12 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// Create is idempotent on name, which is what makes this safe: if a previous
 	// reconcile created the machine but crashed before persisting the providerID,
 	// this call returns that same machine rather than creating a second one.
-	state, err := prov.Create(ctx, specFor(machine, bootstrapData))
+	spec, err := specFor(machine, link, bootstrapData)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := prov.Create(ctx, spec)
 	if err != nil {
 		return nil, fmt.Errorf("creating machine: %w", err)
 	}
@@ -716,7 +721,23 @@ func hostnameFor(machine *infrav1.HydraMachine) string {
 // bootstrapData comes from the owning Machine's Secret rather than from this
 // object, and is passed in rather than read here so that the fetch stays on the
 // create path where it belongs.
-func specFor(machine *infrav1.HydraMachine, bootstrapData []byte) providers.MachineSpec {
+//
+// Image, networks and storage pool are resolved here rather than read straight
+// off the object, because each may come from the owning HydraCluster instead.
+// Resolution order is machine, then cluster, then the manager's flags -- the
+// most specific statement wins, and the flags are the floor.
+func specFor(machine *infrav1.HydraMachine, link *linkage, bootstrapData []byte) (providers.MachineSpec, error) {
+	networks := resolveNetworks(machine, link)
+	if len(networks) == 0 {
+		// No fallback exists for this and none should. A machine with no network
+		// attachment boots, satisfies every check the backend makes, and can never
+		// reach an API server -- healthy-looking and useless, which is the failure
+		// mode this provider keeps being reviewed for.
+		return providers.MachineSpec{}, fmt.Errorf(
+			"%w: no networks on the HydraMachine and none defaulted by its HydraCluster",
+			providers.ErrTerminal)
+	}
+
 	spec := providers.MachineSpec{
 		Name: backendName(machine),
 		// The object's own name, not the derived backend name. The backend name
@@ -730,16 +751,55 @@ func specFor(machine *infrav1.HydraMachine, bootstrapData []byte) providers.Mach
 		VCPUs:         machine.Spec.VCPUs,
 		MemoryBytes:   machine.Spec.Memory.Value(),
 		DiskBytes:     machine.Spec.DiskSize.Value(),
-		Image: providers.Image{
-			Name:     machine.Spec.Image.Name,
-			URL:      machine.Spec.Image.URL,
-			Checksum: machine.Spec.Image.Checksum,
-		},
+		Image:         resolveImage(machine, link),
+		Networks:      networks,
+		StoragePool:   resolveStoragePool(link),
 	}
-	for _, n := range machine.Spec.Networks {
-		spec.Networks = append(spec.Networks, providers.Network{Name: n.Name})
+	return spec, nil
+}
+
+// resolveImage picks the base image: the machine's, else the cluster's, else
+// the zero value, which the backend reads as "use the configured default".
+func resolveImage(machine *infrav1.HydraMachine, link *linkage) providers.Image {
+	if img := machine.Spec.Image; img != nil {
+		return providers.Image{Name: img.Name, URL: img.URL, Checksum: img.Checksum}
 	}
-	return spec
+	if link != nil && link.hydraCluster != nil {
+		if img := link.hydraCluster.Spec.BaseImage; img != nil {
+			return providers.Image{Name: img.Name, URL: img.URL, Checksum: img.Checksum}
+		}
+	}
+	return providers.Image{}
+}
+
+// resolveNetworks picks the network attachments: the machine's, else the
+// cluster's. Returning empty is a real answer, and the caller refuses it.
+func resolveNetworks(machine *infrav1.HydraMachine, link *linkage) []providers.Network {
+	attachments := machine.Spec.Networks
+	if len(attachments) == 0 && link != nil && link.hydraCluster != nil {
+		attachments = link.hydraCluster.Spec.Networks
+	}
+	if len(attachments) == 0 {
+		return nil
+	}
+	out := make([]providers.Network, 0, len(attachments))
+	for _, n := range attachments {
+		out = append(out, providers.Network{Name: n.Name})
+	}
+	return out
+}
+
+// resolveStoragePool returns the cluster's pool, or empty for the backend's
+// configured default.
+//
+// There is no per-machine override on purpose: the backend resolves the base
+// image as a volume inside this pool, so machines in one cluster sharing one
+// pool is what makes a single base image usable by all of them.
+func resolveStoragePool(link *linkage) string {
+	if link != nil && link.hydraCluster != nil {
+		return link.hydraCluster.Spec.StoragePool
+	}
+	return ""
 }
 
 // toMachineAddresses converts, deduplicates and caps the provider's addresses.

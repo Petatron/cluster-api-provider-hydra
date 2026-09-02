@@ -73,7 +73,17 @@ spec:
                 - message: diskSize must be greater than zero
                   rule: quantity(self).isGreaterThan(quantity('0'))
               image:
-                description: image is the base image the machine boots from.
+                description: |-
+                  image is the base image the machine boots from.
+
+                  Optional since the owning HydraCluster can supply a default. Omitting it
+                  resolves in order: this field, then the cluster's baseImage, then the
+                  manager's --libvirt-base-image flag. It is only an error when all three are
+                  empty.
+
+                  Immutability is expressed on the spec rather than the field, because a
+                  field-level transition rule cannot describe "may be set once, then never
+                  changed" for an optional value.
                 properties:
                   checksum:
                     description: |-
@@ -101,8 +111,6 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-validations:
-                - message: image is immutable; replace the machine instead
-                  rule: self == oldSelf
                 - message: one of name or url must be set
                   rule: has(self.name) || has(self.url)
                 - message: checksum is only meaningful alongside url
@@ -130,9 +138,14 @@ spec:
 
                   A list rather than a single value so that multi-homed machines do not
                   require an API break later.
+
+                  Optional for the same reason as image: the owning HydraCluster can supply
+                  defaults. Unlike image there is no manager-flag fallback, and a machine
+                  that resolves to no networks is refused -- it would boot, satisfy the
+                  backend, and never reach an API server.
                 items:
-                  description: HydraMachineNetworkAttachment attaches a machine to
-                    one backend network.
+                  description: HydraNetworkAttachment attaches a machine to one backend
+                    network.
                   properties:
                     name:
                       description: |-
@@ -151,9 +164,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
-                x-kubernetes-validations:
-                - message: networks are immutable; replace the machine instead
-                  rule: self == oldSelf
               providerID:
                 description: |-
                   providerID is the unique identifier for this machine, in the form
@@ -177,15 +187,18 @@ spec:
                   rule: self == oldSelf
             required:
             - diskSize
-            - image
             - memory
-            - networks
             - vcpus
             type: object
             x-kubernetes-validations:
             - message: providerID is immutable once set
               rule: '!has(oldSelf.providerID) || (has(self.providerID) && self.providerID
                 == oldSelf.providerID)'
+            - message: image is immutable once set; replace the machine instead
+              rule: '!has(oldSelf.image) || (has(self.image) && self.image == oldSelf.image)'
+            - message: networks are immutable once set; replace the machine instead
+              rule: '!has(oldSelf.networks) || (has(self.networks) && self.networks
+                == oldSelf.networks)'
           status:
             description: status defines the observed state of HydraMachine
             properties:

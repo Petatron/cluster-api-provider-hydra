@@ -250,6 +250,15 @@ func main() {
 		return p, nil
 	}
 
+	if err := (&controller.HydraClusterReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		NewProvider: newProvider,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "hydracluster")
+		os.Exit(1)
+	}
+
 	if err := (&controller.HydraMachineReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

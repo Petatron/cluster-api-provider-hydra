@@ -91,6 +91,23 @@ type Network struct {
 	Name string
 }
 
+// InfrastructureSpec describes the cluster-scoped prerequisites a backend needs
+// in place before any machine can be created.
+//
+// It exists so those can be checked once, at cluster level, instead of being
+// discovered separately by every machine. A missing storage pool fails every
+// machine in the cluster identically; reporting it once on the cluster is both
+// cheaper and far easier to act on.
+type InfrastructureSpec struct {
+	// StoragePool is where machine disks will be created. Empty means the
+	// backend's own default.
+	StoragePool string
+
+	// Image is the base image machines will be cloned from. A zero value means
+	// the backend's own default.
+	Image Image
+}
+
 // MachineSpec is the backend-neutral description of a machine to create.
 //
 // Sizes are in bytes rather than Kubernetes quantities: quantities belong to the
@@ -113,6 +130,14 @@ type MachineSpec struct {
 
 	Image    Image
 	Networks []Network
+
+	// StoragePool is where this machine's disks are created, and where its base
+	// image is expected to be found. Empty means the backend's own default.
+	//
+	// Cluster-scoped in the API above this: every machine in a cluster shares one
+	// pool, because the base image has to live somewhere both the pool and the
+	// clone agree on.
+	StoragePool string
 
 	// Hostname is the name the machine should call itself, and through it the
 	// name it registers in Kubernetes under.
@@ -211,6 +236,18 @@ type MachineProvider interface {
 	// Deleting a machine that does not exist MUST succeed. Teardown is retried,
 	// and the second attempt finding nothing is success, not failure.
 	Delete(ctx context.Context, id string) error
+
+	// CheckInfrastructure verifies the cluster-scoped prerequisites in spec.
+	//
+	// Returns nil when machines could be created against them. Wraps ErrTerminal
+	// when they are absent or misconfigured, and an unwrapped error when the
+	// backend simply could not be reached -- the same distinction Create draws,
+	// and for the same reason: only the first should invite intervention.
+	//
+	// Implementations must not create anything. Provisioning cluster
+	// infrastructure on someone's host is a separate decision from consuming it,
+	// and this method is the consuming half.
+	CheckInfrastructure(ctx context.Context, spec InfrastructureSpec) error
 
 	// DeleteByName removes the machine and any partial resources keyed by the
 	// idempotency name -- including a clone volume whose domain was never

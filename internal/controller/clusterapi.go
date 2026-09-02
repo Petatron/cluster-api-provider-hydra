@@ -46,6 +46,7 @@ const bootstrapDataSecretKey = "value"
 const (
 	machineKind      = "Machine"
 	hydraMachineKind = "HydraMachine"
+	hydraClusterKind = "HydraCluster"
 )
 
 // errWaitingForBootstrap reports that the bootstrap provider has not published
@@ -99,6 +100,12 @@ type linkage struct {
 
 	machine *clusterv1.Machine
 	cluster *clusterv1.Cluster
+
+	// hydraCluster carries this provider's cluster-scoped settings -- storage
+	// pool, default image, default networks. Nil when the Cluster points at some
+	// other infrastructure provider, or at nothing this controller recognises,
+	// in which case the manager's flags are all that is left.
+	hydraCluster *infrav1.HydraCluster
 }
 
 // resolveLinkage walks from the HydraMachine out to the Cluster API objects that
@@ -173,6 +180,28 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 		return nil, fmt.Errorf("reading Cluster %q: %w", clusterName, err)
 	}
 	link.cluster = cluster
+
+	// The Cluster names its infrastructure object; that is where this provider's
+	// cluster-scoped settings live. A Cluster pointing at another provider is not
+	// an error here -- this controller simply has no defaults to contribute.
+	infraRef := cluster.Spec.InfrastructureRef
+	if infraRef.Kind != hydraClusterKind || infraRef.APIGroup != infrav1.GroupVersion.Group || infraRef.Name == "" {
+		return link, nil
+	}
+
+	hydraCluster := &infrav1.HydraCluster{}
+	key := types.NamespacedName{Namespace: machine.Namespace, Name: infraRef.Name}
+	if err := r.Get(ctx, key, hydraCluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Same treatment as an absent Cluster: not fatal, and it costs only the
+			// defaults. The cluster gate below refuses creation anyway while the
+			// Cluster is not reporting its infrastructure provisioned.
+			log.V(1).Info("HydraCluster named by the Cluster does not exist", "hydraCluster", infraRef.Name)
+			return link, nil
+		}
+		return nil, fmt.Errorf("reading HydraCluster %q: %w", infraRef.Name, err)
+	}
+	link.hydraCluster = hydraCluster
 	return link, nil
 }
 
@@ -189,9 +218,15 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 // dependency graph considerably for fifteen lines of logic whose contract, an
 // owner reference of kind Machine in the cluster.x-k8s.io group, is stable.
 func ownerMachineRef(machine *infrav1.HydraMachine) *metav1.OwnerReference {
-	for i := range machine.OwnerReferences {
-		ref := &machine.OwnerReferences[i]
-		if ref.Kind != machineKind {
+	return ownerRefOfKind(machine.OwnerReferences, machineKind)
+}
+
+// ownerRefOfKind finds the owner reference of the given kind in the Cluster API
+// group, or nil.
+func ownerRefOfKind(refs []metav1.OwnerReference, kind string) *metav1.OwnerReference {
+	for i := range refs {
+		ref := &refs[i]
+		if ref.Kind != kind {
 			continue
 		}
 		// Compare the group only. Matching the full apiVersion would break on
@@ -213,18 +248,21 @@ func ownerMachineRef(machine *infrav1.HydraMachine) *metav1.OwnerReference {
 // pausing a Cluster is how an operator stops a whole cluster's reconciliation --
 // and a provider that ignored it would carry on creating and destroying VMs
 // underneath someone who believed they had stopped everything.
-func pausedReason(machine *infrav1.HydraMachine, link *linkage) string {
-	if _, ok := machine.Annotations[clusterv1.PausedAnnotation]; ok {
+// Takes the object's own annotations rather than the object, so HydraMachine and
+// HydraCluster share one implementation -- the rules are identical and two
+// copies would drift.
+func pausedReason(annotations map[string]string, cluster *clusterv1.Cluster) string {
+	if _, ok := annotations[clusterv1.PausedAnnotation]; ok {
 		return fmt.Sprintf("the %s annotation", clusterv1.PausedAnnotation)
 	}
-	if link == nil || link.cluster == nil {
+	if cluster == nil {
 		return ""
 	}
-	if link.cluster.Spec.Paused != nil && *link.cluster.Spec.Paused {
-		return fmt.Sprintf("spec.paused on Cluster %q", link.cluster.Name)
+	if cluster.Spec.Paused != nil && *cluster.Spec.Paused {
+		return fmt.Sprintf("spec.paused on Cluster %q", cluster.Name)
 	}
-	if _, ok := link.cluster.Annotations[clusterv1.PausedAnnotation]; ok {
-		return fmt.Sprintf("the %s annotation on Cluster %q", clusterv1.PausedAnnotation, link.cluster.Name)
+	if _, ok := cluster.Annotations[clusterv1.PausedAnnotation]; ok {
+		return fmt.Sprintf("the %s annotation on Cluster %q", clusterv1.PausedAnnotation, cluster.Name)
 	}
 	return ""
 }
