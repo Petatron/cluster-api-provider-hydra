@@ -173,18 +173,15 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 	if cfg.RPCTimeout == 0 {
 		cfg.RPCTimeout = defaultRPCTimeout
 	}
-	// Terminal, not a plain error. Construction is lazy now, so this reaches the
-	// controller through recordError -- and an unset pool is a configuration
-	// mistake that retrying cannot fix, so reporting it as retryable would leave
-	// the object cycling forever as though the hypervisor were merely down.
-	if cfg.StoragePool == "" {
-		return nil, fmt.Errorf("%w: libvirt: a storage pool must be configured", providers.ErrTerminal)
-	}
-	// BaseImage is deliberately optional. The API requires image.name or
-	// image.url, resolveBackingPath uses the per-machine name, and URL-only
-	// requests are rejected before any fallback -- so the global default is
-	// unreachable for every admitted HydraMachine. Requiring it forced operators
-	// to invent a duplicate value, and blocked deletion after a restart.
+	// StoragePool and BaseImage are both deliberately optional here, and refusing
+	// to construct without them would defeat the point of HydraCluster.
+	//
+	// Construction happens before any object is read, so a pool required at this
+	// point is required process-wide -- which would mean a cluster naming its own
+	// pool still had to invent a dummy flag value just to let the manager start.
+	// An unset pool is still a configuration error, it just belongs to whichever
+	// cluster failed to name one: lookupPoolNamed reports it terminally, against
+	// the object that can actually be fixed.
 
 	dialer, err := newDialer(cfg)
 	if err != nil {
@@ -575,6 +572,14 @@ func (p *Provider) lookupPoolNamed(ctx context.Context, name string) (golibvirt.
 	if name == "" {
 		name = p.cfg.StoragePool
 	}
+	if name == "" {
+		// Neither the object nor the manager named one. Terminal, and worded so
+		// the reader knows both places to look -- New deliberately no longer
+		// refuses to start over this, so this is where it surfaces.
+		return golibvirt.StoragePool{}, fmt.Errorf(
+			"%w: libvirt: no storage pool named by the HydraCluster and none configured with --libvirt-storage-pool",
+			providers.ErrTerminal)
+	}
 	pool, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
 		return p.lv.StoragePoolLookupByName(name)
 	})
@@ -594,13 +599,18 @@ func (p *Provider) lookupPoolNamed(ctx context.Context, name string) (golibvirt.
 // BaseImage for every machine, so a per-machine image request was silently
 // discarded. It also passed a volume *name* where libvirt expects a *path*.
 func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.StoragePool, img providers.Image) (string, error) {
-	// A URL-only image must be rejected BEFORE the default is applied. Because
-	// New requires BaseImage, falling through would substitute the default and
-	// silently boot an image the caller never asked for -- an admitted request
-	// producing the wrong machine, which is worse than a clear rejection.
+	// A URL-only image must be rejected BEFORE any default is applied. Falling
+	// through would substitute the default and silently boot an image the caller
+	// never asked for -- an admitted request producing the wrong machine, which
+	// is worse than a clear rejection.
+	//
+	// Errors here name pool.Name, the pool actually queried, and not the
+	// configured one. The two differ whenever a HydraCluster names its own pool,
+	// and reporting the wrong one sends an operator to a resource that was never
+	// involved. deleteVolume already had to learn this.
 	if img.Name == "" && img.URL != "" {
 		return "", fmt.Errorf("%w: libvirt: image %q must already exist in pool %q; fetching by URL is not implemented",
-			providers.ErrTerminal, img.URL, p.cfg.StoragePool)
+			providers.ErrTerminal, img.URL, pool.Name)
 	}
 
 	name := img.Name
@@ -616,7 +626,7 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return "", fmt.Errorf("%w: libvirt: image %q not found in pool %q", providers.ErrTerminal, name, p.cfg.StoragePool)
+			return "", fmt.Errorf("%w: libvirt: image %q not found in pool %q", providers.ErrTerminal, name, pool.Name)
 		}
 		return "", fmt.Errorf("libvirt: looking up image %q: %w", name, err)
 	}
@@ -652,7 +662,27 @@ func (p *Provider) CheckInfrastructure(ctx context.Context, spec providers.Infra
 		return fmt.Errorf("libvirt: checking whether storage pool %q is active: %w", pool.Name, err)
 	}
 	if active != 1 {
-		return fmt.Errorf("%w: libvirt: storage pool %q exists but is not running", providers.ErrTerminal, pool.Name)
+		// Deliberately NOT terminal, unlike a pool that does not exist. An
+		// inactive pool is closer to an unreachable hypervisor: `virsh
+		// pool-start`, or autostart after a libvirt restart, fixes it, and the
+		// next attempt then succeeds. Terminal is the signal this codebase
+		// reserves for configuration that will not fix itself, and using it here
+		// would invite an operator or a MachineHealthCheck to act on something
+		// about to come good on its own.
+		return fmt.Errorf("libvirt: storage pool %q exists but is not running", pool.Name)
+	}
+
+	// Only check the image when the cluster actually named one.
+	//
+	// A zero Image here means the HydraCluster set no default, which is a
+	// supported arrangement: its machines name their own. Falling through to
+	// resolveBackingPath would substitute the manager's --libvirt-base-image and
+	// then demand that volume exist *inside this cluster's pool* -- gating a
+	// perfectly valid cluster on an image nobody asked it to use. Machine
+	// reconciliation refuses a machine whose image resolves to nothing anywhere,
+	// which is where that belongs.
+	if spec.Image == (providers.Image{}) {
+		return nil
 	}
 
 	// resolveBackingPath already classifies a missing image as terminal, and

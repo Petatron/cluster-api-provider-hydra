@@ -211,11 +211,19 @@ func (r *HydraClusterReconciler) recordVerified(ctx context.Context, hydraCluste
 	provisioned := true
 	hydraCluster.Status.Initialization.Provisioned = &provisioned
 
+	// Say what was actually checked. The image prerequisite is skipped when the
+	// cluster named no default -- claiming "base image present" in that case
+	// would be a plain untruth on the object an operator reads first.
+	message := "storage pool is running"
+	if hydraCluster.Spec.BaseImage != nil {
+		message = "storage pool is running and the base image is present in it"
+	}
+
 	apimeta.SetStatusCondition(&hydraCluster.Status.Conditions, metav1.Condition{
 		Type:               infrav1.ClusterReadyCondition,
 		Status:             metav1.ConditionTrue,
 		Reason:             "InfrastructureVerified",
-		Message:            "storage pool and base image are present",
+		Message:            message,
 		ObservedGeneration: hydraCluster.Generation,
 	})
 	apimeta.RemoveStatusCondition(&hydraCluster.Status.Conditions, infrav1.ClusterInfrastructureFailedCondition)

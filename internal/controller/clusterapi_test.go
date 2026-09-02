@@ -50,6 +50,8 @@ import (
 
 const (
 	linkNamespace   = "default"
+	linkEndpointIP  = "192.168.16.10"
+	linkOtherIP     = "10.0.0.1"
 	linkClusterName = "hydra"
 	linkMachineName = "worker-1"
 	linkSecretName  = "worker-1-bootstrap"

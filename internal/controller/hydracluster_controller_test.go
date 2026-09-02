@@ -57,7 +57,7 @@ func hydraCluster(mutate func(*infrav1.HydraCluster)) *infrav1.HydraCluster {
 			}},
 		},
 		Spec: infrav1.HydraClusterSpec{
-			ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: "192.168.16.10", Port: 6443},
+			ControlPlaneEndpoint: clusterv1.APIEndpoint{Host: linkEndpointIP, Port: 6443},
 			StoragePool:          linkPool,
 			BaseImage:            &infrav1.HydraImage{Name: linkBaseImage},
 			Networks:             []infrav1.HydraNetworkAttachment{{Name: testNetwork}},
@@ -145,6 +145,40 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			Expect(out.Status.Initialization.Provisioned).NotTo(BeNil())
 			Expect(*out.Status.Initialization.Provisioned).To(BeTrue())
 			Expect(condition(r, infrav1.ClusterReadyCondition).Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("does not demand an image when the cluster named no default", func() {
+			// The cluster-level half of a blocking review finding. A zero Image used
+			// to fall through to the manager's --libvirt-base-image and then require
+			// that volume inside *this* cluster's pool -- gating a perfectly valid
+			// cluster, whose machines all name their own image, on a volume nobody
+			// asked it to use.
+			hc = hydraCluster(func(c *infrav1.HydraCluster) { c.Spec.BaseImage = nil })
+			key = client.ObjectKeyFromObject(hc)
+			r := build(owningCluster(nil))
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.LastInfrastructure.Image).To(Equal(providers.Image{}),
+				"a zero image tells the backend to skip the image prerequisite")
+
+			out := reload(r)
+			Expect(*out.Status.Initialization.Provisioned).To(BeTrue())
+
+			// And the message must not claim something that was never checked.
+			ready := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.ClusterReadyCondition)
+			Expect(ready.Message).To(Equal("storage pool is running"))
+			Expect(ready.Message).NotTo(ContainSubstring("base image"))
+		})
+
+		It("says the base image was checked only when it was", func() {
+			r := build(owningCluster(nil))
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.ClusterReadyCondition)
+			Expect(ready.Message).To(ContainSubstring("base image"))
 		})
 
 		It("re-checks periodically, because a pool can be stopped later", func() {

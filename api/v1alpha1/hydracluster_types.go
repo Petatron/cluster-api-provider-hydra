@@ -35,6 +35,8 @@ import (
 // It is left out rather than stubbed because a field the provider accepts and
 // ignores is worse than one that does not exist -- see spec.image on
 // HydraMachine before PET-8's review caught it.
+// +kubebuilder:validation:XValidation:rule="has(self.controlPlaneEndpoint) && size(self.controlPlaneEndpoint.host) > 0 && self.controlPlaneEndpoint.port > 0",message="controlPlaneEndpoint requires both a host and a non-zero port"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.storagePool) || (has(self.storagePool) && self.storagePool == oldSelf.storagePool)",message="storagePool is immutable once set; existing machines were cloned from a volume inside it"
 type HydraClusterSpec struct {
 	// controlPlaneEndpoint is the address and port of this cluster's API server.
 	//
@@ -45,6 +47,13 @@ type HydraClusterSpec struct {
 	//
 	// Immutable once set. Moving a live cluster's API endpoint is not something
 	// a reconcile can carry out; it is a new cluster.
+	//
+	// Required in practice, and enforced by a rule on the spec rather than by
+	// +required on this field. The contract types make host and port individually
+	// optional and the struct itself omitempty, so +required would still admit
+	// {host: "x"} with port 0 -- an endpoint that satisfies the schema and cannot
+	// be dialled. Reporting infrastructure provisioned with no usable endpoint
+	// leaves Cluster API with nothing to copy and kubeadm with nowhere to join.
 	//
 	// NOTE: this field is part of the Cluster API contract.
 	// +optional
@@ -61,7 +70,17 @@ type HydraClusterSpec struct {
 	// use, because it resolves the base image as a volume *inside* the configured
 	// pool. One pool per cluster keeps a single place the image can be.
 	//
-	// Empty falls back to the manager's --libvirt-storage-pool flag.
+	// Empty falls back to the manager's --libvirt-storage-pool flag. When both
+	// are empty the failure is reported terminally against this object, which is
+	// the one that can be fixed -- the backend deliberately no longer refuses to
+	// start over an unset pool, because that made the flag mandatory process-wide
+	// and so made this field pointless.
+	//
+	// Immutable once set, enforced on the spec. A reconcile cannot carry out the
+	// change it implies: existing machines were cloned from a backing volume
+	// inside the old pool and keep referring to it, while new machines would land
+	// somewhere else -- and provisioned does not regress, so a pool swapped for a
+	// missing one would not even be reported.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
@@ -80,7 +99,19 @@ type HydraClusterSpec struct {
 	// There is no fallback for this one. A machine with no network attachment
 	// boots and can never reach an API server, so provisioning is refused rather
 	// than producing something that looks healthy to the backend and is useless.
+	//
+	// The map-list markers mirror HydraMachine's, so a duplicate attachment name
+	// is rejected here too. Without them an inherited duplicate would produce two
+	// NICs on one attachment, while the identical list written directly on a
+	// machine would be refused -- the same list admitted or rejected depending
+	// only on which object it was written on.
+	//
+	// MinItems is deliberately NOT mirrored. This list is a default, and empty is
+	// a meaningful value: "machines in this cluster name their own attachments".
+	// Requiring one would make that arrangement inexpressible.
 	// +optional
+	// +listType=map
+	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=8
 	Networks []HydraNetworkAttachment `json:"networks,omitempty"`
 }

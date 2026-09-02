@@ -54,7 +54,7 @@ func newMachine(mutate func(*infrav1.HydraMachine)) *infrav1.HydraMachine {
 	m := &infrav1.HydraMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("machine-%d", uniq),
-			Namespace: "default",
+			Namespace: linkNamespace,
 		},
 		Spec: infrav1.HydraMachineSpec{
 			VCPUs:    2,
@@ -75,7 +75,7 @@ func newTemplate(mutate func(*infrav1.HydraMachineTemplate)) *infrav1.HydraMachi
 	t := &infrav1.HydraMachineTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("template-%d", uniq),
-			Namespace: "default",
+			Namespace: linkNamespace,
 		},
 		Spec: infrav1.HydraMachineTemplateSpec{
 			Template: infrav1.HydraMachineTemplateResource{
@@ -391,8 +391,8 @@ func TestToMachineAddressesCapsAndDeduplicates(t *testing.T) {
 	}
 
 	dupes := []providers.Address{
-		{Type: providers.AddressTypeInternalIP, Address: "10.0.0.1"},
-		{Type: providers.AddressTypeInternalIP, Address: "10.0.0.1"},
+		{Type: providers.AddressTypeInternalIP, Address: linkOtherIP},
+		{Type: providers.AddressTypeInternalIP, Address: linkOtherIP},
 		{Type: providers.AddressTypeHostname, Address: "worker"},
 	}
 	if got := toMachineAddresses(dupes); len(got) != 2 {
