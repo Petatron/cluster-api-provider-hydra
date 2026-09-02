@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -304,6 +305,34 @@ func clusterReadyForCreate(link *linkage) error {
 		// cluster's -- and providerID is recorded immediately, so nothing would
 		// ever revisit it.
 		return fmt.Errorf("%w: HydraCluster %q is not visible yet", errWaitingForHydraCluster, link.hydraClusterName)
+	}
+	// Gate on the HydraCluster's CURRENT readiness, not on the latched milestone
+	// below.
+	//
+	// initialization.provisioned only ever moves forward, deliberately -- and the
+	// Cluster's copy of it inherits that. So once a cluster has been verified
+	// once, the milestone stays true even if the storage pool is later stopped or
+	// the base image deleted. Without this check the cluster-level verification
+	// would protect only the first machine ever created, and every machine after
+	// a regression would sail through and fail one at a time inside Create --
+	// which is precisely the late, repeated, per-machine confusion that
+	// CheckInfrastructure exists to replace.
+	if link.hydraCluster != nil {
+		ready := apimeta.FindStatusCondition(link.hydraCluster.Status.Conditions, infrav1.ClusterReadyCondition)
+		switch {
+		case ready == nil:
+			return fmt.Errorf("%w: HydraCluster %q has not been reconciled yet",
+				errWaitingForClusterInfra, link.hydraClusterName)
+		case ready.ObservedGeneration != link.hydraCluster.Generation:
+			// A verdict about an earlier spec says nothing about this one. Someone
+			// may have just pointed the cluster at a different pool.
+			return fmt.Errorf("%w: HydraCluster %q readiness is stale (observed generation %d, current %d)",
+				errWaitingForClusterInfra, link.hydraClusterName,
+				ready.ObservedGeneration, link.hydraCluster.Generation)
+		case ready.Status != metav1.ConditionTrue:
+			return fmt.Errorf("%w: HydraCluster %q is not ready: %s",
+				errWaitingForClusterInfra, link.hydraClusterName, ready.Message)
+		}
 	}
 	if provisioned := link.cluster.Status.Initialization.InfrastructureProvisioned; provisioned == nil || !*provisioned {
 		// Creating a machine before the cluster's own infrastructure exists gives

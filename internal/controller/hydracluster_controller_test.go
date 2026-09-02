@@ -69,6 +69,29 @@ func hydraCluster(mutate func(*infrav1.HydraCluster)) *infrav1.HydraCluster {
 	return hc
 }
 
+// verifiedHydraCluster is a HydraCluster that has already been reconciled and
+// found good.
+//
+// Kept separate from hydraCluster() rather than folded into it: the cluster
+// reconciler specs need an unverified starting point to prove they do the
+// verifying, while the machine specs need a verified one because creation now
+// gates on current readiness rather than on the latched milestone.
+func verifiedHydraCluster(mutate func(*infrav1.HydraCluster)) *infrav1.HydraCluster {
+	hc := hydraCluster(mutate)
+	hc.Generation = 1
+	provisioned := true
+	hc.Status.Initialization.Provisioned = &provisioned
+	hc.Status.Conditions = []metav1.Condition{{
+		Type:               infrav1.ClusterReadyCondition,
+		Status:             metav1.ConditionTrue,
+		Reason:             "InfrastructureVerified",
+		Message:            "storage pool is running and the base image is present in it",
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: 1,
+	}}
+	return hc
+}
+
 // owningCluster is the Cluster that points back at the HydraCluster above.
 func owningCluster(mutate func(*clusterv1.Cluster)) *clusterv1.Cluster {
 	c := readyCluster()
