@@ -282,24 +282,35 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// data the machine already consumed, never reaching the idempotent Create
 	// that would have rediscovered it. The providerID could never be recorded,
 	// for a machine that is running perfectly well.
-	var bootstrapData []byte
+	var spec providers.MachineSpec
 	switch _, findErr := prov.FindByName(ctx, backendName(machine)); {
 	case findErr == nil:
 		// Already exists. Create adopts it below -- including starting it if a
-		// previous attempt defined it without ever starting it -- and by contract
-		// does not read the spec to do so.
+		// previous attempt defined it without ever starting it.
+		//
+		// The spec is deliberately name-only. MachineProvider.Create documents
+		// that adoption must depend on nothing but spec.Name, and this is the
+		// caller that relies on it: resolving the full spec here would make
+		// recovery fail whenever the resolved values had since become
+		// unavailable -- a deleted or unreadable HydraCluster leaving no
+		// networks, say -- and a machine whose providerID was never recorded
+		// would then be unadoptable forever, which is a permanently orphaned VM.
 		logf.FromContext(ctx).Info("Adopting a machine whose providerID was never recorded",
 			"name", backendName(machine))
+		spec = providers.MachineSpec{Name: backendName(machine)}
 	case errors.Is(findErr, providers.ErrNotFound):
-		// Nothing exists, so this really is a create. Both gates belong here and
+		// Nothing exists, so this really is a create. Every gate belongs here and
 		// not earlier: an existing machine being adopted above must not be blocked
-		// on the cluster or on a Secret it already consumed, which is the recovery
-		// path FindByName exists to protect.
+		// on the cluster, on a Secret it already consumed, or on values that
+		// resolve differently now than when it was built.
 		if err := clusterReadyForCreate(link); err != nil {
 			return nil, err
 		}
-		var err error
-		if bootstrapData, err = r.bootstrapDataFor(ctx, link); err != nil {
+		bootstrapData, err := r.bootstrapDataFor(ctx, link)
+		if err != nil {
+			return nil, err
+		}
+		if spec, err = specFor(machine, link, bootstrapData); err != nil {
 			return nil, err
 		}
 	default:
@@ -309,11 +320,6 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// Create is idempotent on name, which is what makes this safe: if a previous
 	// reconcile created the machine but crashed before persisting the providerID,
 	// this call returns that same machine rather than creating a second one.
-	spec, err := specFor(machine, link, bootstrapData)
-	if err != nil {
-		return nil, err
-	}
-
 	state, err := prov.Create(ctx, spec)
 	if err != nil {
 		return nil, fmt.Errorf("creating machine: %w", err)
@@ -570,6 +576,8 @@ func waitReasonFor(err error) string {
 		return "WaitingForCluster"
 	case errors.Is(err, errWaitingForClusterInfra):
 		return "WaitingForClusterInfrastructure"
+	case errors.Is(err, errWaitingForHydraCluster):
+		return "WaitingForHydraCluster"
 	case errors.Is(err, errWaitingForBootstrap):
 		return "WaitingForBootstrapData"
 	default:

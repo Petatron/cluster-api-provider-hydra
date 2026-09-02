@@ -76,6 +76,7 @@ var errWaitingForOwner = errors.New("waiting for the owning Machine")
 var (
 	errWaitingForCluster      = errors.New("waiting for the Cluster")
 	errWaitingForClusterInfra = errors.New("waiting for cluster infrastructure")
+	errWaitingForHydraCluster = errors.New("waiting for the HydraCluster")
 )
 
 // linkage is the Cluster API context surrounding a HydraMachine.
@@ -100,6 +101,14 @@ type linkage struct {
 
 	machine *clusterv1.Machine
 	cluster *clusterv1.Cluster
+
+	// hydraClusterName is the HydraCluster named by the Cluster, whether or not
+	// it could be read -- the third instance of the same distinction ownerName
+	// and clusterName already draw. "This Cluster uses another provider" and
+	// "this Cluster's HydraCluster is not readable right now" must not look
+	// alike: the first means there are no defaults, the second means the defaults
+	// are unknown.
+	hydraClusterName string
 
 	// hydraCluster carries this provider's cluster-scoped settings -- storage
 	// pool, default image, default networks. Nil when the Cluster points at some
@@ -189,14 +198,19 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 		return link, nil
 	}
 
+	link.hydraClusterName = infraRef.Name
+
 	hydraCluster := &infrav1.HydraCluster{}
 	key := types.NamespacedName{Namespace: machine.Namespace, Name: infraRef.Name}
 	if err := r.Get(ctx, key, hydraCluster); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Same treatment as an absent Cluster: not fatal, and it costs only the
-			// defaults. The cluster gate below refuses creation anyway while the
-			// Cluster is not reporting its infrastructure provisioned.
-			log.V(1).Info("HydraCluster named by the Cluster does not exist", "hydraCluster", infraRef.Name)
+			// Not fatal, and deliberately not the same as "no HydraCluster". The
+			// name is retained above so creation waits: the Cluster's
+			// infrastructureProvisioned is a latched milestone and stays true after
+			// the HydraCluster disappears, so without this a new machine would sail
+			// through the cluster gate and quietly fall back to the manager's pool
+			// and image instead of the cluster's.
+			log.V(1).Info("HydraCluster named by the Cluster is not visible", "hydraCluster", infraRef.Name)
 			return link, nil
 		}
 		return nil, fmt.Errorf("reading HydraCluster %q: %w", infraRef.Name, err)
@@ -283,6 +297,13 @@ func clusterReadyForCreate(link *linkage) error {
 	}
 	if link.cluster == nil {
 		return fmt.Errorf("%w: Cluster %q is not visible yet", errWaitingForCluster, link.clusterName)
+	}
+	if link.hydraClusterName != "" && link.hydraCluster == nil {
+		// Its defaults are unknown, not absent. Creating now would silently use
+		// the manager's pool and image for a machine that was meant to use the
+		// cluster's -- and providerID is recorded immediately, so nothing would
+		// ever revisit it.
+		return fmt.Errorf("%w: HydraCluster %q is not visible yet", errWaitingForHydraCluster, link.hydraClusterName)
 	}
 	if provisioned := link.cluster.Status.Initialization.InfrastructureProvisioned; provisioned == nil || !*provisioned {
 		// Creating a machine before the cluster's own infrastructure exists gives

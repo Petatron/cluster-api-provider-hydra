@@ -36,7 +36,7 @@ import (
 // ignores is worse than one that does not exist -- see spec.image on
 // HydraMachine before PET-8's review caught it.
 // +kubebuilder:validation:XValidation:rule="has(self.controlPlaneEndpoint) && size(self.controlPlaneEndpoint.host) > 0 && self.controlPlaneEndpoint.port > 0",message="controlPlaneEndpoint requires both a host and a non-zero port"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.storagePool) || (has(self.storagePool) && self.storagePool == oldSelf.storagePool)",message="storagePool is immutable once set; existing machines were cloned from a volume inside it"
+// +kubebuilder:validation:XValidation:rule="has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool) || self.storagePool == oldSelf.storagePool)",message="storagePool is fixed when the cluster is created; omitting it selects the manager's pool, which is equally binding"
 type HydraClusterSpec struct {
 	// controlPlaneEndpoint is the address and port of this cluster's API server.
 	//
@@ -76,11 +76,14 @@ type HydraClusterSpec struct {
 	// start over an unset pool, because that made the flag mandatory process-wide
 	// and so made this field pointless.
 	//
-	// Immutable once set, enforced on the spec. A reconcile cannot carry out the
-	// change it implies: existing machines were cloned from a backing volume
-	// inside the old pool and keep referring to it, while new machines would land
-	// somewhere else -- and provisioned does not regress, so a pool swapped for a
-	// missing one would not even be reported.
+	// Fixed when the cluster is created, and that includes whether it is set at
+	// all. Set-once is not enough: omitting it already selects the manager's
+	// pool, so allowing omitted-to-set would put existing machines in one pool
+	// and every machine created afterwards in another -- the split-pool state
+	// this field's whole purpose is to avoid. A reconcile cannot carry out that
+	// change either: existing machines were cloned from a backing volume inside
+	// the old pool and keep referring to it, and provisioned does not regress,
+	// so swapping in a missing pool would not even be reported.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253

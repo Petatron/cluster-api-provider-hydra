@@ -82,8 +82,8 @@ type HydraNetworkAttachment struct {
 // enforcing that here turns a silently ignored edit into an immediate rejection.
 //
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.providerID) || (has(self.providerID) && self.providerID == oldSelf.providerID)",message="providerID is immutable once set"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.image) || (has(self.image) && self.image == oldSelf.image)",message="image is immutable once set; replace the machine instead"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.networks) || (has(self.networks) && self.networks == oldSelf.networks)",message="networks are immutable once set; replace the machine instead"
+// +kubebuilder:validation:XValidation:rule="has(self.image) == has(oldSelf.image) && (!has(self.image) || self.image == oldSelf.image)",message="image is fixed when the machine is created; replace the machine instead"
+// +kubebuilder:validation:XValidation:rule="has(self.networks) == has(oldSelf.networks) && (!has(self.networks) || self.networks == oldSelf.networks)",message="networks are fixed when the machine is created; replace the machine instead"
 type HydraMachineSpec struct {
 	// providerID is the unique identifier for this machine, in the form
 	// hydra://<backend>/<id>. The controller sets it once the backing
@@ -128,9 +128,15 @@ type HydraMachineSpec struct {
 	// manager's --libvirt-base-image flag. It is only an error when all three are
 	// empty.
 	//
-	// Immutability is expressed on the spec rather than the field, because a
-	// field-level transition rule cannot describe "may be set once, then never
-	// changed" for an optional value.
+	// Fixed when the machine is created, and that includes whether it is set at
+	// all. Adding one later would be admitted while changing nothing: the VM was
+	// already built from whatever this resolved to, and the reconciler only
+	// re-reads a machine once its providerID exists -- so the object would claim
+	// an image the running VM does not have. Cluster API replaces machines rather
+	// than mutating them, which is the model this follows.
+	//
+	// Expressed on the spec rather than the field, because a field-level
+	// transition rule cannot describe presence changing for an optional value.
 	// +optional
 	Image *HydraImage `json:"image,omitempty"`
 

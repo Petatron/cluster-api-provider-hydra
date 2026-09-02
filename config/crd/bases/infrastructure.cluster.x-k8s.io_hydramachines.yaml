@@ -81,9 +81,15 @@ spec:
                   manager's --libvirt-base-image flag. It is only an error when all three are
                   empty.
 
-                  Immutability is expressed on the spec rather than the field, because a
-                  field-level transition rule cannot describe "may be set once, then never
-                  changed" for an optional value.
+                  Fixed when the machine is created, and that includes whether it is set at
+                  all. Adding one later would be admitted while changing nothing: the VM was
+                  already built from whatever this resolved to, and the reconciler only
+                  re-reads a machine once its providerID exists -- so the object would claim
+                  an image the running VM does not have. Cluster API replaces machines rather
+                  than mutating them, which is the model this follows.
+
+                  Expressed on the spec rather than the field, because a field-level
+                  transition rule cannot describe presence changing for an optional value.
                 properties:
                   checksum:
                     description: |-
@@ -194,11 +200,14 @@ spec:
             - message: providerID is immutable once set
               rule: '!has(oldSelf.providerID) || (has(self.providerID) && self.providerID
                 == oldSelf.providerID)'
-            - message: image is immutable once set; replace the machine instead
-              rule: '!has(oldSelf.image) || (has(self.image) && self.image == oldSelf.image)'
-            - message: networks are immutable once set; replace the machine instead
-              rule: '!has(oldSelf.networks) || (has(self.networks) && self.networks
-                == oldSelf.networks)'
+            - message: image is fixed when the machine is created; replace the machine
+                instead
+              rule: has(self.image) == has(oldSelf.image) && (!has(self.image) ||
+                self.image == oldSelf.image)
+            - message: networks are fixed when the machine is created; replace the
+                machine instead
+              rule: has(self.networks) == has(oldSelf.networks) && (!has(self.networks)
+                || self.networks == oldSelf.networks)
           status:
             description: status defines the observed state of HydraMachine
             properties:

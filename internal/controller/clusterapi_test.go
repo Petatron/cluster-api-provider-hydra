@@ -446,6 +446,54 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
 		})
 
+		It("waits when the referenced HydraCluster is not readable", func() {
+			// Not the same as "no HydraCluster". The Cluster's
+			// infrastructureProvisioned is a latched milestone and stays true after
+			// the HydraCluster disappears, so without this a new machine would
+			// clear the cluster gate and quietly fall back to the manager's pool
+			// and image -- and providerID is recorded immediately, so nothing
+			// would ever revisit it.
+			bare()
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil), // points at a HydraCluster that is not created
+			)
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForHydraCluster"))
+			Expect(ready.Message).To(ContainSubstring(linkClusterName))
+		})
+
+		It("still adopts an existing machine when the defaults are unresolvable", func() {
+			// The recovery path must not depend on anything but the backend name.
+			// A machine created before its HydraCluster was deleted, whose
+			// providerID was never recorded, would otherwise be unadoptable
+			// forever -- a permanently orphaned VM.
+			bare()
+			r := buildWithoutCluster(
+				ownerMachine(nil),
+				owningCluster(nil), // HydraCluster absent, so nothing resolves
+			)
+
+			state, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			out := reload(r)
+			Expect(out.Spec.ProviderID).NotTo(BeNil())
+			Expect(*out.Spec.ProviderID).To(Equal(providers.ProviderID(provider.Name(), state.ID)))
+			Expect(provider.Count()).To(Equal(1), "adopted, not duplicated")
+		})
+
 		It("falls back to the manager's defaults when no HydraCluster is referenced", func() {
 			// A Cluster pointing at some other provider, or at nothing this
 			// controller recognises, is not an error -- there are simply no

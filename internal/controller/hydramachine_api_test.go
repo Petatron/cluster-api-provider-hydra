@@ -222,7 +222,7 @@ var _ = Describe("HydraMachine API", func() {
 			m.Spec.VCPUs = 4
 			err := k8sClient.Update(ctx, m)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err.Error()).To(ContainSubstring("vcpus"))
 		})
 
 		It("rejects a change to memory", func() {
@@ -235,7 +235,7 @@ var _ = Describe("HydraMachine API", func() {
 			m.Spec.Memory = resource.MustParse("8Gi")
 			err := k8sClient.Update(ctx, m)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err.Error()).To(ContainSubstring("memory"))
 		})
 
 		It("rejects a change to diskSize", func() {
@@ -246,7 +246,7 @@ var _ = Describe("HydraMachine API", func() {
 			m.Spec.DiskSize = resource.MustParse("80Gi")
 			err := k8sClient.Update(ctx, m)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err.Error()).To(ContainSubstring("diskSize"))
 		})
 
 		It("rejects a change to networks", func() {
@@ -259,7 +259,34 @@ var _ = Describe("HydraMachine API", func() {
 			m.Spec.Networks = []infrav1.HydraNetworkAttachment{{Name: "br1"}}
 			err := k8sClient.Update(ctx, m)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("immutable"))
+			Expect(err.Error()).To(ContainSubstring("networks"))
+		})
+
+		It("rejects adding an image that was omitted at creation", func() {
+			// Set-once was not enough. The VM was already built from whatever the
+			// image resolved to -- the cluster's default, or the manager's -- and
+			// the reconciler only re-reads a machine once its providerID exists.
+			// Admitting this would let the object claim an image the running VM
+			// does not have.
+			m := newMachine(func(m *infrav1.HydraMachine) { m.Spec.Image = nil })
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Image = &infrav1.HydraImage{Name: testImage}
+			err := k8sClient.Update(ctx, m)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("image"))
+		})
+
+		It("rejects adding networks that were omitted at creation", func() {
+			m := newMachine(func(m *infrav1.HydraMachine) { m.Spec.Networks = nil })
+			Expect(k8sClient.Create(ctx, m)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, m) }()
+
+			m.Spec.Networks = []infrav1.HydraNetworkAttachment{{Name: testNetwork}}
+			err := k8sClient.Update(ctx, m)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("networks"))
 		})
 
 		It("rejects appending a network", func() {
@@ -351,7 +378,7 @@ var _ = Describe("HydraMachineTemplate API", func() {
 		t.Spec.Template.Spec.VCPUs = 8
 		err := k8sClient.Update(ctx, t)
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("immutable"))
+		Expect(err.Error()).To(ContainSubstring("vcpus"))
 	})
 
 	It("carries the machine payload at spec.template.spec so it can be cloned", func() {

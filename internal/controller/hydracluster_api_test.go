@@ -110,13 +110,27 @@ var _ = Describe("HydraCluster API", func() {
 			hc.Spec.StoragePool = "somewhere-else"
 			err := k8sClient.Update(ctx, hc)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("storagePool is immutable"))
+			Expect(err.Error()).To(ContainSubstring("storagePool is fixed when the cluster is created"))
 		})
 
 		It("may be omitted, falling back to the manager's flag", func() {
 			Expect(k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
 				hc.Spec.StoragePool = ""
 			}))).To(Succeed())
+		})
+
+		It("cannot be added later either, because omission already chose a pool", func() {
+			// Set-once was not enough. Omitting it selects the manager's pool, so
+			// adding one afterwards would leave existing machines in that pool and
+			// send every new machine somewhere else -- the split-pool state this
+			// field exists to prevent.
+			hc := newHydraCluster(func(hc *infrav1.HydraCluster) { hc.Spec.StoragePool = "" })
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+			hc.Spec.StoragePool = "added-afterwards"
+			err := k8sClient.Update(ctx, hc)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("equally binding"))
 		})
 	})
 
