@@ -221,6 +221,20 @@ type HydraMachineStatus struct {
 }
 
 // Condition types owned by HydraMachine.
+// StandaloneAnnotation declares that no Cluster API Machine will ever own this
+// HydraMachine, so the controller should provision it without bootstrap data
+// rather than waiting to be adopted.
+//
+// It exists because the absence of an owner reference cannot be read as this
+// intent. Cluster API attaches the reference in a later reconcile, so every
+// machine it manages is briefly indistinguishable from a standalone one -- and
+// provisioning during that window produces a VM with no user-data and the
+// manager's default pool and image, which nothing afterwards revisits.
+//
+// Useful for exercising the infrastructure half on its own: the machine boots
+// the base image, configures nothing, and joins no cluster.
+const StandaloneAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/standalone"
+
 const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady
 	// condition by Cluster API.

@@ -149,8 +149,9 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Resolve the Cluster API objects around this machine before anything else.
-	// Both the paused check and the bootstrap data depend on them, and a machine
-	// with no owning Machine is a supported standalone case rather than an error.
+	// Both the paused check and the bootstrap data depend on them. A machine that
+	// declares itself standalone needs none of them; one that merely has no owner
+	// reference yet waits for the owner Cluster API is about to attach.
 	link, err := r.resolveLinkage(ctx, machine)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {

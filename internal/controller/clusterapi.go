@@ -82,11 +82,18 @@ var (
 
 // linkage is the Cluster API context surrounding a HydraMachine.
 //
-// Both fields may be nil, and nil is a supported state rather than an error:
-// a HydraMachine created directly, with no owning Machine, provisions a VM with
-// no bootstrap data. That is the documented way to exercise the infrastructure
-// half on its own -- the machine boots and never joins a cluster.
+// Every object pointer here may be nil, and nil is never on its own a reason to
+// provision. Each is paired with the name of the thing it should have held, so
+// the controller can tell "there is nothing here" from "I cannot see it yet" --
+// a distinction this file makes four times, because collapsing it in any one of
+// them provisions a machine from wrong information and then never looks again.
 type linkage struct {
+	// standalone records that the object declares it will never have a Cluster
+	// API owner, via infrav1.StandaloneAnnotation. It is the only thing that
+	// makes an ownerless machine provisionable, and it has to be an explicit
+	// statement: see resolveLinkage.
+	standalone bool
+
 	// ownerName is the Machine named by an owner reference, whether or not that
 	// Machine could be read. Keeping it separate from machine is what lets the
 	// controller tell "nothing owns this" from "its owner is not visible right
@@ -130,7 +137,23 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 
 	ref := ownerMachineRef(machine)
 	if ref == nil {
-		return &linkage{}, nil
+		// No owner reference, which is NOT the same as no owner.
+		//
+		// Cluster API stamps the reference on in its own reconcile, so every
+		// HydraMachine it manages exists for a moment without one. Reading that
+		// moment as "standalone" is not a rare race: it is the state every single
+		// machine passes through on creation, and the consequences are silent.
+		// clusterReadyForCreate would find no cluster to gate on, bootstrapDataFor
+		// would find no bootstrap provider to ask, and Create would then run with
+		// no user-data and with the manager's default pool and image instead of
+		// the cluster's. providerID is recorded immediately, so nothing would ever
+		// revisit it: a VM that boots, configures nothing, joins nothing, and
+		// looks provisioned.
+		//
+		// So standalone has to be stated rather than inferred. An operator who
+		// wants a machine with no Cluster API owner says so with the annotation;
+		// anything else waits for the owner Cluster API is about to attach.
+		return &linkage{standalone: hasStandaloneAnnotation(machine)}, nil
 	}
 	name := ref.Name
 
@@ -220,6 +243,18 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 	return link, nil
 }
 
+// hasStandaloneAnnotation reports whether the object opts out of Cluster API
+// ownership.
+//
+// Presence is the signal, whatever the value, matching how Cluster API reads its
+// own paused and skip-remediation annotations -- an operator who writes
+// "false" here has still gone out of their way to write it, and treating that
+// as "not standalone" would be a surprise in the direction of provisioning.
+func hasStandaloneAnnotation(machine *infrav1.HydraMachine) bool {
+	_, ok := machine.Annotations[infrav1.StandaloneAnnotation]
+	return ok
+}
+
 // ownerMachineRef returns the owner reference naming the Cluster API Machine
 // that owns this object, or nil when nothing does.
 //
@@ -291,6 +326,16 @@ func pausedReason(annotations map[string]string, cluster *clusterv1.Cluster) str
 // finalizers, while applying it to observation would flip a healthy machine to
 // not-ready every time the cache lagged.
 func clusterReadyForCreate(link *linkage) error {
+	if link.machine == nil && !link.standalone {
+		// Every gate below reads through the owning Machine, so without one there
+		// is nothing to check and no safe default to assume. Naming the owner when
+		// we know it makes the wait legible; when we do not, the object simply has
+		// not been adopted yet.
+		if link.ownerName != "" {
+			return fmt.Errorf("%w: owner Machine %q is not visible yet", errWaitingForOwner, link.ownerName)
+		}
+		return fmt.Errorf("%w: no owner Machine yet, and the machine is not marked standalone", errWaitingForOwner)
+	}
 	if link.clusterName == "" {
 		// Not part of a cluster. A standalone HydraMachine has no shared
 		// infrastructure to wait for.
@@ -357,9 +402,11 @@ func (r *HydraMachineReconciler) bootstrapDataFor(ctx context.Context, link *lin
 			// only safe answer -- see resolveLinkage.
 			return nil, fmt.Errorf("%w: owner Machine %q is not visible yet", errWaitingForOwner, link.ownerName)
 		}
-		// Nothing owns this object, so there is no bootstrap provider to ask.
+		// Declared standalone, so there is no bootstrap provider to ask.
 		// Documented on providers.MachineSpec as a useful state: the VM boots,
-		// configures nothing, and never joins a cluster.
+		// configures nothing, and never joins a cluster. Reachable only through
+		// the annotation -- see resolveLinkage for why the absence of an owner is
+		// not enough to conclude it.
 		return nil, nil
 	}
 
