@@ -1,0 +1,25 @@
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraCluster
+metadata:
+  name: hydracluster-sample
+spec:
+  # Supplied rather than produced. Hydra creates no load balancer or VIP, so it
+  # has nothing to derive an endpoint from -- it only reports back what it is
+  # told. Providers that DO create the endpoint are the ones expected to fill
+  # this in themselves.
+  controlPlaneEndpoint:
+    host: 192.168.16.10
+    port: 6443
+  # Where this cluster's machine disks are created, and where its base image is
+  # expected to live. Cluster-scoped with no per-machine override: the backend
+  # resolves the base image as a volume *inside* this pool, so one pool per
+  # cluster is what lets a single image serve every machine in it.
+  storagePool: k8s-workers
+  # Inherited by machines that name no image of their own.
+  baseImage:
+    name: ubuntu-24.04-server-cloudimg-amd64.img
+  # Inherited by machines that name no networks of their own. There is no
+  # manager-flag fallback for this: a machine that resolves to no network boots,
+  # looks healthy to the backend, and can never reach an API server.
+  networks:
+    - name: br0

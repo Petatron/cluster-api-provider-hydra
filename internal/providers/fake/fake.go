@@ -49,11 +49,20 @@ type Provider struct {
 	// there is nowhere else to check that the controller passed it on.
 	LastSpec providers.MachineSpec
 
+	// LastInfrastructure is the spec of the most recent CheckInfrastructure, so a
+	// test can assert the cluster's pool and image actually reached the backend
+	// rather than the manager's defaults.
+	LastInfrastructure providers.InfrastructureSpec
+
+	// InfrastructureChecks counts CheckInfrastructure calls.
+	InfrastructureChecks int
+
 	// Injected failures. Set to make the corresponding call fail.
-	CreateErr error
-	GetErr    error
-	FindErr   error
-	DeleteErr error
+	CreateErr         error
+	InfrastructureErr error
+	GetErr            error
+	FindErr           error
+	DeleteErr         error
 
 	// ReadyOnCreate controls whether machines report Ready immediately. Real
 	// backends usually do not, so the default of false is the honest one.
@@ -108,6 +117,16 @@ func (p *Provider) Create(_ context.Context, spec providers.MachineSpec) (*provi
 	p.machines[id] = state
 	p.byName[spec.Name] = id
 	return copyState(state), nil
+}
+
+// CheckInfrastructure implements providers.MachineProvider.
+func (p *Provider) CheckInfrastructure(_ context.Context, spec providers.InfrastructureSpec) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.InfrastructureChecks++
+	p.LastInfrastructure = spec
+	return p.InfrastructureErr
 }
 
 // Get implements providers.MachineProvider.

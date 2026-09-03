@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -46,6 +47,7 @@ const bootstrapDataSecretKey = "value"
 const (
 	machineKind      = "Machine"
 	hydraMachineKind = "HydraMachine"
+	hydraClusterKind = "HydraCluster"
 )
 
 // errWaitingForBootstrap reports that the bootstrap provider has not published
@@ -75,6 +77,7 @@ var errWaitingForOwner = errors.New("waiting for the owning Machine")
 var (
 	errWaitingForCluster      = errors.New("waiting for the Cluster")
 	errWaitingForClusterInfra = errors.New("waiting for cluster infrastructure")
+	errWaitingForHydraCluster = errors.New("waiting for the HydraCluster")
 )
 
 // linkage is the Cluster API context surrounding a HydraMachine.
@@ -99,6 +102,20 @@ type linkage struct {
 
 	machine *clusterv1.Machine
 	cluster *clusterv1.Cluster
+
+	// hydraClusterName is the HydraCluster named by the Cluster, whether or not
+	// it could be read -- the third instance of the same distinction ownerName
+	// and clusterName already draw. "This Cluster uses another provider" and
+	// "this Cluster's HydraCluster is not readable right now" must not look
+	// alike: the first means there are no defaults, the second means the defaults
+	// are unknown.
+	hydraClusterName string
+
+	// hydraCluster carries this provider's cluster-scoped settings -- storage
+	// pool, default image, default networks. Nil when the Cluster points at some
+	// other infrastructure provider, or at nothing this controller recognises,
+	// in which case the manager's flags are all that is left.
+	hydraCluster *infrav1.HydraCluster
 }
 
 // resolveLinkage walks from the HydraMachine out to the Cluster API objects that
@@ -173,6 +190,33 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 		return nil, fmt.Errorf("reading Cluster %q: %w", clusterName, err)
 	}
 	link.cluster = cluster
+
+	// The Cluster names its infrastructure object; that is where this provider's
+	// cluster-scoped settings live. A Cluster pointing at another provider is not
+	// an error here -- this controller simply has no defaults to contribute.
+	infraRef := cluster.Spec.InfrastructureRef
+	if infraRef.Kind != hydraClusterKind || infraRef.APIGroup != infrav1.GroupVersion.Group || infraRef.Name == "" {
+		return link, nil
+	}
+
+	link.hydraClusterName = infraRef.Name
+
+	hydraCluster := &infrav1.HydraCluster{}
+	key := types.NamespacedName{Namespace: machine.Namespace, Name: infraRef.Name}
+	if err := r.Get(ctx, key, hydraCluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Not fatal, and deliberately not the same as "no HydraCluster". The
+			// name is retained above so creation waits: the Cluster's
+			// infrastructureProvisioned is a latched milestone and stays true after
+			// the HydraCluster disappears, so without this a new machine would sail
+			// through the cluster gate and quietly fall back to the manager's pool
+			// and image instead of the cluster's.
+			log.V(1).Info("HydraCluster named by the Cluster is not visible", "hydraCluster", infraRef.Name)
+			return link, nil
+		}
+		return nil, fmt.Errorf("reading HydraCluster %q: %w", infraRef.Name, err)
+	}
+	link.hydraCluster = hydraCluster
 	return link, nil
 }
 
@@ -189,9 +233,15 @@ func (r *HydraMachineReconciler) resolveLinkage(ctx context.Context, machine *in
 // dependency graph considerably for fifteen lines of logic whose contract, an
 // owner reference of kind Machine in the cluster.x-k8s.io group, is stable.
 func ownerMachineRef(machine *infrav1.HydraMachine) *metav1.OwnerReference {
-	for i := range machine.OwnerReferences {
-		ref := &machine.OwnerReferences[i]
-		if ref.Kind != machineKind {
+	return ownerRefOfKind(machine.OwnerReferences, machineKind)
+}
+
+// ownerRefOfKind finds the owner reference of the given kind in the Cluster API
+// group, or nil.
+func ownerRefOfKind(refs []metav1.OwnerReference, kind string) *metav1.OwnerReference {
+	for i := range refs {
+		ref := &refs[i]
+		if ref.Kind != kind {
 			continue
 		}
 		// Compare the group only. Matching the full apiVersion would break on
@@ -213,18 +263,21 @@ func ownerMachineRef(machine *infrav1.HydraMachine) *metav1.OwnerReference {
 // pausing a Cluster is how an operator stops a whole cluster's reconciliation --
 // and a provider that ignored it would carry on creating and destroying VMs
 // underneath someone who believed they had stopped everything.
-func pausedReason(machine *infrav1.HydraMachine, link *linkage) string {
-	if _, ok := machine.Annotations[clusterv1.PausedAnnotation]; ok {
+// Takes the object's own annotations rather than the object, so HydraMachine and
+// HydraCluster share one implementation -- the rules are identical and two
+// copies would drift.
+func pausedReason(annotations map[string]string, cluster *clusterv1.Cluster) string {
+	if _, ok := annotations[clusterv1.PausedAnnotation]; ok {
 		return fmt.Sprintf("the %s annotation", clusterv1.PausedAnnotation)
 	}
-	if link == nil || link.cluster == nil {
+	if cluster == nil {
 		return ""
 	}
-	if link.cluster.Spec.Paused != nil && *link.cluster.Spec.Paused {
-		return fmt.Sprintf("spec.paused on Cluster %q", link.cluster.Name)
+	if cluster.Spec.Paused != nil && *cluster.Spec.Paused {
+		return fmt.Sprintf("spec.paused on Cluster %q", cluster.Name)
 	}
-	if _, ok := link.cluster.Annotations[clusterv1.PausedAnnotation]; ok {
-		return fmt.Sprintf("the %s annotation on Cluster %q", clusterv1.PausedAnnotation, link.cluster.Name)
+	if _, ok := cluster.Annotations[clusterv1.PausedAnnotation]; ok {
+		return fmt.Sprintf("the %s annotation on Cluster %q", clusterv1.PausedAnnotation, cluster.Name)
 	}
 	return ""
 }
@@ -245,6 +298,41 @@ func clusterReadyForCreate(link *linkage) error {
 	}
 	if link.cluster == nil {
 		return fmt.Errorf("%w: Cluster %q is not visible yet", errWaitingForCluster, link.clusterName)
+	}
+	if link.hydraClusterName != "" && link.hydraCluster == nil {
+		// Its defaults are unknown, not absent. Creating now would silently use
+		// the manager's pool and image for a machine that was meant to use the
+		// cluster's -- and providerID is recorded immediately, so nothing would
+		// ever revisit it.
+		return fmt.Errorf("%w: HydraCluster %q is not visible yet", errWaitingForHydraCluster, link.hydraClusterName)
+	}
+	// Gate on the HydraCluster's CURRENT readiness, not on the latched milestone
+	// below.
+	//
+	// initialization.provisioned only ever moves forward, deliberately -- and the
+	// Cluster's copy of it inherits that. So once a cluster has been verified
+	// once, the milestone stays true even if the storage pool is later stopped or
+	// the base image deleted. Without this check the cluster-level verification
+	// would protect only the first machine ever created, and every machine after
+	// a regression would sail through and fail one at a time inside Create --
+	// which is precisely the late, repeated, per-machine confusion that
+	// CheckInfrastructure exists to replace.
+	if link.hydraCluster != nil {
+		ready := apimeta.FindStatusCondition(link.hydraCluster.Status.Conditions, infrav1.ClusterReadyCondition)
+		switch {
+		case ready == nil:
+			return fmt.Errorf("%w: HydraCluster %q has not been reconciled yet",
+				errWaitingForClusterInfra, link.hydraClusterName)
+		case ready.ObservedGeneration != link.hydraCluster.Generation:
+			// A verdict about an earlier spec says nothing about this one. Someone
+			// may have just pointed the cluster at a different pool.
+			return fmt.Errorf("%w: HydraCluster %q readiness is stale (observed generation %d, current %d)",
+				errWaitingForClusterInfra, link.hydraClusterName,
+				ready.ObservedGeneration, link.hydraCluster.Generation)
+		case ready.Status != metav1.ConditionTrue:
+			return fmt.Errorf("%w: HydraCluster %q is not ready: %s",
+				errWaitingForClusterInfra, link.hydraClusterName, ready.Message)
+		}
 	}
 	if provisioned := link.cluster.Status.Initialization.InfrastructureProvisioned; provisioned == nil || !*provisioned {
 		// Creating a machine before the cluster's own infrastructure exists gives

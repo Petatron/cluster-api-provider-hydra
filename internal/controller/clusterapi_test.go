@@ -50,6 +50,8 @@ import (
 
 const (
 	linkNamespace   = "default"
+	linkEndpointIP  = "192.168.16.10"
+	linkOtherIP     = "10.0.0.1"
 	linkClusterName = "hydra"
 	linkMachineName = "worker-1"
 	linkSecretName  = "worker-1-bootstrap"
@@ -83,8 +85,8 @@ func linkedMachine(name string) *infrav1.HydraMachine {
 			VCPUs:    2,
 			Memory:   resource.MustParse("4Gi"),
 			DiskSize: resource.MustParse("40Gi"),
-			Image:    infrav1.HydraMachineImage{Name: testImage},
-			Networks: []infrav1.HydraMachineNetworkAttachment{{Name: testNetwork}},
+			Image:    &infrav1.HydraImage{Name: testImage},
+			Networks: []infrav1.HydraNetworkAttachment{{Name: testNetwork}},
 		},
 	}
 }
@@ -369,6 +371,237 @@ var _ = Describe("Cluster API linkage", func() {
 			err = r.Get(ctx, key, out)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
 				"the finalizer should have been released and the object collected")
+		})
+	})
+
+	Context("cluster defaults", func() {
+		// A machine that names nothing, so everything must come from the cluster.
+		bare := func() {
+			hm.Spec.Image = nil
+			hm.Spec.Networks = nil
+		}
+
+		It("inherits image, networks and storage pool from the HydraCluster", func() {
+			// These three used to be a mix of required per-machine fields and
+			// process-wide manager flags. Neither could express "this cluster uses
+			// that pool", which is what HydraCluster exists to fix.
+			bare()
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.LastSpec.Image.Name).To(Equal(linkBaseImage))
+			Expect(provider.LastSpec.Networks).To(HaveLen(1))
+			Expect(provider.LastSpec.Networks[0].Name).To(Equal(testNetwork))
+			Expect(provider.LastSpec.StoragePool).To(Equal(linkPool))
+		})
+
+		It("lets the machine override the cluster's image and networks", func() {
+			hm.Spec.Image = &infrav1.HydraImage{Name: "machine-specific.img"}
+			hm.Spec.Networks = []infrav1.HydraNetworkAttachment{{Name: "br-machine"}}
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.LastSpec.Image.Name).To(Equal("machine-specific.img"))
+			Expect(provider.LastSpec.Networks[0].Name).To(Equal("br-machine"))
+			// The pool has no per-machine override, so it still comes from the
+			// cluster -- deliberately, since the base image is resolved inside it.
+			Expect(provider.LastSpec.StoragePool).To(Equal(linkPool))
+		})
+
+		It("refuses to create a machine that resolves to no networks", func() {
+			// Terminal, not a wait. A machine with no NIC boots, satisfies every
+			// check the backend makes, and can never reach an API server.
+			bare()
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(func(hc *infrav1.HydraCluster) { hc.Spec.Networks = nil }),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(provider.Count()).To(BeZero())
+
+			failed := apimeta.FindStatusCondition(reload(r).Status.Conditions,
+				infrav1.MachineProvisioningFailedCondition)
+			Expect(failed).NotTo(BeNil())
+			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("waits when the referenced HydraCluster is not readable", func() {
+			// Not the same as "no HydraCluster". The Cluster's
+			// infrastructureProvisioned is a latched milestone and stays true after
+			// the HydraCluster disappears, so without this a new machine would
+			// clear the cluster gate and quietly fall back to the manager's pool
+			// and image -- and providerID is recorded immediately, so nothing
+			// would ever revisit it.
+			bare()
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil), // points at a HydraCluster that is not created
+			)
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForHydraCluster"))
+			Expect(ready.Message).To(ContainSubstring(linkClusterName))
+		})
+
+		It("waits while the HydraCluster reports not ready", func() {
+			// The latched milestone is why this check has to exist.
+			// initialization.provisioned only moves forward, and the Cluster's copy
+			// inherits that -- so once verified, the milestone stays true even after
+			// the pool is stopped. Without this, cluster-level verification would
+			// protect only the first machine ever created.
+			degraded := verifiedHydraCluster(nil)
+			degraded.Status.Conditions[0].Status = metav1.ConditionFalse
+			degraded.Status.Conditions[0].Reason = "InfrastructureInvalid"
+			degraded.Status.Conditions[0].Message = "storage pool \"k8s-workers\" exists but is not running"
+
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				degraded,
+			)
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero(), "no machine while the cluster is degraded")
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForClusterInfrastructure"))
+			// The cluster-level reason should reach the machine, so one look at the
+			// machine says what to go and fix.
+			Expect(ready.Message).To(ContainSubstring("not running"))
+		})
+
+		It("waits while the HydraCluster's readiness is stale", func() {
+			// A verdict about an earlier spec says nothing about this one -- someone
+			// may have just pointed the cluster at a different pool.
+			stale := verifiedHydraCluster(nil)
+			stale.Generation = 2 // spec changed; the condition still describes gen 1
+
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				stale,
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.Count()).To(BeZero())
+
+			ready := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(ready.Reason).To(Equal("WaitingForClusterInfrastructure"))
+			Expect(ready.Message).To(ContainSubstring("stale"))
+		})
+
+		It("waits while the HydraCluster has not been reconciled at all", func() {
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				hydraCluster(nil), // no conditions yet
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.Count()).To(BeZero())
+		})
+
+		It("still adopts an existing machine when its HydraCluster is degraded", func() {
+			// Every gate belongs to the create branch only. This one is new, so it
+			// gets the same proof the others did: a machine whose providerID was
+			// never recorded must still be adoptable, or it is an orphaned VM.
+			degraded := verifiedHydraCluster(nil)
+			degraded.Status.Conditions[0].Status = metav1.ConditionFalse
+
+			r := buildWithoutCluster(ownerMachine(nil), owningCluster(nil), degraded)
+
+			state, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			out := reload(r)
+			Expect(out.Spec.ProviderID).NotTo(BeNil())
+			Expect(*out.Spec.ProviderID).To(Equal(providers.ProviderID(provider.Name(), state.ID)))
+			Expect(provider.Count()).To(Equal(1), "adopted, not duplicated")
+		})
+
+		It("still adopts an existing machine when the defaults are unresolvable", func() {
+			// The recovery path must not depend on anything but the backend name.
+			// A machine created before its HydraCluster was deleted, whose
+			// providerID was never recorded, would otherwise be unadoptable
+			// forever -- a permanently orphaned VM.
+			bare()
+			r := buildWithoutCluster(
+				ownerMachine(nil),
+				owningCluster(nil), // HydraCluster absent, so nothing resolves
+			)
+
+			state, err := provider.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			out := reload(r)
+			Expect(out.Spec.ProviderID).NotTo(BeNil())
+			Expect(*out.Spec.ProviderID).To(Equal(providers.ProviderID(provider.Name(), state.ID)))
+			Expect(provider.Count()).To(Equal(1), "adopted, not duplicated")
+		})
+
+		It("falls back to the manager's defaults when no HydraCluster is referenced", func() {
+			// A Cluster pointing at some other provider, or at nothing this
+			// controller recognises, is not an error -- there are simply no
+			// defaults to contribute, and the empty values mean "use the flags".
+			hm.Spec.Image = nil
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				readyCluster(),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provider.LastSpec.Image.Name).To(BeEmpty(), "empty means the backend default")
+			Expect(provider.LastSpec.StoragePool).To(BeEmpty())
+			// The machine still named its own networks, so it provisions.
+			Expect(provider.Count()).To(Equal(1))
 		})
 	})
 

@@ -239,15 +239,36 @@ func main() {
 		}
 	}()
 
+	// The factory itself is the singleton, nil-check included, all under the
+	// lock. Two reconcilers share it and each caches what it returns, so a
+	// factory that always dialled would open one connection per reconciler and
+	// leave the first unreferenced -- closed by nothing, since the assignment
+	// below would have overwritten it. Holding the lock across the whole body
+	// also closes the race where both call in at once.
 	newProvider := func(ctx context.Context) (providers.MachineProvider, error) {
+		providerMu.Lock()
+		defer providerMu.Unlock()
+
+		if machineProvider != nil {
+			return machineProvider, nil
+		}
 		p, err := libvirtprovider.New(ctx, libvirtCfg)
 		if err != nil {
+			// Deliberately not cached. A hypervisor that was down at first
+			// reconcile is retried, not remembered as broken.
 			return nil, err
 		}
-		providerMu.Lock()
 		machineProvider = p
-		providerMu.Unlock()
 		return p, nil
+	}
+
+	if err := (&controller.HydraClusterReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		NewProvider: newProvider,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "hydracluster")
+		os.Exit(1)
 	}
 
 	if err := (&controller.HydraMachineReconciler{
