@@ -35,6 +35,10 @@ const (
 	modelVirtio   = "virtio"
 	diskBusVirtio = modelVirtio
 	diskBusSATA   = "sata"
+
+	// diskTypeFile is the only disk type this provider emits. See domainXML for
+	// why the pool/volume alternative is not an option.
+	diskTypeFile = "file"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -206,7 +210,7 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 		},
 		Devices: devices{
 			Disks: []diskDef{{
-				Type:   "file",
+				Type:   diskTypeFile,
 				Device: "disk",
 				Driver: diskDriverDef{Name: "qemu", Type: formatQcow2},
 				Source: diskSourceDef{File: rootPath},
@@ -232,7 +236,7 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 		// optical device is the configuration base cloud images are built and
 		// tested against.
 		d.Devices.Disks = append(d.Devices.Disks, diskDef{
-			Type:     "file",
+			Type:     diskTypeFile,
 			Device:   "cdrom",
 			Driver:   diskDriverDef{Name: "qemu", Type: formatRaw},
 			Source:   diskSourceDef{File: cidataPath},

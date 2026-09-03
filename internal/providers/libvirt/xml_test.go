@@ -26,9 +26,6 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
-// testPool is the storage pool name the XML fixtures are built against.
-const testPool = "k8s-workers"
-
 func testSpec() providers.MachineSpec {
 	return providers.MachineSpec{
 		Name:        "worker-1",
@@ -218,7 +215,7 @@ func TestDomainXMLDeclaresDisksByPathForAppArmor(t *testing.T) {
 		t.Fatalf("expected two disks, got %d", len(parsed.Devices.Disks))
 	}
 	for _, d := range parsed.Devices.Disks {
-		if d.Type != "file" {
+		if d.Type != diskTypeFile {
 			t.Errorf("disk %q has type %q, want file", d.Target.Dev, d.Type)
 		}
 		if !strings.HasPrefix(d.Source.File, "/") {
