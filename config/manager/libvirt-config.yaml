@@ -44,12 +44,16 @@ data:
   # cacert.pem. Unused when insecure is "true" or remoteAddr is empty.
   pkiPath: "/etc/pki/libvirt"
 
-  # Storage pool that machine disks are created in. REQUIRED -- an empty value is
-  # reported as a terminal condition on every HydraMachine.
+  # Storage pool that machine disks are created in.
+  #
+  # A fallback now, not a requirement: a HydraCluster names the pool its own
+  # machines use, and that wins. Leave this empty when every cluster names its
+  # own. If neither names one, that is reported as a terminal condition against
+  # the object which can be fixed.
   storagePool: ""
 
-  # Volume name of a default base image. OPTIONAL, and currently unused: the API
-  # requires every HydraMachine to name its own image (or give a URL, which is
-  # not yet fetchable), so this fallback is unreachable in practice. Left in
-  # place for a future defaulting story rather than removed outright.
+  # Volume name of a default base image. OPTIONAL, and no longer unreachable:
+  # since HydraMachine's image became optional, a machine that names none falls
+  # back to its HydraCluster's baseImage and then to this value. Resolution is
+  # machine, then cluster, then here.
   baseImage: ""
