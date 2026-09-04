@@ -1,0 +1,82 @@
+# A MachineDeployment that scales Hydra-provisioned worker VMs.
+#
+# Verified end to end on real hardware (PET-37): created a VM automatically,
+# scaled 1 -> 2 with the second VM appearing and joining on its own, and scaled
+# back down with the removed machine's domain undefined and BOTH of its volumes
+# reclaimed -- while the surviving machine's volumes and the shared base image
+# were left untouched.
+#
+# Not in config/samples on purpose. The samples suite applies every file there
+# against envtest, which loads only this provider's CRDs -- Cluster API's are not
+# vendored -- so a MachineDeployment there would fail to admit and the failure
+# would say nothing useful about this provider.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  name: hydra-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      vcpus: 2
+      memory: 4Gi
+      diskSize: 40Gi
+      # image and networks are deliberately omitted so every machine stamped
+      # from this template inherits them from the HydraCluster. State them here
+      # only to override the cluster for this pool.
+      #
+      # This template must NOT carry the standalone annotation. Cluster API owns
+      # every machine it stamps out, and a machine marked standalone would
+      # provision before its bootstrap data existed.
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: hydra-md-0
+  namespace: default
+spec:
+  clusterName: hydra
+  replicas: 1
+  selector:
+    matchLabels:
+      hydra.md: hydra-md-0
+  template:
+    metadata:
+      labels:
+        hydra.md: hydra-md-0
+        cluster.x-k8s.io/cluster-name: hydra
+    spec:
+      clusterName: hydra
+      version: v1.35.3
+      bootstrap:
+        # ---------------------------------------------------------------------
+        # ADOPTED CLUSTERS ONLY. On a cluster Hydra built, use a
+        # KubeadmConfigTemplate here instead:
+        #
+        #   configRef:
+        #     apiGroup: bootstrap.cluster.x-k8s.io
+        #     kind: KubeadmConfigTemplate
+        #     name: hydra-md-0
+        #
+        # That is the normal path and the one to prefer. It cannot work on a
+        # cluster Cluster API did not build: CABPK refuses to generate a worker
+        # join until the Cluster's ControlPlaneInitialized *condition* is true,
+        # and nothing sets that without a control-plane provider. Patching
+        # status.initialization.controlPlaneInitialized does not help -- the
+        # condition is recomputed from control-plane machines.
+        #
+        # So an adopted cluster supplies the data itself. One Secret holding
+        # cloud-init with a real `kubeadm join` serves every replica: the token
+        # is reusable, and each VM still gets its own hostname because the
+        # provider writes it into that machine's cidata meta-data.
+        #
+        # The join token expires. A Secret whose token has aged out produces a
+        # VM that boots perfectly and fails to join as unauthorized, which reads
+        # like a provider bug and is not.
+        # ---------------------------------------------------------------------
+        dataSecretName: hydra-worker-0-bootstrap
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: hydra-md-0
