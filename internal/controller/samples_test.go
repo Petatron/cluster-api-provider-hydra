@@ -30,6 +30,9 @@ import (
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 )
 
+// yamlExt is the extension both suites below filter directory listings on.
+const yamlExt = ".yaml"
+
 // The shipped samples are the first thing anyone runs against this provider, and
 // they previously did not validate at all -- spec was written as a comment, which
 // YAML reads as null against a schema that requires an object. Applying them here
@@ -44,7 +47,7 @@ var _ = Describe("config/samples", func() {
 
 		applied := 0
 		for _, e := range entries {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" || e.Name() == "kustomization.yaml" {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt || e.Name() == "kustomization.yaml" {
 				continue
 			}
 
@@ -79,7 +82,7 @@ var _ = Describe("config/samples", func() {
 
 		checked := 0
 		for _, e := range entries {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" || e.Name() == "kustomization.yaml" {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt || e.Name() == "kustomization.yaml" {
 				continue
 			}
 			raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
@@ -125,7 +128,7 @@ var _ = Describe("config/crd", func() {
 
 		generated := 0
 		for _, e := range bases {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt {
 				continue
 			}
 			generated++
