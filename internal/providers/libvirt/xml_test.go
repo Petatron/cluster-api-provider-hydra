@@ -26,9 +26,6 @@ import (
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
-// testPool is the storage pool name the XML fixtures are built against.
-const testPool = "k8s-workers"
-
 func testSpec() providers.MachineSpec {
 	return providers.MachineSpec{
 		Name:        "worker-1",
@@ -41,7 +38,7 @@ func testSpec() providers.MachineSpec {
 }
 
 func TestDomainXMLIsWellFormedAndComplete(t *testing.T) {
-	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "")
+	out := domainXML(testSpec(), "/var/lib/libvirt/k8s-workers/worker-1.qcow2", "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -60,7 +57,7 @@ func TestDomainXMLIsWellFormedAndComplete(t *testing.T) {
 	if len(parsed.Devices.Interfaces) != 1 || parsed.Devices.Interfaces[0].Source.Bridge != "br0" {
 		t.Errorf("expected a single interface bridged to br0, got %+v", parsed.Devices.Interfaces)
 	}
-	if len(parsed.Devices.Disks) != 1 || parsed.Devices.Disks[0].Source.Volume != "worker-1.qcow2" {
+	if len(parsed.Devices.Disks) != 1 || parsed.Devices.Disks[0].Source.File != "/var/lib/libvirt/k8s-workers/worker-1.qcow2" {
 		t.Errorf("expected the disk to reference the created volume, got %+v", parsed.Devices.Disks)
 	}
 
@@ -79,7 +76,7 @@ func TestDomainXMLEscapesNames(t *testing.T) {
 	spec := testSpec()
 	spec.Name = `evil"><name>pwned</name><x a="`
 
-	out := domainXML(spec, "pool", "vol", "")
+	out := domainXML(spec, "/var/lib/libvirt/k8s-workers/evil.qcow2", "")
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatalf("generated XML does not parse: %v", err)
@@ -172,25 +169,64 @@ func TestIsRoutable(t *testing.T) {
 // absent, undefine the domain, and strand the real disk with nothing pointing
 // at it.
 func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
-	out := domainXML(testSpec(), "pool-the-machine-was-built-in", "worker-1.qcow2", "")
+	const built = "/mnt/pool-the-machine-was-built-in/worker-1.qcow2"
+	out := domainXML(testSpec(), built, "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatalf("generated domain XML does not parse: %v", err)
 	}
 
-	var pool, volume string
+	var path string
 	for _, d := range parsed.Devices.Disks {
-		if d.Source.Volume != "" {
-			pool, volume = d.Source.Pool, d.Source.Volume
+		if d.Source.File != "" {
+			path = d.Source.File
 			break
 		}
 	}
-	if pool != "pool-the-machine-was-built-in" {
-		t.Errorf("disk pool = %q, want the pool the domain was defined with", pool)
+	if path != built {
+		t.Errorf("disk path = %q, want the path the domain was defined with", path)
 	}
-	if volume != "worker-1.qcow2" {
-		t.Errorf("disk volume = %q, want worker-1.qcow2", volume)
+}
+
+// Every disk must be declared as a file with an absolute path, never as a pool
+// and volume name.
+//
+// This is not a style preference. libvirt builds each domain's AppArmor profile
+// by passing the domain XML to virt-aa-helper, which emits one rule per disk
+// path it can see -- and it does not resolve the pool/volume form. A domain
+// declared that way starts with a profile granting it no access to its own
+// disks, and qemu dies with "Could not open ... Permission denied" on the
+// backing image. Permissions on the file itself are irrelevant: a world-readable
+// image is refused just the same, which is what makes the failure so hard to
+// read.
+//
+// The failure is total -- no VM starts at all on any host with AppArmor
+// enabled, which is the default on Ubuntu -- and invisible to every other test
+// in this file, because the XML is perfectly valid either way. Hence this one.
+func TestDomainXMLDeclaresDisksByPathForAppArmor(t *testing.T) {
+	out := domainXML(testSpec(), "/var/lib/libvirt/k8s-workers/worker-1.qcow2", "/var/lib/libvirt/k8s-workers/worker-1-cidata.iso")
+
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated domain XML does not parse: %v", err)
+	}
+	if len(parsed.Devices.Disks) != 2 {
+		t.Fatalf("expected two disks, got %d", len(parsed.Devices.Disks))
+	}
+	for _, d := range parsed.Devices.Disks {
+		if d.Type != diskTypeFile {
+			t.Errorf("disk %q has type %q, want file", d.Target.Dev, d.Type)
+		}
+		if !strings.HasPrefix(d.Source.File, "/") {
+			t.Errorf("disk %q source = %q, want an absolute path", d.Target.Dev, d.Source.File)
+		}
+	}
+	// The attributes virt-aa-helper cannot follow must not appear at all.
+	for _, attr := range []string{"<source pool=", "volume="} {
+		if strings.Contains(out, attr) {
+			t.Errorf("domain XML contains %q; disks must be declared by path", attr)
+		}
 	}
 }
 
@@ -198,7 +234,7 @@ func TestDomainXMLCarriesItsDiskSource(t *testing.T) {
 // depends on that disk being visible in the domain XML, because that is where
 // teardown looks for what to reclaim.
 func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
-	out := domainXML(testSpec(), testPool, "worker-1.qcow2", "worker-1-cidata.iso")
+	out := domainXML(testSpec(), "/var/lib/libvirt/k8s-workers/worker-1.qcow2", "/var/lib/libvirt/k8s-workers/worker-1-cidata.iso")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
@@ -218,11 +254,8 @@ func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
 	if cdrom == nil {
 		t.Fatalf("no CD-ROM device in %+v", parsed.Devices.Disks)
 	}
-	if cdrom.Source.Volume != "worker-1-cidata.iso" {
-		t.Errorf("cdrom volume = %q, want worker-1-cidata.iso", cdrom.Source.Volume)
-	}
-	if cdrom.Source.Pool != testPool {
-		t.Errorf("cdrom pool = %q, want k8s-workers", cdrom.Source.Pool)
+	if cdrom.Source.File != "/var/lib/libvirt/k8s-workers/worker-1-cidata.iso" {
+		t.Errorf("cdrom path = %q, want the cloud-init image", cdrom.Source.File)
 	}
 	// An ISO read as qcow2 is not a filesystem cloud-init can mount.
 	if cdrom.Driver.Type != formatRaw {
@@ -238,7 +271,7 @@ func TestDomainXMLAttachesCloudInitImage(t *testing.T) {
 // The no-bootstrap-data case has to stay clean: an empty cidata volume name must
 // attach no device at all rather than one pointing at "".
 func TestDomainXMLOmitsCloudInitWhenAbsent(t *testing.T) {
-	out := domainXML(testSpec(), "pool", "vol", "")
+	out := domainXML(testSpec(), "/var/lib/libvirt/k8s-workers/worker-1.qcow2", "")
 
 	var parsed domainDef
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {

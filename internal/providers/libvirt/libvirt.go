@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -367,7 +368,10 @@ func partitionOwnedDisks(machineName string, disks []diskSource) (ours, foreign 
 		cidataVolumeName(machineName): {},
 	}
 	for _, d := range disks {
-		if _, ok := owned[d.volume]; ok {
+		// The file name, not the whole path. Create names volumes deterministically
+		// from the machine name; where the pool put them is the pool's business and
+		// is not something ownership should depend on.
+		if _, ok := owned[filepath.Base(d.path)]; ok {
 			ours = append(ours, d)
 			continue
 		}
@@ -440,19 +444,39 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		return nil, err
 	}
 
-	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainDefineXML(domainXML(spec, pool.Name, volName, cidataVol))
-	})
-	if err != nil {
-		// Roll back both volumes so a failed define does not leave disks that
-		// FindByName cannot see. A crash in this window is recovered by
-		// DeleteByName, which removes them even when no domain exists.
-		// These were just created in the configured pool, so that is the right
-		// place to look -- unlike deletion, which must consult the domain.
+	// Roll back both volumes so a failure here does not leave disks that
+	// FindByName cannot see. A crash in this window is recovered by
+	// DeleteByName, which removes them even when no domain exists.
+	// These were just created in the configured pool, so that is the right
+	// place to look -- unlike deletion, which must consult the domain.
+	rollback := func() {
 		_ = p.deleteVolume(ctx, pool.Name, volName)
 		if cidataVol != "" {
 			_ = p.deleteVolume(ctx, pool.Name, cidataVol)
 		}
+	}
+
+	// The domain references its disks by path, not by pool and volume, so the
+	// volumes just created have to be resolved to paths first. domainXML explains
+	// why that indirection is load-bearing rather than incidental.
+	rootPath, err := p.volumePath(ctx, pool, volName)
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	var cidataPath string
+	if cidataVol != "" {
+		if cidataPath, err = p.volumePath(ctx, pool, cidataVol); err != nil {
+			rollback()
+			return nil, err
+		}
+	}
+
+	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
+		return p.lv.DomainDefineXML(domainXML(spec, rootPath, cidataPath))
+	})
+	if err != nil {
+		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
@@ -633,6 +657,25 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 	path, err := call(ctx, p, func() (string, error) { return p.lv.StorageVolGetPath(vol) })
 	if err != nil {
 		return "", fmt.Errorf("libvirt: resolving path for image %q: %w", name, err)
+	}
+	return path, nil
+}
+
+// volumePath returns a volume's absolute path on the host.
+//
+// Unlike resolveBackingPath, a missing volume here is not a configuration error
+// worth reporting terminally: the caller created this volume moments ago, so its
+// absence is a genuine backend fault and retrying is the right response.
+func (p *Provider) volumePath(ctx context.Context, pool golibvirt.StoragePool, volName string) (string, error) {
+	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolLookupByName(pool, volName)
+	})
+	if err != nil {
+		return "", fmt.Errorf("libvirt: looking up volume %q in pool %q: %w", volName, pool.Name, err)
+	}
+	path, err := call(ctx, p, func() (string, error) { return p.lv.StorageVolGetPath(vol) })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: resolving path for volume %q: %w", volName, err)
 	}
 	return path, nil
 }
@@ -849,7 +892,8 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	// deleted -- a redeploy with a different --libvirt-storage-pool is enough --
 	// and looking in the new pool would report the volume absent, undefine the
 	// domain, and strand the real disk in the old pool with nothing left pointing
-	// at it.
+	// at it. The domain records absolute paths, so deleteVolumeByPath resolves
+	// each one back to whichever pool really holds it.
 	disks, err := p.diskSourcesOf(ctx, dom)
 	if err != nil {
 		return err
@@ -870,10 +914,10 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 		// Worth saying out loud. An operator who attached this expects it to
 		// survive, and an operator who did not needs to know it was left behind.
 		logf.FromContext(ctx).Info("Leaving a volume this provider did not create",
-			"domain", dom.Name, "pool", d.pool, "volume", d.volume)
+			"domain", dom.Name, "path", d.path)
 	}
 	for _, d := range ours {
-		if err := p.deleteVolume(ctx, d.pool, d.volume); err != nil {
+		if err := p.deleteVolumeByPath(ctx, d.path); err != nil {
 			return err
 		}
 	}
@@ -891,16 +935,21 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 //
 // The previous version swallowed pool and volume lookup errors entirely, so a
 // transient failure here looked like success and left the disk behind.
-// diskSource is one pool-backed disk attached to a domain.
+// diskSource is one file-backed disk attached to a domain, named by its
+// absolute path on the host.
+//
+// A path rather than a pool and volume name because that is what the domain XML
+// carries -- see domainXML -- and because it makes reclamation exact: libvirt
+// can find the volume that owns a path without anything having to guess which
+// pool it lives in.
 type diskSource struct {
-	pool   string
-	volume string
+	path string
 }
 
-// diskSourcesOf reads every pool-backed disk out of a domain's own XML.
+// diskSourcesOf reads every file-backed disk out of a domain's own XML.
 //
-// Returns an empty slice when the domain has no pool-backed disk, which is not
-// an error: there is simply nothing for this provider to reclaim.
+// Returns an empty slice when the domain has no such disk, which is not an
+// error: there is simply nothing for this provider to reclaim.
 func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]diskSource, error) {
 	desc, err := call(ctx, p, func() (string, error) {
 		return p.lv.DomainGetXMLDesc(dom, 0)
@@ -919,15 +968,40 @@ func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]d
 
 	var out []diskSource
 	for _, d := range parsed.Devices.Disks {
-		if d.Source.Volume == "" {
+		if d.Source.File == "" {
+			// A disk with no file source is nothing this provider created: a
+			// network-backed disk, or a CD-ROM with no medium inserted.
 			continue
 		}
-		// An empty pool attribute leaves deleteVolume to fall back to the
-		// configured pool, which is the best available guess when the domain XML
-		// does not say.
-		out = append(out, diskSource{pool: d.Source.Pool, volume: d.Source.Volume})
+		out = append(out, diskSource{path: d.Source.File})
 	}
 	return out, nil
+}
+
+// deleteVolumeByPath removes the volume a domain's disk points at.
+//
+// Preferred over deleteVolume during teardown because it needs no pool name.
+// libvirt resolves the path to whichever pool actually contains it, so a machine
+// created before --libvirt-storage-pool changed is still reclaimed from the pool
+// it was really built in.
+func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
+	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
+		return p.lv.StorageVolLookupByPath(path)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			// Either already reclaimed, or in no pool libvirt knows about. Neither
+			// is something teardown can act on, and both are safe to leave: the
+			// file is not referenced by any domain once this one is undefined.
+			return nil
+		}
+		return fmt.Errorf("libvirt: looking up volume at %q: %w", path, err)
+	}
+	if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+		!isNotFound(err) {
+		return fmt.Errorf("libvirt: deleting volume at %q: %w", path, err)
+	}
+	return nil
 }
 
 func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) error {

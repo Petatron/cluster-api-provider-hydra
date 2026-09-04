@@ -5,6 +5,17 @@ metadata:
     app.kubernetes.io/name: cluster-api-provider-hydra
     app.kubernetes.io/managed-by: kustomize
   name: hydramachine-sample
+  annotations:
+    # This sample is applied on its own, with no Cluster API Machine to own it,
+    # so it has to say so. The controller will not infer that from the missing
+    # owner reference: every machine Cluster API manages looks exactly like this
+    # for the moment before the reference is stamped on, and provisioning during
+    # that window builds a VM with no bootstrap data and the wrong defaults.
+    #
+    # A HydraMachine that a Machine will own -- anything a MachineDeployment
+    # stamps out of a HydraMachineTemplate -- must NOT carry this. It would
+    # provision before its bootstrap data existed.
+    hydramachine.infrastructure.cluster.x-k8s.io/standalone: ""
 spec:
   vcpus: 2
   memory: 4Gi

@@ -68,6 +68,13 @@ status:
   conditions: []       # a "Ready" condition mirrors to Machine.InfrastructureReady
 ```
 
+Applied on its own — with no Cluster API `Machine` to own it — a `HydraMachine`
+also needs `hydramachine.infrastructure.cluster.x-k8s.io/standalone: ""`. The
+controller will not infer that from a missing owner reference: a machine Cluster
+API is about to adopt looks identical until the reference is stamped on, and
+provisioning in that window builds a VM with no bootstrap data and the wrong
+defaults. `config/samples/` carries a complete, applyable example.
+
 Every spec field is **backend-neutral**. A machine is described by what it must
 provide — capacity, an image, network attachments — never by how a particular
 backend provides it. There is no libvirt vocabulary in the API and no untyped

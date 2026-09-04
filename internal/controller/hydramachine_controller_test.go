@@ -78,7 +78,15 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			Scheme:    k8sClient.Scheme(),
 			Provider:  provider,
 		}
-		machine = newMachine(nil)
+		machine = newMachine(func(m *infrav1.HydraMachine) {
+			// These specs exercise the infrastructure half on its own, with no
+			// Cluster API objects around it, so they are the standalone case -- and
+			// standalone now has to be declared. The controller deliberately will
+			// not infer it from a missing owner reference, because every machine
+			// Cluster API manages looks exactly like this for a moment before the
+			// reference is stamped on. See infrav1.StandaloneAnnotation.
+			m.Annotations = map[string]string{infrav1.StandaloneAnnotation: ""}
+		})
 		key = client.ObjectKeyFromObject(machine)
 		Expect(k8sClient.Create(ctx, machine)).To(Succeed())
 	})

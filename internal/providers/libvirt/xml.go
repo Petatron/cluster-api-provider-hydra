@@ -35,6 +35,10 @@ const (
 	modelVirtio   = "virtio"
 	diskBusVirtio = modelVirtio
 	diskBusSATA   = "sata"
+
+	// diskTypeFile is the only disk type this provider emits. See domainXML for
+	// why the pool/volume alternative is not an option.
+	diskTypeFile = "file"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -97,10 +101,11 @@ type diskDriverDef struct {
 	Type string `xml:"type,attr"`
 }
 
+// diskSourceDef carries only a file path. The pool/volume attributes libvirt
+// also accepts are deliberately absent: see domainXML for why emitting them
+// leaves the domain with no AppArmor rules for its own disks.
 type diskSourceDef struct {
-	Pool   string `xml:"pool,attr,omitempty"`
-	Volume string `xml:"volume,attr,omitempty"`
-	File   string `xml:"file,attr,omitempty"`
+	File string `xml:"file,attr,omitempty"`
 }
 
 type diskTargetDef struct {
@@ -171,10 +176,29 @@ type volBackingDef struct {
 
 // domainXML renders the libvirt domain definition for a machine.
 //
-// cidataVolume names the cloud-init NoCloud image, attached as a CD-ROM. An
-// empty value attaches nothing, which is the no-bootstrap-data case: the machine
-// boots the base image and configures nothing.
-func domainXML(spec providers.MachineSpec, pool, volume, cidataVolume string) string {
+// Disks are referenced by absolute host path -- <disk type='file'> with a
+// <source file=> -- and NOT by <source pool= volume=>, even though the volumes
+// were just created through the pool API and the pool form would be the more
+// natural expression of that.
+//
+// The reason is AppArmor, which is enabled by default on Ubuntu and most other
+// distributions that ship libvirt. libvirt generates a per-domain AppArmor
+// profile by handing the domain XML to virt-aa-helper, which walks the disks and
+// emits a rule for each path it finds -- including, for a copy-on-write clone,
+// the backing file underneath it. virt-aa-helper does not resolve the
+// pool/volume form: it sees a disk with no path and emits nothing at all. The
+// domain then starts with a profile that grants it no disk access, and qemu
+// fails with "Could not open ... Permission denied" on the first image it
+// touches. The file mode is irrelevant -- a world-readable backing image is
+// denied just the same, which is what makes the failure so misleading.
+//
+// So the paths are resolved by the caller and spelled out here. Both forms are
+// equivalent to libvirt itself; only the security driver can tell them apart.
+//
+// cidataPath is the cloud-init NoCloud image, attached as a CD-ROM. An empty
+// value attaches nothing, which is the no-bootstrap-data case: the machine boots
+// the base image and configures nothing.
+func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 	d := domainDef{
 		Type:   "kvm",
 		Name:   spec.Name,
@@ -186,10 +210,10 @@ func domainXML(spec providers.MachineSpec, pool, volume, cidataVolume string) st
 		},
 		Devices: devices{
 			Disks: []diskDef{{
-				Type:   "volume",
+				Type:   diskTypeFile,
 				Device: "disk",
 				Driver: diskDriverDef{Name: "qemu", Type: formatQcow2},
-				Source: diskSourceDef{Pool: pool, Volume: volume},
+				Source: diskSourceDef{File: rootPath},
 				Target: diskTargetDef{Dev: "vda", Bus: diskBusVirtio},
 			}},
 			Console: consoleDef{
@@ -204,7 +228,7 @@ func domainXML(spec providers.MachineSpec, pool, volume, cidataVolume string) st
 			}},
 		},
 	}
-	if cidataVolume != "" {
+	if cidataPath != "" {
 		// SATA rather than virtio, and sda rather than vda. cloud-init's NoCloud
 		// datasource finds this by filesystem label, so the bus does not strictly
 		// matter -- but a virtio CD-ROM is not something every guest image's
@@ -212,10 +236,10 @@ func domainXML(spec providers.MachineSpec, pool, volume, cidataVolume string) st
 		// optical device is the configuration base cloud images are built and
 		// tested against.
 		d.Devices.Disks = append(d.Devices.Disks, diskDef{
-			Type:     "volume",
+			Type:     diskTypeFile,
 			Device:   "cdrom",
 			Driver:   diskDriverDef{Name: "qemu", Type: formatRaw},
-			Source:   diskSourceDef{Pool: pool, Volume: cidataVolume},
+			Source:   diskSourceDef{File: cidataPath},
 			Target:   diskTargetDef{Dev: "sda", Bus: diskBusSATA},
 			ReadOnly: &readOnlyDef{},
 		})

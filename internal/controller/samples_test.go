@@ -26,7 +26,12 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
+
+	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 )
+
+// yamlExt is the extension both suites below filter directory listings on.
+const yamlExt = ".yaml"
 
 // The shipped samples are the first thing anyone runs against this provider, and
 // they previously did not validate at all -- spec was written as a comment, which
@@ -42,7 +47,7 @@ var _ = Describe("config/samples", func() {
 
 		applied := 0
 		for _, e := range entries {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" || e.Name() == "kustomization.yaml" {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt || e.Name() == "kustomization.yaml" {
 				continue
 			}
 
@@ -60,6 +65,47 @@ var _ = Describe("config/samples", func() {
 		}
 
 		Expect(applied).To(BeNumerically(">", 0), "no samples were found to validate")
+	})
+
+	// A sample is applied on its own, so it has no Cluster API Machine to own it
+	// and never will. Without the standalone annotation the controller waits for
+	// an owner that is not coming, and the sample sits on WaitingForOwnerMachine
+	// forever -- doing nothing, reporting no error, and looking like the provider
+	// is broken to the person running it first.
+	//
+	// Nothing else catches that: the sample still validates, still applies, and
+	// still parses. Only its behaviour changes.
+	It("every HydraMachine sample declares itself standalone", func() {
+		dir := filepath.Join("..", "..", "config", "samples")
+		entries, err := os.ReadDir(dir)
+		Expect(err).NotTo(HaveOccurred())
+
+		checked := 0
+		for _, e := range entries {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt || e.Name() == "kustomization.yaml" {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			Expect(err).NotTo(HaveOccurred())
+
+			obj := &unstructured.Unstructured{}
+			Expect(yaml.Unmarshal(raw, obj)).To(Succeed(), e.Name())
+			// Only the machines. A HydraMachineTemplate is stamped out by Cluster
+			// API into machines it does own, and annotating it would push the
+			// marker onto every one of them -- provisioning each before its
+			// bootstrap data exists, which is the opposite failure.
+			if obj.GetKind() != hydraMachineKind {
+				continue
+			}
+
+			_, ok := obj.GetAnnotations()[infrav1.StandaloneAnnotation]
+			Expect(ok).To(BeTrue(),
+				"%s is applied with no owning Machine, so it must carry %s or it will wait forever",
+				e.Name(), infrav1.StandaloneAnnotation)
+			checked++
+		}
+
+		Expect(checked).To(BeNumerically(">", 0), "no HydraMachine samples were found to check")
 	})
 })
 
@@ -82,7 +128,7 @@ var _ = Describe("config/crd", func() {
 
 		generated := 0
 		for _, e := range bases {
-			if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			if e.IsDir() || filepath.Ext(e.Name()) != yamlExt {
 				continue
 			}
 			generated++

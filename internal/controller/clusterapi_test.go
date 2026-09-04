@@ -326,16 +326,43 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.Count()).To(Equal(1))
 		})
 
-		It("provisions with no bootstrap data when nothing owns it", func() {
-			// A HydraMachine created directly is the documented way to exercise the
-			// infrastructure half on its own: it boots and never joins a cluster.
+		It("provisions with no bootstrap data when it declares itself standalone", func() {
+			// Declaring standalone is the documented way to exercise the
+			// infrastructure half on its own: the machine boots and never joins a
+			// cluster.
 			hm.OwnerReferences = nil
+			hm.Annotations = map[string]string{infrav1.StandaloneAnnotation: ""}
 			r := build()
 
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(provider.Count()).To(Equal(1))
 			Expect(provider.LastSpec.BootstrapData).To(BeEmpty())
+		})
+
+		It("waits, rather than provisioning, when it has no owner reference and no declaration", func() {
+			// The one that was wrong on real hardware, and the most expensive kind
+			// of wrong: silent.
+			//
+			// Cluster API attaches the owner reference in its own reconcile, so
+			// every machine it manages passes through exactly this state. Reading it
+			// as standalone let the cluster gate pass with no cluster, the bootstrap
+			// fetch return nothing, and Create run with no user-data and the
+			// manager's default pool and image rather than the cluster's. providerID
+			// is recorded immediately afterwards, so nothing ever revisited it: a VM
+			// that boots, configures nothing, joins nothing, and reports itself
+			// provisioned.
+			hm.OwnerReferences = nil
+			r := build()
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueWhileProvisioning))
+			Expect(provider.Count()).To(BeZero(), "nothing may be created before the owner is known")
+
+			cond := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.MachineReadyCondition)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("WaitingForOwnerMachine"))
 		})
 
 		It("waits, rather than provisioning, when the owning Machine is not visible", func() {

@@ -16,7 +16,10 @@ limitations under the License.
 
 package libvirt
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // Deletion has to reclaim both volumes Hydra created and destroy nothing else.
 // Getting this wrong in either direction loses data: too narrow orphans a
@@ -25,31 +28,40 @@ import "testing"
 func TestPartitionOwnedDisks(t *testing.T) {
 	const machine = "default-worker-1-0123456789abcdef0123"
 
+	const dir = "/var/lib/libvirt/k8s-workers/"
+
 	disks := []diskSource{
-		{pool: testPool, volume: rootVolumeName(machine)},
-		{pool: testPool, volume: cidataVolumeName(machine)},
-		{pool: "operator-data", volume: "postgres-data.qcow2"},
+		{path: dir + rootVolumeName(machine)},
+		{path: dir + cidataVolumeName(machine)},
+		{path: "/srv/operator-data/postgres-data.qcow2"},
 		// Deliberately similar, and still not ours: another machine's disk must
 		// not be reclaimed just because the names look alike.
-		{pool: testPool, volume: rootVolumeName("default-worker-2-fedcba9876543210fedc")},
+		{path: dir + rootVolumeName("default-worker-2-fedcba9876543210fedc")},
+		// Ours, in a different directory. Ownership follows the name Create
+		// chose, not where the pool happened to put it -- a machine built before
+		// the pool was redefined still has to be reclaimable.
+		{path: "/mnt/bigger-disk/" + rootVolumeName(machine)},
 	}
 
 	ours, foreign := partitionOwnedDisks(machine, disks)
 
-	if len(ours) != 2 {
-		t.Fatalf("reclaimable = %+v, want the root disk and the cloud-init image", ours)
+	if len(ours) != 3 {
+		t.Fatalf("reclaimable = %+v, want both volumes plus the relocated root disk", ours)
 	}
-	got := map[string]bool{ours[0].volume: true, ours[1].volume: true}
+	got := map[string]bool{}
+	for _, d := range ours {
+		got[filepath.Base(d.path)] = true
+	}
 	if !got[rootVolumeName(machine)] || !got[cidataVolumeName(machine)] {
-		t.Errorf("reclaimable = %+v, want exactly the two volumes Create makes", ours)
+		t.Errorf("reclaimable = %+v, want exactly the volumes Create makes", ours)
 	}
 
 	if len(foreign) != 2 {
 		t.Fatalf("left alone = %+v, want the operator volume and the other machine's disk", foreign)
 	}
 	for _, d := range foreign {
-		if d.volume == rootVolumeName(machine) || d.volume == cidataVolumeName(machine) {
-			t.Errorf("volume %q was classified as foreign but is ours", d.volume)
+		if base := filepath.Base(d.path); base == rootVolumeName(machine) || base == cidataVolumeName(machine) {
+			t.Errorf("volume %q was classified as foreign but is ours", d.path)
 		}
 	}
 }
@@ -59,10 +71,9 @@ func TestPartitionOwnedDisks(t *testing.T) {
 func TestPartitionOwnedDisksWithoutCloudInit(t *testing.T) {
 	const machine = "default-worker-1-0123456789abcdef0123"
 
-	ours, foreign := partitionOwnedDisks(machine, []diskSource{
-		{pool: testPool, volume: rootVolumeName(machine)},
-	})
-	if len(ours) != 1 || ours[0].volume != rootVolumeName(machine) {
+	root := "/var/lib/libvirt/k8s-workers/" + rootVolumeName(machine)
+	ours, foreign := partitionOwnedDisks(machine, []diskSource{{path: root}})
+	if len(ours) != 1 || ours[0].path != root {
 		t.Errorf("reclaimable = %+v, want the root disk", ours)
 	}
 	if len(foreign) != 0 {
