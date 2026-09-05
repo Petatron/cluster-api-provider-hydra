@@ -8,10 +8,16 @@
 # rolling replacement.
 #
 # LAB-SPECIFIC VALUES -- change all of these for another site:
-#   controlPlaneEndpoint.host   an address OUTSIDE the DHCP pool (see below)
 #   networks / storagePool      the bridge and libvirt pool on your hypervisor
 #   baseImage.name              a cloud image present in that pool
-#   vip_interface               the NIC name inside the guest (enp1s0 for virtio)
+#
+# TWO VALUES ARE STATED TWICE, and nothing checks that the copies agree:
+#   the endpoint address   controlPlaneEndpoint.host  ==  kube-vip `address`
+#                          controlPlaneEndpoint.port  ==  kube-vip `port`
+#   the guest NIC name     kube-vip `vip_interface`   ==  the interface the
+#                          --node-ip command reads (enp1s0 for virtio)
+# Change one copy and not the other and the cluster fails in a way that points
+# nowhere near the edit. Both sites are marked inline.
 #
 # CHOOSING THE ENDPOINT ADDRESS. It must be outside the DHCP range, and that has
 # to be confirmed against the DHCP server rather than inferred. Guessing from
@@ -35,8 +41,14 @@ metadata:
 spec:
   controlPlaneEndpoint:
     # Held by kube-vip on whichever control-plane node is leader, so it stays
-    # valid as replicas go 1 -> 3. Chosen at 192.168.15.10 because every DHCP
-    # lease this router has issued lands in .200-.243, ~190 addresses above it.
+    # valid as replicas go 1 -> 3.
+    #
+    # MUST equal kube-vip's `address` env below, and this port MUST equal its
+    # `port`. Nothing validates that they agree: change one and the endpoint
+    # simply stops working, with no error pointing at the cause.
+    #
+    # The address must be outside the DHCP range -- confirmed against the DHCP
+    # server's configuration, not guessed. See the header.
     host: 192.168.15.10
     port: 6443
   storagePool: k8s-workers
@@ -153,6 +165,9 @@ spec:
                     value: "10"
                   - name: vip_retryperiod
                     value: "2"
+                  # MUST equal HydraCluster.spec.controlPlaneEndpoint.host
+                  # above. This is the pair that actually claims the address;
+                  # the HydraCluster field only states where the API will be.
                   - name: address
                     value: "192.168.15.10"
                 securityContext:
@@ -188,6 +203,7 @@ spec:
         # identity was an address that moves to a different machine on failover.
         # Captured here, before kubeadm starts the kubelet and kube-vip with it,
         # while enp1s0 still has only its own DHCP address.
+        # enp1s0 here MUST be the same interface as kube-vip's vip_interface.
         NODE_IP=$(ip -4 -o addr show enp1s0 | awk '{print $4}' | cut -d/ -f1 | head -1)
         printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
           "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
