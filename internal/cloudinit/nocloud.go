@@ -155,12 +155,18 @@ func ISO(meta Metadata, userData []byte) ([]byte, error) {
 // come from a range known to be free -- would leave the second interface with
 // no address at all, and nothing in the guest says why.
 //
-// One stanza covers any number of interfaces, because none of this varies per
-// NIC: match every ethernet by name and ask for DHCP. That makes the document
-// independent of how many networks a machine has, which matters because the
-// alternative is naming interfaces the provider does not choose -- libvirt
-// assigns the MACs, and enp1s0/enp2s0 are a guest-side naming convention rather
-// than anything the provider can promise.
+// The stanzas match by name pattern rather than naming interfaces, because the
+// provider does not choose those names: libvirt assigns the MACs, and
+// enp1s0/enp2s0 are a guest-side convention rather than anything the provider
+// can promise. Matching also makes the document independent of how many
+// networks a machine has.
+//
+// Both naming schemes are covered, and that is not belt-and-braces. Predictable
+// interface names (en*) are the default, but an image booted with
+// net.ifnames=0 gets eth0/eth1 instead -- and since this file REPLACES the
+// fallback rather than supplementing it, matching only en* would leave such an
+// image with no configured interface at all. Hydra does not constrain which base
+// image an operator uses, so it cannot assume the naming scheme.
 //
 // `optional: true` is what keeps this safe. Without it, systemd-networkd holds
 // boot waiting for every matched interface to come up, so attaching a network
@@ -172,9 +178,14 @@ func ISO(meta Metadata, userData []byte) ([]byte, error) {
 // needs it yet.
 var networkConfig = []byte(`version: 2
 ethernets:
-  hydra-all:
+  hydra-en:
     match:
       name: "en*"
+    dhcp4: true
+    optional: true
+  hydra-eth:
+    match:
+      name: "eth*"
     dhcp4: true
     optional: true
 `)

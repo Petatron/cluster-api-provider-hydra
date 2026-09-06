@@ -112,8 +112,6 @@ func TestISOCarriesUserDataAndMetadata(t *testing.T) {
 	}
 }
 
-// A hostname is not attacker-controlled in practice, but building the document
-// by concatenation would put it one character away from meaning something else.
 // A machine on two networks gets an address on only one of them unless the
 // datasource says otherwise, because cloud-init's fallback configuration brings
 // up a single interface. That is not a hypothetical: it is what happened when a
@@ -145,13 +143,18 @@ func TestISOCarriesNetworkConfig(t *testing.T) {
 	if doc.Version != 2 {
 		t.Errorf("version = %d, want 2", doc.Version)
 	}
-	if len(doc.Ethernets) != 1 {
-		t.Fatalf("ethernets = %+v, want exactly one stanza covering every interface", doc.Ethernets)
-	}
+	// Both naming schemes, because this file replaces cloud-init's fallback
+	// rather than supplementing it. An image booted with net.ifnames=0 has
+	// eth0/eth1, and matching only en* would leave it with no configured
+	// interface at all -- a worse failure than the one this document fixes.
+	want := map[string]bool{"en*": false, "eth*": false}
 	for name, e := range doc.Ethernets {
-		if e.Match["name"] != "en*" {
-			t.Errorf("%s matches %q; it must match every ethernet, since the provider does not choose interface names", name, e.Match["name"])
+		pattern := e.Match["name"]
+		if _, ok := want[pattern]; !ok {
+			t.Errorf("%s matches %q, which is neither naming scheme", name, pattern)
+			continue
 		}
+		want[pattern] = true
 		if !e.DHCP4 {
 			t.Errorf("%s has dhcp4 off, so a second interface would come up with no address", name)
 		}
@@ -162,8 +165,15 @@ func TestISOCarriesNetworkConfig(t *testing.T) {
 			t.Errorf("%s is not optional; a network with no DHCP server would block boot", name)
 		}
 	}
+	for pattern, seen := range want {
+		if !seen {
+			t.Errorf("no stanza matches %q; an image using that naming scheme would come up with no interface", pattern)
+		}
+	}
 }
 
+// A hostname is not attacker-controlled in practice, but building the document
+// by concatenation would put it one character away from meaning something else.
 func TestISOEscapesMetadataValues(t *testing.T) {
 	hostname := "evil\ninstance-id: hijacked"
 
