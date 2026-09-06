@@ -135,6 +135,9 @@ func ISO(meta Metadata, userData []byte) ([]byte, error) {
 	if err := w.AddFile(bytes.NewReader(metaData), "meta-data"); err != nil {
 		return nil, fmt.Errorf("cloudinit: adding meta-data: %w", err)
 	}
+	if err := w.AddFile(bytes.NewReader(networkConfig), "network-config"); err != nil {
+		return nil, fmt.Errorf("cloudinit: adding network-config: %w", err)
+	}
 
 	var buf bytes.Buffer
 	if err := w.WriteTo(&buf, VolumeLabel); err != nil {
@@ -142,6 +145,39 @@ func ISO(meta Metadata, userData []byte) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// networkConfig is the NoCloud network-config document, written to every
+// datasource image.
+//
+// It exists because cloud-init's fallback configuration brings up exactly one
+// interface. A machine attached to two networks -- the site LAN for internet
+// access, and a network Hydra itself controls so a control-plane endpoint can
+// come from a range known to be free -- would leave the second interface with
+// no address at all, and nothing in the guest says why.
+//
+// One stanza covers any number of interfaces, because none of this varies per
+// NIC: match every ethernet by name and ask for DHCP. That makes the document
+// independent of how many networks a machine has, which matters because the
+// alternative is naming interfaces the provider does not choose -- libvirt
+// assigns the MACs, and enp1s0/enp2s0 are a guest-side naming convention rather
+// than anything the provider can promise.
+//
+// `optional: true` is what keeps this safe. Without it, systemd-networkd holds
+// boot waiting for every matched interface to come up, so attaching a network
+// with no DHCP server on it would stall the machine rather than simply leaving
+// that interface unconfigured.
+//
+// Static addressing is deliberately not expressible here. The endpoint is a VIP
+// claimed by kube-vip over ARP, not an address assigned to a NIC, so nothing
+// needs it yet.
+var networkConfig = []byte(`version: 2
+ethernets:
+  hydra-all:
+    match:
+      name: "en*"
+    dhcp4: true
+    optional: true
+`)
 
 // metadataYAML renders the NoCloud meta-data document.
 //

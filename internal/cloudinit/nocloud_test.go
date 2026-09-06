@@ -114,6 +114,56 @@ func TestISOCarriesUserDataAndMetadata(t *testing.T) {
 
 // A hostname is not attacker-controlled in practice, but building the document
 // by concatenation would put it one character away from meaning something else.
+// A machine on two networks gets an address on only one of them unless the
+// datasource says otherwise, because cloud-init's fallback configuration brings
+// up a single interface. That is not a hypothetical: it is what happened when a
+// machine was first attached to both the site LAN and a Hydra-controlled
+// network, and the second interface sat there with no address and no error.
+func TestISOCarriesNetworkConfig(t *testing.T) {
+	out, err := ISO(Metadata{InstanceID: "worker-1"}, []byte("#cloud-config\n"))
+	if err != nil {
+		t.Fatalf("ISO() = %v", err)
+	}
+
+	files := readISO(t, out)
+	got, ok := files["network-config"]
+	if !ok {
+		t.Fatalf("no network-config in the image; files = %v", keysOf(files))
+	}
+
+	var doc struct {
+		Version   int `yaml:"version"`
+		Ethernets map[string]struct {
+			Match    map[string]string `yaml:"match"`
+			DHCP4    bool              `yaml:"dhcp4"`
+			Optional bool              `yaml:"optional"`
+		} `yaml:"ethernets"`
+	}
+	if err := yaml.Unmarshal([]byte(got), &doc); err != nil {
+		t.Fatalf("network-config does not parse: %v\n%s", err, got)
+	}
+	if doc.Version != 2 {
+		t.Errorf("version = %d, want 2", doc.Version)
+	}
+	if len(doc.Ethernets) != 1 {
+		t.Fatalf("ethernets = %+v, want exactly one stanza covering every interface", doc.Ethernets)
+	}
+	for name, e := range doc.Ethernets {
+		if e.Match["name"] != "en*" {
+			t.Errorf("%s matches %q; it must match every ethernet, since the provider does not choose interface names", name, e.Match["name"])
+		}
+		if !e.DHCP4 {
+			t.Errorf("%s has dhcp4 off, so a second interface would come up with no address", name)
+		}
+		// Without this, systemd-networkd waits at boot for every matched
+		// interface. Attaching a network with no DHCP server would stall the
+		// machine rather than leaving that interface unconfigured.
+		if !e.Optional {
+			t.Errorf("%s is not optional; a network with no DHCP server would block boot", name)
+		}
+	}
+}
+
 func TestISOEscapesMetadataValues(t *testing.T) {
 	hostname := "evil\ninstance-id: hijacked"
 
