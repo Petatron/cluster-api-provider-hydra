@@ -1,0 +1,243 @@
+# A complete Kubernetes cluster built by Hydra from nothing: a KubeadmControlPlane
+# over HydraMachineTemplate, with kube-vip holding the API endpoint.
+#
+# Verified end to end on real hardware (PET-16), exactly as written here:
+# three control-plane VMs created through libvirt, kubeadm init and join driven
+# by CABPK-generated bootstrap data, all three Nodes Ready with providerIDs
+# matching their Machines, and the VIP surviving a leader failover during a
+# rolling replacement.
+#
+# LAB-SPECIFIC VALUES -- change all of these for another site:
+#   networks / storagePool      the bridge and libvirt pool on your hypervisor
+#   baseImage.name              a cloud image present in that pool
+#
+# TWO VALUES ARE STATED TWICE, and nothing checks that the copies agree:
+#   the endpoint address   controlPlaneEndpoint.host  ==  kube-vip `address`
+#                          controlPlaneEndpoint.port  ==  kube-vip `port`
+#   the guest NIC name     kube-vip `vip_interface`   ==  the interface the
+#                          --node-ip command reads (enp1s0 for virtio)
+# Change one copy and not the other and the cluster fails in a way that points
+# nowhere near the edit. Both sites are marked inline.
+#
+# CHOOSING THE ENDPOINT ADDRESS. It must be outside the DHCP range, and that has
+# to be confirmed against the DHCP server rather than inferred. Guessing from
+# observed leases is not sound: the addresses a server has handed out say
+# nothing about the bounds of its pool, because many servers allocate by hashing
+# the client ID rather than counting up from the start. controlPlaneEndpoint is
+# immutable, so getting this wrong means rebuilding the cluster.
+#
+# The CNI is not here. After the first control-plane node registers it stays
+# NotReady until one is installed; this cluster used:
+#
+#   cilium install --set ipam.operator.clusterPoolIPv4PodCIDRList[0]=10.244.0.0/16
+#
+# matching the pod CIDR below, so kubeadm and the CNI cannot disagree.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraCluster
+metadata:
+  name: hydra-wl0
+  namespace: default
+spec:
+  controlPlaneEndpoint:
+    # Held by kube-vip on whichever control-plane node is leader, so it stays
+    # valid as replicas go 1 -> 3.
+    #
+    # MUST equal kube-vip's `address` env below, and this port MUST equal its
+    # `port`. Nothing validates that they agree: change one and the endpoint
+    # simply stops working, with no error pointing at the cause.
+    #
+    # The address must be outside the DHCP range -- confirmed against the DHCP
+    # server's configuration, not guessed. See the header.
+    host: 192.168.15.10
+    port: 6443
+  storagePool: k8s-workers
+  baseImage:
+    name: ubuntu-24.04-server-cloudimg-amd64.img
+  networks:
+    - name: br0
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: hydra-wl0
+  namespace: default
+spec:
+  clusterNetwork:
+    # Stated once here and propagated by KCP into kubeadm's config, so kubeadm
+    # and the CNI cannot disagree the way the management cluster's do.
+    pods:
+      cidrBlocks: ["10.244.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: HydraCluster
+    name: hydra-wl0
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KubeadmControlPlane
+    name: hydra-wl0-cp
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  name: hydra-wl0-cp
+  namespace: default
+spec:
+  template:
+    spec:
+      # Larger than a worker: this carries etcd as well as the control plane.
+      vcpus: 4
+      memory: 8Gi
+      diskSize: 40Gi
+      # image and networks inherited from HydraCluster/hydra-wl0.
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta2
+kind: KubeadmControlPlane
+metadata:
+  name: hydra-wl0-cp
+  namespace: default
+spec:
+  replicas: 3
+  version: v1.35.3
+  machineTemplate:
+    spec:
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: hydra-wl0-cp
+  kubeadmConfigSpec:
+    files:
+      # kubeadm's preflight refuses to init without these. `sysctl --system` in
+      # preKubeadmCommands is useless on its own -- it applies whatever is on
+      # disk, and nothing puts these there. Dropping them cost one rollout.
+      - path: /etc/modules-load.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          overlay
+          br_netfilter
+      - path: /etc/sysctl.d/k8s.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+      - path: /etc/kubernetes/manifests/kube-vip.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: kube-vip
+            namespace: kube-system
+          spec:
+            containers:
+              - name: kube-vip
+                image: ghcr.io/kube-vip/kube-vip:v0.8.9
+                imagePullPolicy: IfNotPresent
+                args: ["manager"]
+                env:
+                  - name: vip_arp
+                    value: "true"
+                  - name: port
+                    value: "6443"
+                  - name: vip_interface
+                    value: "enp1s0"
+                  - name: vip_cidr
+                    value: "32"
+                  - name: cp_enable
+                    value: "true"
+                  - name: cp_namespace
+                    value: "kube-system"
+                  - name: vip_ddns
+                    value: "false"
+                  - name: svc_enable
+                    value: "false"
+                  - name: vip_leaderelection
+                    value: "true"
+                  - name: vip_leaseduration
+                    value: "15"
+                  - name: vip_renewdeadline
+                    value: "10"
+                  - name: vip_retryperiod
+                    value: "2"
+                  # MUST equal HydraCluster.spec.controlPlaneEndpoint.host
+                  # above. This is the pair that actually claims the address;
+                  # the HydraCluster field only states where the API will be.
+                  - name: address
+                    value: "192.168.15.10"
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN", "NET_RAW", "SYS_TIME"]
+                volumeMounts:
+                  - mountPath: /etc/kubernetes/admin.conf
+                    name: kubeconfig
+            hostAliases:
+              - hostnames: ["kubernetes"]
+                ip: 127.0.0.1
+            hostNetwork: true
+            volumes:
+              - name: kubeconfig
+                hostPath:
+                  path: /etc/kubernetes/admin.conf
+    initConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+    joinConfiguration:
+      nodeRegistration:
+        criSocket: unix:///run/containerd/containerd.sock
+    preKubeadmCommands:
+      # The guest derives its own providerID from the SMBIOS UUID libvirt
+      # published as the domain UUID. Quoting matters: a mangled format string
+      # once produced "<uuid>n", registering a Node CAPI could never match.
+      - |
+        # --node-ip is not optional here, and the reason is kube-vip.
+        #
+        # The VIP is added as a second address on enp1s0 of whichever node holds
+        # leadership. Left to itself the kubelet picked that address and
+        # registered 192.168.15.10 as the node's InternalIP -- so the node's
+        # identity was an address that moves to a different machine on failover.
+        # Captured here, before kubeadm starts the kubelet and kube-vip with it,
+        # while enp1s0 still has only its own DHCP address.
+        # enp1s0 here MUST be the same interface as kube-vip's vip_interface.
+        NODE_IP=$(ip -4 -o addr show enp1s0 | awk '{print $4}' | cut -d/ -f1 | head -1)
+        printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s --node-ip=%s\n' \
+          "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+          "$NODE_IP" \
+          > /etc/default/kubelet
+      - modprobe overlay
+      - modprobe br_netfilter
+      - sysctl --system
+      - DEBIAN_FRONTEND=noninteractive apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y containerd apt-transport-https ca-certificates curl gpg qemu-guest-agent
+      - systemctl enable --now qemu-guest-agent
+      - mkdir -p /etc/containerd
+      - containerd config default > /etc/containerd/config.toml
+      - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      - systemctl restart containerd
+      - mkdir -p /etc/apt/keyrings
+      - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+      - DEBIAN_FRONTEND=noninteractive apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=1.35.3-* kubeadm=1.35.3-* kubectl=1.35.3-*
+      - apt-mark hold kubelet kubeadm kubectl
+      # kubeadm 1.29+ writes an admin.conf that is NOT cluster-admin, and creates
+      # super-admin.conf for that. kube-vip pointed at admin.conf cannot reach the
+      # API during init, so `kubeadm init` waits for a control plane that cannot
+      # come up. Point it at super-admin.conf for the duration, and put it back
+      # afterwards.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/admin.conf#path: /etc/kubernetes/super-admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
+    postKubeadmCommands:
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          sed -i 's#path: /etc/kubernetes/super-admin.conf#path: /etc/kubernetes/admin.conf#' \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
