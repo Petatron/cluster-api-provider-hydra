@@ -175,10 +175,10 @@ var _ = Describe("HydraCluster API", func() {
 	Context("managedNetwork", func() {
 		valid := func(hc *infrav1.HydraCluster) {
 			hc.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
-				Name:      "hydra-wl0",
-				Subnet:    "192.168.60.0/24",
-				DHCPStart: "192.168.60.100",
-				DHCPEnd:   "192.168.60.200",
+				Name:      testNetName,
+				Subnet:    testSubnet,
+				DHCPStart: testDHCPStart,
+				DHCPEnd:   testDHCPEnd,
 			}
 		}
 
@@ -202,6 +202,32 @@ var _ = Describe("HydraCluster API", func() {
 			err := k8sClient.Update(ctx, hc)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("managedNetwork is immutable"))
+		})
+
+		It("cannot be added after the cluster is created", func() {
+			// Existing machines are never rebuilt -- their providerID is already
+			// recorded -- so they never gain the extra interface. New machines would.
+			// The endpoint would then sit on a network only part of the fleet is on.
+			hc := newHydraCluster(nil)
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+			valid(hc)
+			err := k8sClient.Update(ctx, hc)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("cannot be added or removed"))
+		})
+
+		It("cannot be removed after the cluster is created", func() {
+			// The mirror image, and the reason the nested rule is not enough: a
+			// transition rule on the nested type does not run when the parent field
+			// disappears.
+			hc := newHydraCluster(valid)
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+			hc.Spec.ManagedNetwork = nil
+			err := k8sClient.Update(ctx, hc)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("cannot be added or removed"))
 		})
 
 		It("rejects a subnet that is not CIDR", func() {

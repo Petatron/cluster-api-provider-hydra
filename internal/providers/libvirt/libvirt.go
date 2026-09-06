@@ -761,16 +761,46 @@ func (p *Provider) createNetwork(ctx context.Context, spec providers.ManagedNetw
 	if err != nil {
 		return "", fmt.Errorf("libvirt: defining network %q: %w", spec.Name, err)
 	}
-	if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(created) }); err != nil &&
-		!isAlreadyExists(err) {
-		return "", fmt.Errorf("libvirt: starting network %q: %w", spec.Name, err)
-	}
-	// Without autostart the network is gone after a host reboot, and every
-	// machine attached to it comes back with a dead interface.
-	if err := callVoid(ctx, p, func() error { return p.lv.NetworkSetAutostart(created, 1) }); err != nil {
-		return "", fmt.Errorf("libvirt: setting autostart on network %q: %w", spec.Name, err)
+	// Nothing is rolled back if the steps below fail, because they do not need
+	// to be: a network that is defined but not started is found by the next
+	// reconcile, and bringUp is reached from the verify path too. That is the
+	// difference between resumable and abandoned -- an earlier version reported
+	// "an operator must start this" for a network it had just defined itself.
+	if err := p.bringUp(ctx, created, spec.Name); err != nil {
+		return "", err
 	}
 	return p.networkBridge(ctx, created, spec.Name)
+}
+
+// bringUp starts a network if it is not running and makes sure it comes back
+// after a reboot.
+//
+// Both steps run every time, deliberately. Autostart in particular is only
+// reachable once the network is up, so setting it once at creation means a
+// failure there is silently forgotten -- the next reconcile finds a running
+// network, is satisfied, and the host reboots months later into a cluster whose
+// machines all have dead interfaces. Setting it on every pass costs one call.
+//
+// Starting a network the cluster declares is not the same liberty as rewriting
+// its addressing. A declared network that is stopped makes the cluster unusable
+// and starting it destroys nothing, so this ensures rather than reports --
+// unlike the address and range checks in verifyNetwork, which refuse to touch
+// what an operator configured.
+func (p *Provider) bringUp(ctx context.Context, n golibvirt.Network, name string) error {
+	active, err := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
+	if err != nil {
+		return fmt.Errorf("libvirt: checking whether network %q is running: %w", name, err)
+	}
+	if active == 0 {
+		if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(n) }); err != nil &&
+			!isAlreadyExists(err) {
+			return fmt.Errorf("libvirt: starting network %q: %w", name, err)
+		}
+	}
+	if err := callVoid(ctx, p, func() error { return p.lv.NetworkSetAutostart(n, 1) }); err != nil {
+		return fmt.Errorf("libvirt: setting autostart on network %q: %w", name, err)
+	}
+	return nil
 }
 
 func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
@@ -786,6 +816,17 @@ func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec 
 	// Terminal, all of it: none of these can become true by waiting, and a
 	// machine attached to a network that is not the one declared would get an
 	// address from a range the endpoint was chosen to avoid.
+	//
+	// The forward mode is checked for the same reason it is set on creation, and
+	// adopting is where it matters most: a nat network whose addressing happens
+	// to match would pass every other check here and then produce a cluster
+	// whose API server the management controllers cannot dial. The cluster would
+	// come up and be unmanageable, which is a far worse outcome than being told
+	// the network is the wrong kind.
+	if parsed.Forward.Mode != netForwardOpen {
+		return "", fmt.Errorf("%w: libvirt: network %q has forward mode %q, but Hydra needs \"open\" -- other modes block the inbound connections the management cluster makes to a workload cluster's API server",
+			providers.ErrTerminal, spec.Name, parsed.Forward.Mode)
+	}
 	if parsed.IP.Address != gateway || parsed.IP.Netmask != netmask {
 		return "", fmt.Errorf("%w: libvirt: network %q is %s/%s, but the cluster declares %s (gateway %s)",
 			providers.ErrTerminal, spec.Name, parsed.IP.Address, parsed.IP.Netmask, spec.Subnet, gateway)
@@ -800,14 +841,9 @@ func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec 
 			parsed.IP.DHCP.Range.Start, parsed.IP.DHCP.Range.End, spec.DHCPStart, spec.DHCPEnd)
 	}
 
-	active, err := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
-	if err != nil {
-		return "", fmt.Errorf("libvirt: checking whether network %q is running: %w", spec.Name, err)
-	}
-	if active == 0 {
-		// Not terminal. A stopped network is exactly the kind of thing an
-		// operator starts, the same way a stopped storage pool is.
-		return "", fmt.Errorf("libvirt: network %q is defined but not running", spec.Name)
+	// Addressing is verified; liveness is ensured. See bringUp.
+	if err := p.bringUp(ctx, n, spec.Name); err != nil {
+		return "", err
 	}
 	return p.networkBridge(ctx, n, spec.Name)
 }
@@ -829,12 +865,12 @@ func (p *Provider) networkBridge(ctx context.Context, n golibvirt.Network, name 
 	return parsed.Bridge.Name, nil
 }
 
-// CheckInfrastructure implements providers.MachineProvider.
+// EnsureInfrastructure implements providers.MachineProvider.
 //
 // Two things are worth checking and nothing else is: the pool exists and is
 // running, and the base image is a volume inside it. Those are exactly the
 // absences that make every machine in the cluster fail, and both are one RPC.
-func (p *Provider) CheckInfrastructure(ctx context.Context, spec providers.InfrastructureSpec) error {
+func (p *Provider) EnsureInfrastructure(ctx context.Context, spec providers.InfrastructureSpec) error {
 	ctx, cancel, err := p.begin(ctx)
 	if err != nil {
 		return err
@@ -1327,7 +1363,10 @@ func call2[A, B any](ctx context.Context, p *Provider, fn func() (A, B, error)) 
 func isAlreadyExists(err error) bool {
 	var e golibvirt.Error
 	if errors.As(err, &e) {
-		return golibvirt.ErrorNumber(e.Code) == golibvirt.ErrStorageVolExist
+		switch golibvirt.ErrorNumber(e.Code) {
+		case golibvirt.ErrStorageVolExist, golibvirt.ErrNetworkExist:
+			return true
+		}
 	}
 	return false
 }
@@ -1336,7 +1375,8 @@ func isNotFound(err error) bool {
 	var e golibvirt.Error
 	if errors.As(err, &e) {
 		switch golibvirt.ErrorNumber(e.Code) {
-		case golibvirt.ErrNoDomain, golibvirt.ErrNoStorageVol, golibvirt.ErrNoStoragePool:
+		case golibvirt.ErrNoDomain, golibvirt.ErrNoStorageVol, golibvirt.ErrNoStoragePool,
+			golibvirt.ErrNoNetwork:
 			return true
 		}
 	}

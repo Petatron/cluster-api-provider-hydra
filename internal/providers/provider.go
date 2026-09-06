@@ -273,17 +273,25 @@ type MachineProvider interface {
 	// and the second attempt finding nothing is success, not failure.
 	Delete(ctx context.Context, id string) error
 
-	// CheckInfrastructure verifies the cluster-scoped prerequisites in spec.
+	// EnsureInfrastructure makes the cluster-scoped prerequisites in spec usable,
+	// and reports whether machines could now be created against them.
 	//
-	// Returns nil when machines could be created against them. Wraps ErrTerminal
-	// when they are absent or misconfigured, and an unwrapped error when the
-	// backend simply could not be reached -- the same distinction Create draws,
-	// and for the same reason: only the first should invite intervention.
+	// Wraps ErrTerminal when they are absent or misconfigured, and an unwrapped
+	// error when the backend simply could not be reached -- the same distinction
+	// Create draws, and for the same reason: only the first should invite
+	// intervention.
 	//
-	// Implementations must not create anything. Provisioning cluster
-	// infrastructure on someone's host is a separate decision from consuming it,
-	// and this method is the consuming half.
-	CheckInfrastructure(ctx context.Context, spec InfrastructureSpec) error
+	// The line this draws is ownership, not action. An implementation MAY create
+	// what the cluster explicitly asked it to own -- ManagedNetwork is the only
+	// such field today -- and MUST NOT create, reconfigure or remove anything
+	// else. A storage pool and a base image are the operator's; finding them
+	// absent is reported, never fixed.
+	//
+	// It was called CheckInfrastructure, and said implementations must create
+	// nothing. That was true until a cluster could declare a network it wanted
+	// Hydra to own, and a name promising a pure check while the libvirt backend
+	// defined networks was worse than either behaviour.
+	EnsureInfrastructure(ctx context.Context, spec InfrastructureSpec) error
 
 	// DeleteByName removes the machine and any partial resources keyed by the
 	// idempotency name -- including a clone volume whose domain was never

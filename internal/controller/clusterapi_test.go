@@ -48,6 +48,17 @@ import (
 // under test is the controller's reading of those objects, which a fake client
 // reproduces exactly.
 
+// The managed-network fixture, shared so the API specs and the endpoint
+// invariant specs cannot drift apart about which addresses are inside the range.
+const (
+	testNetName   = "hydra-wl0"
+	testSubnet    = "192.168.60.0/24"
+	testDHCPStart = "192.168.60.100"
+	testDHCPEnd   = "192.168.60.200"
+	testSmallNet  = "192.168.60.0/30"
+	testSmallHost = "192.168.60.2"
+)
+
 const (
 	linkNamespace   = "default"
 	linkEndpointIP  = "192.168.16.10"

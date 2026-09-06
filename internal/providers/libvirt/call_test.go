@@ -143,10 +143,19 @@ func TestErrorClassification(t *testing.T) {
 		{"no domain is not-found", mk(golibvirt.ErrNoDomain), isNotFound, true},
 		{"no storage vol is not-found", mk(golibvirt.ErrNoStorageVol), isNotFound, true},
 		{"no storage pool is not-found", mk(golibvirt.ErrNoStoragePool), isNotFound, true},
+		// Without this row the managed-network feature cannot work at all: an
+		// absent network takes the error path instead of the create path, so
+		// createNetwork is never reached. Nothing else in the suite notices,
+		// because every other classification is still correct.
+		{"no network is not-found", mk(golibvirt.ErrNoNetwork), isNotFound, true},
 		{"invalid op is not not-found", mk(golibvirt.ErrOperationInvalid), isNotFound, false},
 		{"plain error is not not-found", errors.New("boom"), isNotFound, false},
 
 		{"vol exists is already-exists", mk(golibvirt.ErrStorageVolExist), isAlreadyExists, true},
+		// NetworkCreate on an already-running network reports this, and the
+		// caller treats it as success -- so it has to be recognised or a second
+		// reconcile of a healthy network fails.
+		{"network exists is already-exists", mk(golibvirt.ErrNetworkExist), isAlreadyExists, true},
 		{"no domain is not already-exists", mk(golibvirt.ErrNoDomain), isAlreadyExists, false},
 
 		{"invalid op is invalid-state", mk(golibvirt.ErrOperationInvalid), isInvalidState, true},

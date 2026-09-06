@@ -337,7 +337,7 @@ func TestNetworkXMLIsOpenSoItIsReachableInbound(t *testing.T) {
 	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
 		t.Fatalf("generated network XML does not parse: %v\n%s", err, out)
 	}
-	if parsed.Forward.Mode != "open" {
+	if parsed.Forward.Mode != netForwardOpen {
 		t.Errorf("forward mode = %q, want open; nat blocks inbound connections and route needs an upstream route back",
 			parsed.Forward.Mode)
 	}

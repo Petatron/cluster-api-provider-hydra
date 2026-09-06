@@ -39,6 +39,13 @@ const (
 	// diskTypeFile is the only disk type this provider emits. See domainXML for
 	// why the pool/volume alternative is not an option.
 	diskTypeFile = "file"
+
+	// netForwardOpen is the forward mode Hydra's managed networks must have, on
+	// creation and on adoption alike. See networkXML: the other modes either
+	// block the inbound connections the management cluster makes to a workload
+	// cluster's API server, or need a route back that only the site's own router
+	// can provide.
+	netForwardOpen = "open"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -228,7 +235,7 @@ type netRangeDef struct {
 func networkXML(spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
 	n := networkDef{
 		Name:    spec.Name,
-		Forward: netForwardDef{Mode: "open"},
+		Forward: netForwardDef{Mode: netForwardOpen},
 		Bridge:  netBridgeDef{STP: "on"},
 		IP: netIPDef{
 			Address: gateway,

@@ -155,8 +155,16 @@ spec:
                   counting upward.
 
                   Declaring one here makes the answer structural. Hydra sets the DHCP range,
-                  so every address inside the subnet and outside that range is free by
-                  construction rather than by inspection of someone else's router.
+                  so which addresses can be handed to a machine is known rather than guessed
+                  at from someone else's router.
+
+                  "Outside the range" is not the same as "usable", and the difference has
+                  bitten before. The network address, the broadcast address and the gateway
+                  -- libvirt takes the first host address -- all sit outside the range and
+                  none can serve an endpoint. The controller refuses a controlPlaneEndpoint
+                  on any of them, and on anything inside the range, because the field is
+                  immutable and the alternative is a cluster that admits cleanly and then
+                  cannot be reached.
 
                   Machines receive an interface on this network IN ADDITION to networks
                   above, not instead of them -- the site network is what gives them internet
@@ -169,10 +177,14 @@ spec:
                     description: |-
                       dhcpStart and dhcpEnd bound the addresses handed to machines.
 
-                      The point of stating them is what they LEAVE OUT. Addresses inside the
-                      subnet and outside this range are Hydra's to allocate, and a
-                      controlPlaneEndpoint chosen from there cannot collide with a machine --
-                      which is the guarantee that a bridged site network cannot give.
+                      The point of stating them is what they LEAVE OUT: a controlPlaneEndpoint
+                      outside this range cannot be handed to a machine, which is the guarantee a
+                      bridged site network cannot give.
+
+                      Outside the range still leaves three addresses that were never available
+                      -- the network address, the broadcast address, and the gateway on the first
+                      host address -- so the usable space is the subnet minus those minus this
+                      range. The controller checks it rather than trusting the arithmetic.
 
                       Leave room. A range covering the whole subnet is accepted, because
                       refusing it would be second-guessing an operator who has some other plan
@@ -283,6 +295,11 @@ spec:
                 it selects the manager's pool, which is equally binding
               rule: has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool)
                 || self.storagePool == oldSelf.storagePool)
+            - message: managedNetwork cannot be added or removed after the cluster
+                is created; machines keep the attachments they were built with, so
+                either change leaves the control-plane endpoint on a network only
+                part of the cluster is attached to
+              rule: has(self.managedNetwork) == has(oldSelf.managedNetwork)
           status:
             description: status defines the observed state of HydraCluster
             properties:

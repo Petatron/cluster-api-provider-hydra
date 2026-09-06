@@ -37,6 +37,7 @@ import (
 // HydraMachine before PET-8's review caught it.
 // +kubebuilder:validation:XValidation:rule="has(self.controlPlaneEndpoint) && size(self.controlPlaneEndpoint.host) > 0 && self.controlPlaneEndpoint.port > 0",message="controlPlaneEndpoint requires both a host and a non-zero port"
 // +kubebuilder:validation:XValidation:rule="has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool) || self.storagePool == oldSelf.storagePool)",message="storagePool is fixed when the cluster is created; omitting it selects the manager's pool, which is equally binding"
+// +kubebuilder:validation:XValidation:rule="has(self.managedNetwork) == has(oldSelf.managedNetwork)",message="managedNetwork cannot be added or removed after the cluster is created; machines keep the attachments they were built with, so either change leaves the control-plane endpoint on a network only part of the cluster is attached to"
 type HydraClusterSpec struct {
 	// controlPlaneEndpoint is the address and port of this cluster's API server.
 	//
@@ -131,8 +132,16 @@ type HydraClusterSpec struct {
 	// counting upward.
 	//
 	// Declaring one here makes the answer structural. Hydra sets the DHCP range,
-	// so every address inside the subnet and outside that range is free by
-	// construction rather than by inspection of someone else's router.
+	// so which addresses can be handed to a machine is known rather than guessed
+	// at from someone else's router.
+	//
+	// "Outside the range" is not the same as "usable", and the difference has
+	// bitten before. The network address, the broadcast address and the gateway
+	// -- libvirt takes the first host address -- all sit outside the range and
+	// none can serve an endpoint. The controller refuses a controlPlaneEndpoint
+	// on any of them, and on anything inside the range, because the field is
+	// immutable and the alternative is a cluster that admits cleanly and then
+	// cannot be reached.
 	//
 	// Machines receive an interface on this network IN ADDITION to networks
 	// above, not instead of them -- the site network is what gives them internet
@@ -147,6 +156,10 @@ type HydraClusterSpec struct {
 // attached to it for their whole lives; changing the subnet under a running
 // cluster would strand every machine already on it, and changing the DHCP range
 // could put a machine on the address the control-plane endpoint is using.
+// This rule covers changes to a network that is already declared. It does NOT
+// fire when the optional parent field appears or disappears -- a transition rule
+// on a nested type is simply not evaluated then -- so HydraClusterSpec carries a
+// presence rule as well. That is the same gap storagePool had.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="managedNetwork is immutable; machines are attached to it for their whole lives"
 type HydraManagedNetwork struct {
 	// name is the network's name on the hypervisor.
@@ -170,10 +183,14 @@ type HydraManagedNetwork struct {
 
 	// dhcpStart and dhcpEnd bound the addresses handed to machines.
 	//
-	// The point of stating them is what they LEAVE OUT. Addresses inside the
-	// subnet and outside this range are Hydra's to allocate, and a
-	// controlPlaneEndpoint chosen from there cannot collide with a machine --
-	// which is the guarantee that a bridged site network cannot give.
+	// The point of stating them is what they LEAVE OUT: a controlPlaneEndpoint
+	// outside this range cannot be handed to a machine, which is the guarantee a
+	// bridged site network cannot give.
+	//
+	// Outside the range still leaves three addresses that were never available
+	// -- the network address, the broadcast address, and the gateway on the first
+	// host address -- so the usable space is the subnet minus those minus this
+	// range. The controller checks it rather than trusting the arithmetic.
 	//
 	// Leave room. A range covering the whole subnet is accepted, because
 	// refusing it would be second-guessing an operator who has some other plan

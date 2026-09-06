@@ -86,14 +86,22 @@ load balancer or a VIP — are the ones expected to fill it in; Hydra creates
 neither, so it only reports back what it is told. Immutable once set: moving a
 live cluster's API endpoint is not something a reconcile can carry out.
 
-Its controller **verifies rather than creates**. There is no network to build and
-no load balancer to stand up, so what it does is confirm that the infrastructure
-the cluster was pointed at actually exists — the storage pool is running, and the
-base image is present in it — and report that through
+Its controller **verifies what it does not own, and creates only what the cluster
+asked it to own**. The storage pool and the base image were there before it
+looked and outlive it, so those it confirms and never touches — the pool is
+running, the image is present in it — reporting through
 `status.initialization.provisioned`, which gates machine creation. Both absences
 fail every machine in the cluster identically, so checking once at cluster level
 turns a late, repeated, per-machine confusion into a single condition raised
 before anything is attempted.
+
+The exception is `managedNetwork`. A cluster that declares one is asking Hydra to
+own a network, so the provider creates it if it is absent and verifies it if it
+is not — and even then it will not reconfigure the addressing of a network it
+found, only refuse to use it. Deleting the cluster **leaves that network behind**,
+deliberately: tearing it down safely means knowing whether Hydra created it or
+adopted an operator's, and waiting until no machine still has an interface on it.
+Until ownership is tracked, a leftover bridge is the cheaper mistake.
 
 Deliberately **not** here: how to reach the hypervisor. That is still a manager
 flag, and moving it onto this object is PET-38, bundled with the switch to TLS.

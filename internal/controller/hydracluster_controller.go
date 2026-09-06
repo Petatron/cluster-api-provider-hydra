@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -109,16 +111,27 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// No finalizer, deliberately.
+	// No finalizer, and this is now a policy rather than a tautology.
 	//
-	// A finalizer exists to hold an object open while its provider tears
-	// something down. This provider creates nothing at cluster scope -- the
-	// storage pool and the base image were there before it looked and outlive it
-	// -- so a finalizer here would guard nothing while adding a way for deletion
-	// to wedge. It earns its place when there is something to release; see
-	// PET-38, which introduces per-cluster hypervisor connections.
+	// It used to be simply true that there was nothing to release: the storage
+	// pool and base image were there before the controller looked and outlive it.
+	// A managed network changes that -- Hydra may have defined it -- so deletion
+	// now LEAKS a libvirt network, on purpose, and that is worth stating rather
+	// than discovering.
+	//
+	// Tearing one down correctly needs two things this controller does not have.
+	// It needs to know whether Hydra created the network or merely adopted one an
+	// operator built, because deleting the latter would take down every guest
+	// already attached to it, including guests belonging to nobody here. And it
+	// needs to wait until no machine still holds an interface on it, which means
+	// ordering cluster teardown behind machine teardown. Getting that order wrong
+	// destroys running clusters; a leftover virbr costs an operator one
+	// `virsh net-undefine`.
+	//
+	// So the leak is the deliberate choice until ownership is tracked. See PET-41.
 	if !hydraCluster.DeletionTimestamp.IsZero() {
-		log.V(1).Info("HydraCluster is being deleted; nothing to release", "name", hydraCluster.Name)
+		log.V(1).Info("HydraCluster is being deleted; any managed network is deliberately left in place",
+			"name", hydraCluster.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -143,7 +156,17 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	if err := prov.CheckInfrastructure(ctx, infrastructureSpecFor(hydraCluster)); err != nil {
+	// Before the backend is asked for anything. This is a property of the
+	// declaration alone, so a cluster that cannot work should say so without
+	// first creating a network for it.
+	if err := validateEndpointAgainstManagedNetwork(hydraCluster); err != nil {
+		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
+	}
+
+	if err := prov.EnsureInfrastructure(ctx, infrastructureSpecFor(hydraCluster)); err != nil {
 		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -367,4 +390,104 @@ func managedNetworkOf(hydraCluster *infrav1.HydraCluster) *providers.ManagedNetw
 		DHCPStart: n.DHCPStart,
 		DHCPEnd:   n.DHCPEnd,
 	}
+}
+
+// validateEndpointAgainstManagedNetwork checks the one invariant a managed
+// network exists to provide: that the control-plane endpoint is an address the
+// network can actually carry and will never hand to a machine.
+//
+// Nothing else enforces it. The subnet, the range and the endpoint are three
+// independently valid fields, and CEL cannot compare them -- ordering IP
+// addresses is not something the expression language can express -- so a cluster
+// declaring an endpoint inside its own DHCP range would admit cleanly and then
+// hand that address to the first machine that asked.
+//
+// Which is the whole feature failing quietly, so it is checked loudly instead.
+// Terminal: every one of these is a statement about the spec, and
+// controlPlaneEndpoint is immutable, so none of them improves by waiting.
+func validateEndpointAgainstManagedNetwork(hydraCluster *infrav1.HydraCluster) error {
+	n := hydraCluster.Spec.ManagedNetwork
+	if n == nil {
+		return nil
+	}
+	host := hydraCluster.Spec.ControlPlaneEndpoint.Host
+	endpoint := net.ParseIP(host)
+	if endpoint == nil {
+		// A name rather than an address is not something this can check, and not
+		// something to refuse: an operator may be fronting the endpoint with DNS
+		// they manage. The range guarantee is theirs to keep in that case.
+		return nil
+	}
+
+	_, subnet, err := net.ParseCIDR(n.Subnet)
+	if err != nil {
+		return fmt.Errorf("%w: managedNetwork.subnet %q is not valid CIDR: %v",
+			providers.ErrTerminal, n.Subnet, err)
+	}
+	if !subnet.Contains(endpoint) {
+		return fmt.Errorf("%w: controlPlaneEndpoint.host %s is not inside managedNetwork.subnet %s, so nothing on that network can answer for it",
+			providers.ErrTerminal, host, n.Subnet)
+	}
+
+	// The addresses outside the DHCP range are not all free. libvirt takes the
+	// first host address for the gateway, and the network and broadcast
+	// addresses were never usable. An endpoint on any of them is unreachable in
+	// a way that looks like the VIP simply not working.
+	gateway, _, err := managedNetworkGateway(n.Subnet)
+	if err != nil {
+		return err
+	}
+	switch {
+	case endpoint.Equal(subnet.IP):
+		return fmt.Errorf("%w: controlPlaneEndpoint.host %s is the network address of managedNetwork.subnet %s",
+			providers.ErrTerminal, host, n.Subnet)
+	case endpoint.Equal(gateway):
+		return fmt.Errorf("%w: controlPlaneEndpoint.host %s is the gateway of managedNetwork.subnet %s; libvirt takes the first host address",
+			providers.ErrTerminal, host, n.Subnet)
+	case endpoint.Equal(broadcastOf(subnet)):
+		return fmt.Errorf("%w: controlPlaneEndpoint.host %s is the broadcast address of managedNetwork.subnet %s",
+			providers.ErrTerminal, host, n.Subnet)
+	}
+
+	start, end := net.ParseIP(n.DHCPStart), net.ParseIP(n.DHCPEnd)
+	if start == nil || end == nil {
+		return fmt.Errorf("%w: managedNetwork DHCP bounds %q-%q are not both addresses",
+			providers.ErrTerminal, n.DHCPStart, n.DHCPEnd)
+	}
+	if bytes.Compare(endpoint.To4(), start.To4()) >= 0 && bytes.Compare(endpoint.To4(), end.To4()) <= 0 {
+		return fmt.Errorf("%w: controlPlaneEndpoint.host %s is inside managedNetwork's DHCP range %s-%s, so a machine can be given the endpoint's address; choose an address in %s outside that range",
+			providers.ErrTerminal, host, n.DHCPStart, n.DHCPEnd, n.Subnet)
+	}
+	return nil
+}
+
+// managedNetworkGateway mirrors the backend's choice of gateway so the two
+// cannot disagree about which address is reserved.
+func managedNetworkGateway(cidr string) (net.IP, *net.IPNet, error) {
+	_, subnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: managedNetwork.subnet %q is not valid CIDR: %v",
+			providers.ErrTerminal, cidr, err)
+	}
+	base := subnet.IP.To4()
+	if base == nil {
+		return nil, nil, fmt.Errorf("%w: managedNetwork.subnet %q is not IPv4", providers.ErrTerminal, cidr)
+	}
+	gw := make(net.IP, len(base))
+	copy(gw, base)
+	gw[3]++
+	return gw, subnet, nil
+}
+
+func broadcastOf(subnet *net.IPNet) net.IP {
+	ip := subnet.IP.To4()
+	mask := subnet.Mask
+	if ip == nil || len(mask) != net.IPv4len {
+		return nil
+	}
+	out := make(net.IP, net.IPv4len)
+	for i := range out {
+		out[i] = ip[i] | ^mask[i]
+	}
+	return out
 }
