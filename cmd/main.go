@@ -228,12 +228,18 @@ func main() {
 	}
 
 	var providerMu sync.Mutex
-	var machineProvider *libvirtprovider.Provider
+	// Two references to one provider: what the reconcilers use, and what has to
+	// be closed. They differ because the reconcilers get an instrumented wrapper
+	// around the libvirt provider, and only the latter owns a connection --
+	// MachineProvider has no Close, deliberately, since not every backend holds
+	// one open.
+	var machineProvider providers.MachineProvider
+	var libvirtConn *libvirtprovider.Provider
 	defer func() {
 		providerMu.Lock()
 		defer providerMu.Unlock()
-		if machineProvider != nil {
-			if err := machineProvider.Close(); err != nil {
+		if libvirtConn != nil {
+			if err := libvirtConn.Close(); err != nil {
 				setupLog.Error(err, "Failed to close the libvirt connection")
 			}
 		}
@@ -258,8 +264,13 @@ func main() {
 			// reconcile is retried, not remembered as broken.
 			return nil, err
 		}
-		machineProvider = p
-		return p, nil
+		// Wrapped once, here, so both reconcilers share the same instrumented
+		// instance and the singleton above still holds -- a wrapper created per
+		// caller would be harmless for metrics but would defeat the nil check
+		// that keeps this to one libvirt connection.
+		libvirtConn = p
+		machineProvider = providers.NewInstrumented(p)
+		return machineProvider, nil
 	}
 
 	if err := (&controller.HydraClusterReconciler{

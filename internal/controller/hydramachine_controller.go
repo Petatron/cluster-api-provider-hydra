@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/metrics"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
@@ -594,6 +596,11 @@ func waitReasonFor(err error) string {
 // a MachineHealthCheck may act on it, so a machine waiting on its bootstrap
 // Secret must not carry it.
 func (r *HydraMachineReconciler) recordWaiting(ctx context.Context, machine *infrav1.HydraMachine, reason, message string) error {
+	// The reason, never the machine. There are four of these and the set is
+	// fixed by waitReasonFor; a machine name here would add a series per machine
+	// and never remove one.
+	metrics.MachineWaitTotal.WithLabelValues(reason).Inc()
+
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               infrav1.MachineReadyCondition,
@@ -624,6 +631,13 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 	if !terminal {
 		reason = phase + "FailedRetrying"
 	}
+
+	// terminal is its own label rather than being folded into reason, because it
+	// is the question an operator actually asks of a failure graph: is this
+	// something that will clear, or something waiting on me?
+	metrics.MachineFailureTotal.
+		WithLabelValues(phase, reason, strconv.FormatBool(terminal)).
+		Inc()
 
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
