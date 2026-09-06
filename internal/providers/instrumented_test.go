@@ -33,15 +33,15 @@ func TestOutcomeOf(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"nil", nil, "success"},
-		{"terminal", fmt.Errorf("%w: pool missing", ErrTerminal), "terminal"},
+		{"nil", nil, outcomeSuccess},
+		{"terminal", fmt.Errorf("%w: pool missing", ErrTerminal), outcomeTerminal},
 		// Not a failure: Create's idempotency check and deletion both ask for
 		// machines that may legitimately not exist. Counting those as errors
 		// would make a healthy provider look broken.
-		{"not found", fmt.Errorf("%w: no such machine", ErrNotFound), "not_found"},
-		{"unreachable", errors.New("dial unix: connection refused"), "error"},
+		{"not found", fmt.Errorf("%w: no such machine", ErrNotFound), outcomeNotFound},
+		{"unreachable", errors.New("dial unix: connection refused"), outcomeError},
 		// Terminal wins when both are present: it is the actionable half.
-		{"terminal wrapping not-found", fmt.Errorf("%w: %w", ErrTerminal, ErrNotFound), "terminal"},
+		{"terminal wrapping not-found", fmt.Errorf("%w: %w", ErrTerminal, ErrNotFound), outcomeTerminal},
 	} {
 		if got := outcomeOf(tc.err); got != tc.want {
 			t.Errorf("outcomeOf(%s) = %q, want %q", tc.name, got, tc.want)

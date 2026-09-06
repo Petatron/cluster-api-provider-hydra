@@ -47,6 +47,15 @@ func NewInstrumented(p MachineProvider) MachineProvider {
 	return &Instrumented{MachineProvider: p}
 }
 
+// The outcome label's values, named so the decorator and its tests cannot
+// disagree about the spelling of a label a dashboard will depend on.
+const (
+	outcomeSuccess  = "success"
+	outcomeTerminal = "terminal"
+	outcomeNotFound = "not_found"
+	outcomeError    = "error"
+)
+
 // outcomeOf classifies an error the way the rest of the provider does.
 //
 // The split is deliberate and is the point of the label: "terminal" is a
@@ -57,16 +66,16 @@ func NewInstrumented(p MachineProvider) MachineProvider {
 func outcomeOf(err error) string {
 	switch {
 	case err == nil:
-		return "success"
+		return outcomeSuccess
 	case errors.Is(err, ErrTerminal):
-		return "terminal"
+		return outcomeTerminal
 	case errors.Is(err, ErrNotFound):
 		// Not a failure. Create's idempotency check and deletion both ask for
 		// machines that may legitimately not exist, and counting those as errors
 		// would make a healthy provider look broken.
-		return "not_found"
+		return outcomeNotFound
 	default:
-		return "error"
+		return outcomeError
 	}
 }
 
