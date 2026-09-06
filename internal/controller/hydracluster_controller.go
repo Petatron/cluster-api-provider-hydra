@@ -201,6 +201,7 @@ func infrastructureSpecFor(hydraCluster *infrav1.HydraCluster) providers.Infrast
 	if img := hydraCluster.Spec.BaseImage; img != nil {
 		spec.Image = providers.Image{Name: img.Name, URL: img.URL, Checksum: img.Checksum}
 	}
+	spec.ManagedNetwork = managedNetworkOf(hydraCluster)
 	return spec
 }
 
@@ -347,4 +348,23 @@ func (r *HydraClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(clusterToHydraCluster),
 		).
 		Complete(r)
+}
+
+// managedNetworkOf converts the API's managed-network declaration for the
+// backend, or nil when the cluster declares none.
+//
+// Shared by the cluster check and machine creation on purpose: the network the
+// cluster verifies and the network machines are attached to must be the same
+// one, and two conversions could drift.
+func managedNetworkOf(hydraCluster *infrav1.HydraCluster) *providers.ManagedNetwork {
+	if hydraCluster == nil || hydraCluster.Spec.ManagedNetwork == nil {
+		return nil
+	}
+	n := hydraCluster.Spec.ManagedNetwork
+	return &providers.ManagedNetwork{
+		Name:      n.Name,
+		Subnet:    n.Subnet,
+		DHCPStart: n.DHCPStart,
+		DHCPEnd:   n.DHCPEnd,
+	}
 }

@@ -763,8 +763,21 @@ func specFor(machine *infrav1.HydraMachine, link *linkage, bootstrapData []byte)
 		Image:         resolveImage(machine, link),
 		Networks:      networks,
 		StoragePool:   resolveStoragePool(link),
+		// From the cluster, never the machine. A managed network is the cluster's
+		// addressing scheme -- the endpoint every machine in it must not collide
+		// with -- so letting one machine opt out would put it on a network its own
+		// control plane is not on.
+		ManagedNetwork: managedNetworkOf(hydraClusterOf(link)),
 	}
 	return spec, nil
+}
+
+// hydraClusterOf returns the cluster a machine belongs to, or nil.
+func hydraClusterOf(link *linkage) *infrav1.HydraCluster {
+	if link == nil {
+		return nil
+	}
+	return link.hydraCluster
 }
 
 // resolveImage picks the base image: the machine's, else the cluster's, else

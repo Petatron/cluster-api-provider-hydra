@@ -472,6 +472,19 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		}
 	}
 
+	// Resolve rather than create. The cluster-level check owns this network's
+	// existence, and machine creation is already gated on that check having
+	// passed -- so a machine that gets this far and finds no network has hit a
+	// real fault, not a race worth papering over by creating one here.
+	if spec.ManagedNetwork != nil {
+		bridge, nErr := p.ensureNetwork(ctx, *spec.ManagedNetwork)
+		if nErr != nil {
+			rollback()
+			return nil, nErr
+		}
+		spec.Networks = append(spec.Networks, providers.Network{Name: bridge})
+	}
+
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
 		return p.lv.DomainDefineXML(domainXML(spec, rootPath, cidataPath))
 	})
@@ -680,6 +693,142 @@ func (p *Provider) volumePath(ctx context.Context, pool golibvirt.StoragePool, v
 	return path, nil
 }
 
+// subnetParts splits a CIDR into the gateway address and the netmask libvirt
+// wants, taking the first host address for the gateway the way libvirt's own
+// networks do.
+func subnetParts(cidr string) (gateway, netmask string, err error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: libvirt: subnet %q is not valid CIDR: %v",
+			providers.ErrTerminal, cidr, err)
+	}
+	if ip.To4() == nil {
+		return "", "", fmt.Errorf("%w: libvirt: subnet %q is not IPv4", providers.ErrTerminal, cidr)
+	}
+	// /31 and /32 are rejected rather than merely checked for a gateway address.
+	// A /31 does contain a second address, so a containment check passes and the
+	// network renders fine -- and then holds the gateway and nothing else, so no
+	// machine can ever be given an address on it. A network that builds cleanly
+	// and cannot be used is worse than one that is refused.
+	ones, bits := ipnet.Mask.Size()
+	if bits-ones < 2 {
+		return "", "", fmt.Errorf("%w: libvirt: subnet %q leaves no addresses for machines after the gateway",
+			providers.ErrTerminal, cidr)
+	}
+	base := ipnet.IP.To4()
+	gw := make(net.IP, len(base))
+	copy(gw, base)
+	gw[3]++
+	return gw.String(), net.IP(ipnet.Mask).String(), nil
+}
+
+// ensureNetwork creates the cluster's managed network if it is absent, and
+// verifies it if it is not.
+//
+// Verification rather than reconciliation, deliberately. Naming an existing
+// network adopts it, and an operator who built that network chose its
+// addressing for reasons this provider cannot see. Quietly rewriting it would
+// renumber every machine already attached; saying the declaration and the
+// network disagree leaves them to decide which is wrong.
+//
+// Returns the bridge name, which is what machines are actually attached to.
+func (p *Provider) ensureNetwork(ctx context.Context, spec providers.ManagedNetwork) (string, error) {
+	gateway, netmask, err := subnetParts(spec.Subnet)
+	if err != nil {
+		return "", err
+	}
+
+	existing, err := call(ctx, p, func() (golibvirt.Network, error) {
+		return p.lv.NetworkLookupByName(spec.Name)
+	})
+	if err != nil {
+		if !isNotFound(err) {
+			return "", fmt.Errorf("libvirt: looking up network %q: %w", spec.Name, err)
+		}
+		return p.createNetwork(ctx, spec, gateway, netmask)
+	}
+	return p.verifyNetwork(ctx, existing, spec, gateway, netmask)
+}
+
+func (p *Provider) createNetwork(ctx context.Context, spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
+	doc, err := networkXML(spec, gateway, netmask)
+	if err != nil {
+		return "", err
+	}
+	created, err := call(ctx, p, func() (golibvirt.Network, error) {
+		return p.lv.NetworkDefineXML(doc)
+	})
+	if err != nil {
+		return "", fmt.Errorf("libvirt: defining network %q: %w", spec.Name, err)
+	}
+	if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(created) }); err != nil &&
+		!isAlreadyExists(err) {
+		return "", fmt.Errorf("libvirt: starting network %q: %w", spec.Name, err)
+	}
+	// Without autostart the network is gone after a host reboot, and every
+	// machine attached to it comes back with a dead interface.
+	if err := callVoid(ctx, p, func() error { return p.lv.NetworkSetAutostart(created, 1) }); err != nil {
+		return "", fmt.Errorf("libvirt: setting autostart on network %q: %w", spec.Name, err)
+	}
+	return p.networkBridge(ctx, created, spec.Name)
+}
+
+func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
+	desc, err := call(ctx, p, func() (string, error) { return p.lv.NetworkGetXMLDesc(n, 0) })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: reading network %q: %w", spec.Name, err)
+	}
+	var parsed networkDef
+	if err := xml.Unmarshal([]byte(desc), &parsed); err != nil {
+		return "", fmt.Errorf("libvirt: parsing network %q: %w", spec.Name, err)
+	}
+
+	// Terminal, all of it: none of these can become true by waiting, and a
+	// machine attached to a network that is not the one declared would get an
+	// address from a range the endpoint was chosen to avoid.
+	if parsed.IP.Address != gateway || parsed.IP.Netmask != netmask {
+		return "", fmt.Errorf("%w: libvirt: network %q is %s/%s, but the cluster declares %s (gateway %s)",
+			providers.ErrTerminal, spec.Name, parsed.IP.Address, parsed.IP.Netmask, spec.Subnet, gateway)
+	}
+	if parsed.IP.DHCP == nil {
+		return "", fmt.Errorf("%w: libvirt: network %q hands out no addresses, but the cluster declares a DHCP range",
+			providers.ErrTerminal, spec.Name)
+	}
+	if parsed.IP.DHCP.Range.Start != spec.DHCPStart || parsed.IP.DHCP.Range.End != spec.DHCPEnd {
+		return "", fmt.Errorf("%w: libvirt: network %q hands out %s-%s, but the cluster declares %s-%s; an endpoint chosen outside the declared range may be inside the real one",
+			providers.ErrTerminal, spec.Name,
+			parsed.IP.DHCP.Range.Start, parsed.IP.DHCP.Range.End, spec.DHCPStart, spec.DHCPEnd)
+	}
+
+	active, err := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: checking whether network %q is running: %w", spec.Name, err)
+	}
+	if active == 0 {
+		// Not terminal. A stopped network is exactly the kind of thing an
+		// operator starts, the same way a stopped storage pool is.
+		return "", fmt.Errorf("libvirt: network %q is defined but not running", spec.Name)
+	}
+	return p.networkBridge(ctx, n, spec.Name)
+}
+
+// networkBridge reads back the bridge libvirt chose, which is the name machines
+// are attached by.
+func (p *Provider) networkBridge(ctx context.Context, n golibvirt.Network, name string) (string, error) {
+	desc, err := call(ctx, p, func() (string, error) { return p.lv.NetworkGetXMLDesc(n, 0) })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: reading network %q: %w", name, err)
+	}
+	var parsed networkDef
+	if err := xml.Unmarshal([]byte(desc), &parsed); err != nil {
+		return "", fmt.Errorf("libvirt: parsing network %q: %w", name, err)
+	}
+	if parsed.Bridge.Name == "" {
+		return "", fmt.Errorf("libvirt: network %q reports no bridge to attach machines to", name)
+	}
+	return parsed.Bridge.Name, nil
+}
+
 // CheckInfrastructure implements providers.MachineProvider.
 //
 // Two things are worth checking and nothing else is: the pool exists and is
@@ -713,6 +862,15 @@ func (p *Provider) CheckInfrastructure(ctx context.Context, spec providers.Infra
 		// would invite an operator or a MachineHealthCheck to act on something
 		// about to come good on its own.
 		return fmt.Errorf("libvirt: storage pool %q exists but is not running", pool.Name)
+	}
+
+	// Before the image check, not after it: the image section below returns
+	// early when the cluster named no image, and a managed network is not
+	// contingent on there being one.
+	if spec.ManagedNetwork != nil {
+		if _, err := p.ensureNetwork(ctx, *spec.ManagedNetwork); err != nil {
+			return err
+		}
 	}
 
 	// Only check the image when the cluster actually named one.

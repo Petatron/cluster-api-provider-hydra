@@ -117,6 +117,74 @@ type HydraClusterSpec struct {
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=8
 	Networks []HydraNetworkAttachment `json:"networks,omitempty"`
+
+	// managedNetwork asks Hydra to create and own a network for this cluster,
+	// instead of only attaching machines to networks an operator prepared.
+	//
+	// It exists to solve the control-plane endpoint problem. A
+	// KubeadmControlPlane needs an endpoint that survives replicas coming and
+	// going, so controlPlaneEndpoint must be an address no DHCP server will ever
+	// hand to a machine -- and it is immutable, so a wrong guess is not
+	// repairable. On a bridged site network there is no way to know that: the
+	// addresses a DHCP server has already issued say nothing about the bounds of
+	// its pool, because many allocate by hashing the client ID rather than
+	// counting upward.
+	//
+	// Declaring one here makes the answer structural. Hydra sets the DHCP range,
+	// so every address inside the subnet and outside that range is free by
+	// construction rather than by inspection of someone else's router.
+	//
+	// Machines receive an interface on this network IN ADDITION to networks
+	// above, not instead of them -- the site network is what gives them internet
+	// access and the address they register as Nodes.
+	// +optional
+	ManagedNetwork *HydraManagedNetwork `json:"managedNetwork,omitempty"`
+}
+
+// HydraManagedNetwork describes a network whose lifecycle Hydra owns.
+//
+// Every field is immutable. The network is created once and machines are
+// attached to it for their whole lives; changing the subnet under a running
+// cluster would strand every machine already on it, and changing the DHCP range
+// could put a machine on the address the control-plane endpoint is using.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="managedNetwork is immutable; machines are attached to it for their whole lives"
+type HydraManagedNetwork struct {
+	// name is the network's name on the hypervisor.
+	//
+	// Hydra creates it if it is absent and verifies it if it is not, so naming an
+	// existing network adopts it -- which is why the checks are strict about the
+	// subnet and range matching rather than reconfiguring what it finds.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// subnet is the address range of the network, in CIDR form.
+	//
+	// Hydra takes the first address for the gateway, the way libvirt's own
+	// networks do.
+	// +required
+	// +kubebuilder:validation:Pattern=`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[12][0-9]|3[0-2])$`
+	Subnet string `json:"subnet"`
+
+	// dhcpStart and dhcpEnd bound the addresses handed to machines.
+	//
+	// The point of stating them is what they LEAVE OUT. Addresses inside the
+	// subnet and outside this range are Hydra's to allocate, and a
+	// controlPlaneEndpoint chosen from there cannot collide with a machine --
+	// which is the guarantee that a bridged site network cannot give.
+	//
+	// Leave room. A range covering the whole subnet is accepted, because
+	// refusing it would be second-guessing an operator who has some other plan
+	// for the endpoint, but it gives Hydra nothing to allocate from.
+	// +required
+	// +kubebuilder:validation:Pattern=`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`
+	DHCPStart string `json:"dhcpStart"`
+
+	// +required
+	// +kubebuilder:validation:Pattern=`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`
+	DHCPEnd string `json:"dhcpEnd"`
 }
 
 // HydraClusterInitializationStatus reports Cluster API initialization

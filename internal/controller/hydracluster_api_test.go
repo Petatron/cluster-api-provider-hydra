@@ -172,6 +172,62 @@ var _ = Describe("HydraCluster API", func() {
 		})
 	})
 
+	Context("managedNetwork", func() {
+		valid := func(hc *infrav1.HydraCluster) {
+			hc.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
+				Name:      "hydra-wl0",
+				Subnet:    "192.168.60.0/24",
+				DHCPStart: "192.168.60.100",
+				DHCPEnd:   "192.168.60.200",
+			}
+		}
+
+		It("may be omitted, which is bridging onto a site network as before", func() {
+			Expect(k8sClient.Create(ctx, newHydraCluster(nil))).To(Succeed())
+		})
+
+		It("admits a complete declaration", func() {
+			Expect(k8sClient.Create(ctx, newHydraCluster(valid))).To(Succeed())
+		})
+
+		It("is immutable once set", func() {
+			// Machines are attached to this network for their whole lives, and the
+			// control-plane endpoint was chosen to sit outside its DHCP range.
+			// Moving the subnet would strand every machine already on it; moving the
+			// range could put a machine on the endpoint's address.
+			hc := newHydraCluster(valid)
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+			hc.Spec.ManagedNetwork.DHCPStart = "192.168.60.2"
+			err := k8sClient.Update(ctx, hc)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("managedNetwork is immutable"))
+		})
+
+		It("rejects a subnet that is not CIDR", func() {
+			err := k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
+				valid(hc)
+				hc.Spec.ManagedNetwork.Subnet = "192.168.60.0"
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("rejects a DHCP bound that is not an address", func() {
+			err := k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
+				valid(hc)
+				hc.Spec.ManagedNetwork.DHCPEnd = "192.168.60.0/24"
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("requires every field, since a partial network is not usable", func() {
+			err := k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
+				hc.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{Name: "hydra-wl0"}
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
 	It("reports provisioned and the endpoint through printer columns", func() {
 		// The columns are how someone reads a stuck cluster with kubectl, so a
 		// typo in a JSONPath is worth catching here rather than in anger.

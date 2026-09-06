@@ -140,6 +140,74 @@ spec:
                   rule: '!has(oldSelf.host) || (has(self.host) && self.host == oldSelf.host)'
                 - message: controlPlaneEndpoint.port is immutable once set
                   rule: '!has(oldSelf.port) || (has(self.port) && self.port == oldSelf.port)'
+              managedNetwork:
+                description: |-
+                  managedNetwork asks Hydra to create and own a network for this cluster,
+                  instead of only attaching machines to networks an operator prepared.
+
+                  It exists to solve the control-plane endpoint problem. A
+                  KubeadmControlPlane needs an endpoint that survives replicas coming and
+                  going, so controlPlaneEndpoint must be an address no DHCP server will ever
+                  hand to a machine -- and it is immutable, so a wrong guess is not
+                  repairable. On a bridged site network there is no way to know that: the
+                  addresses a DHCP server has already issued say nothing about the bounds of
+                  its pool, because many allocate by hashing the client ID rather than
+                  counting upward.
+
+                  Declaring one here makes the answer structural. Hydra sets the DHCP range,
+                  so every address inside the subnet and outside that range is free by
+                  construction rather than by inspection of someone else's router.
+
+                  Machines receive an interface on this network IN ADDITION to networks
+                  above, not instead of them -- the site network is what gives them internet
+                  access and the address they register as Nodes.
+                properties:
+                  dhcpEnd:
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+                    type: string
+                  dhcpStart:
+                    description: |-
+                      dhcpStart and dhcpEnd bound the addresses handed to machines.
+
+                      The point of stating them is what they LEAVE OUT. Addresses inside the
+                      subnet and outside this range are Hydra's to allocate, and a
+                      controlPlaneEndpoint chosen from there cannot collide with a machine --
+                      which is the guarantee that a bridged site network cannot give.
+
+                      Leave room. A range covering the whole subnet is accepted, because
+                      refusing it would be second-guessing an operator who has some other plan
+                      for the endpoint, but it gives Hydra nothing to allocate from.
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+                    type: string
+                  name:
+                    description: |-
+                      name is the network's name on the hypervisor.
+
+                      Hydra creates it if it is absent and verifies it if it is not, so naming an
+                      existing network adopts it -- which is why the checks are strict about the
+                      subnet and range matching rather than reconfiguring what it finds.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  subnet:
+                    description: |-
+                      subnet is the address range of the network, in CIDR form.
+
+                      Hydra takes the first address for the gateway, the way libvirt's own
+                      networks do.
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[12][0-9]|3[0-2])$
+                    type: string
+                required:
+                - dhcpEnd
+                - dhcpStart
+                - name
+                - subnet
+                type: object
+                x-kubernetes-validations:
+                - message: managedNetwork is immutable; machines are attached to it
+                    for their whole lives
+                  rule: self == oldSelf
               networks:
                 description: |-
                   networks are the network attachments machines in this cluster receive when

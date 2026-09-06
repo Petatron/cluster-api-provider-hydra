@@ -91,6 +91,29 @@ type Network struct {
 	Name string
 }
 
+// ManagedNetwork is a network the provider creates and owns, rather than one an
+// operator prepared and the provider merely attaches to.
+//
+// It exists so a cluster's control-plane endpoint can come from a range the
+// provider controls. On a network someone else runs there is no way to know
+// which addresses its DHCP server may hand out -- the ones it has already
+// issued say nothing about the bounds of its pool -- and the endpoint is
+// immutable, so guessing wrong is not repairable. Setting the range makes every
+// address outside it free by construction.
+//
+// A backend with no notion of this may reject it; none is required to invent one.
+type ManagedNetwork struct {
+	Name string
+
+	// Subnet in CIDR form. The first address is the gateway.
+	Subnet string
+
+	// DHCPStart and DHCPEnd bound what machines may be given. What they leave
+	// out is the point: that is the space the endpoint comes from.
+	DHCPStart string
+	DHCPEnd   string
+}
+
 // InfrastructureSpec describes the cluster-scoped prerequisites a backend needs
 // in place before any machine can be created.
 //
@@ -106,6 +129,12 @@ type InfrastructureSpec struct {
 	// Image is the base image machines will be cloned from. A zero value means
 	// the backend's own default.
 	Image Image
+
+	// ManagedNetwork, when set, is created if absent and verified if present --
+	// the same shape as the checks above it, and for the same reason: an absence
+	// that would fail every machine identically belongs on the cluster, reported
+	// once.
+	ManagedNetwork *ManagedNetwork
 }
 
 // MachineSpec is the backend-neutral description of a machine to create.
@@ -130,6 +159,13 @@ type MachineSpec struct {
 
 	Image    Image
 	Networks []Network
+
+	// ManagedNetwork, when set, gets an interface on this machine IN ADDITION to
+	// Networks, not instead of them. The site network is what gives a machine
+	// internet access and the address it registers with; this one carries the
+	// cluster's endpoint. A machine attached only to the managed network could
+	// not install anything at boot.
+	ManagedNetwork *ManagedNetwork
 
 	// StoragePool is where this machine's disks are created, and where its base
 	// image is expected to be found. Empty means the backend's own default.

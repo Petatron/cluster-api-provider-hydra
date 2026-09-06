@@ -308,3 +308,85 @@ func TestRawVolumeXMLHasNoBackingStore(t *testing.T) {
 		t.Errorf("cloud-init volume has a backing store: %+v", parsed.BackingSt)
 	}
 }
+
+// The forward mode is the entire reason a Hydra-managed network works, and it
+// is the one property of this document that cannot be inferred from reading it.
+//
+// "nat" is the obvious choice and is wrong: libvirt installs filtering rules for
+// it that accept only RELATED,ESTABLISHED inbound, so the management cluster's
+// controllers cannot open a connection to a workload cluster's API server on it
+// -- the cluster comes up and is then unmanageable. "route" allows inbound but
+// needs the upstream router to know a route back, which is the dependency on
+// someone else's equipment this whole feature exists to remove.
+//
+// "open" installs no rules at all. Nothing else in the test suite would notice
+// if this changed, because every other property of the network would still be
+// correct.
+func TestNetworkXMLIsOpenSoItIsReachableInbound(t *testing.T) {
+	out, err := networkXML(providers.ManagedNetwork{
+		Name:      "hydra-wl0",
+		Subnet:    "192.168.60.0/24",
+		DHCPStart: "192.168.60.100",
+		DHCPEnd:   "192.168.60.200",
+	}, "192.168.60.1", "255.255.255.0")
+	if err != nil {
+		t.Fatalf("networkXML() = %v", err)
+	}
+
+	var parsed networkDef
+	if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("generated network XML does not parse: %v\n%s", err, out)
+	}
+	if parsed.Forward.Mode != "open" {
+		t.Errorf("forward mode = %q, want open; nat blocks inbound connections and route needs an upstream route back",
+			parsed.Forward.Mode)
+	}
+	if parsed.IP.Address != "192.168.60.1" || parsed.IP.Netmask != "255.255.255.0" {
+		t.Errorf("ip = %s/%s, want 192.168.60.1/255.255.255.0", parsed.IP.Address, parsed.IP.Netmask)
+	}
+	if parsed.IP.DHCP == nil {
+		t.Fatal("no DHCP range: machines would get no addresses at all")
+	}
+	// The range is what makes the endpoint safe. Everything inside the subnet
+	// and outside it is the provider's to allocate.
+	if parsed.IP.DHCP.Range.Start != "192.168.60.100" || parsed.IP.DHCP.Range.End != "192.168.60.200" {
+		t.Errorf("dhcp range = %s-%s, want 192.168.60.100-192.168.60.200",
+			parsed.IP.DHCP.Range.Start, parsed.IP.DHCP.Range.End)
+	}
+	// Naming the bridge would mean inventing a virbrN that might already exist.
+	if parsed.Bridge.Name != "" {
+		t.Errorf("bridge name = %q, want it left for libvirt to choose", parsed.Bridge.Name)
+	}
+}
+
+func TestSubnetParts(t *testing.T) {
+	for _, tc := range []struct {
+		cidr, gateway, netmask string
+		wantErr                bool
+	}{
+		{cidr: "192.168.60.0/24", gateway: "192.168.60.1", netmask: "255.255.255.0"},
+		{cidr: "10.10.0.0/16", gateway: "10.10.0.1", netmask: "255.255.0.0"},
+		// No room for a gateway, let alone machines.
+		{cidr: "192.168.60.0/31", wantErr: true},
+		{cidr: "192.168.60.0/32", wantErr: true},
+		{cidr: "not-a-cidr", wantErr: true},
+		// IPv6 is not rejected for being exotic -- the netmask form libvirt wants
+		// here is IPv4-only, so accepting it would render a broken document.
+		{cidr: "fd00::/64", wantErr: true},
+	} {
+		gw, mask, err := subnetParts(tc.cidr)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("subnetParts(%q) = %s/%s, want an error", tc.cidr, gw, mask)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("subnetParts(%q) = %v", tc.cidr, err)
+			continue
+		}
+		if gw != tc.gateway || mask != tc.netmask {
+			t.Errorf("subnetParts(%q) = %s/%s, want %s/%s", tc.cidr, gw, mask, tc.gateway, tc.netmask)
+		}
+	}
+}
