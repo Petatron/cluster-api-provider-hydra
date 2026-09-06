@@ -329,3 +329,92 @@ var _ = Describe("HydraCluster Reconciler", func() {
 		})
 	})
 })
+
+var _ = Describe("managed network endpoint invariant", func() {
+	// The point of declaring a DHCP range is that everything outside it is the
+	// cluster's to allocate. Nothing else enforces that the endpoint actually
+	// honours it: subnet, range and endpoint are three independently valid
+	// fields, and CEL cannot order IP addresses, so a cluster asking for an
+	// endpoint inside its own DHCP range admits cleanly and then hands that
+	// address to the first machine that asks.
+	net := func(mutate func(*infrav1.HydraManagedNetwork)) *infrav1.HydraManagedNetwork {
+		n := &infrav1.HydraManagedNetwork{
+			Name:      testNetName,
+			Subnet:    testSubnet,
+			DHCPStart: testDHCPStart,
+			DHCPEnd:   testDHCPEnd,
+		}
+		if mutate != nil {
+			mutate(n)
+		}
+		return n
+	}
+	with := func(host string, n *infrav1.HydraManagedNetwork) *infrav1.HydraCluster {
+		hc := &infrav1.HydraCluster{}
+		hc.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: host, Port: 6443}
+		hc.Spec.ManagedNetwork = n
+		return hc
+	}
+
+	It("accepts an endpoint below the range", func() {
+		Expect(validateEndpointAgainstManagedNetwork(with("192.168.60.10", net(nil)))).To(Succeed())
+	})
+
+	It("accepts an endpoint above the range", func() {
+		Expect(validateEndpointAgainstManagedNetwork(with("192.168.60.250", net(nil)))).To(Succeed())
+	})
+
+	It("refuses an endpoint inside the DHCP range", func() {
+		err := validateEndpointAgainstManagedNetwork(with("192.168.60.150", net(nil)))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("inside managedNetwork's DHCP range"))
+		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "immutable field, so waiting cannot help")
+	})
+
+	It("refuses the range boundaries themselves", func() {
+		for _, host := range []string{testDHCPStart, testDHCPEnd} {
+			Expect(validateEndpointAgainstManagedNetwork(with(host, net(nil)))).NotTo(Succeed(), host)
+		}
+	})
+
+	// Outside the DHCP range is not the same as usable. These three were never
+	// available, and an endpoint on any of them fails in a way that looks like
+	// the VIP simply not working.
+	It("refuses the gateway, network and broadcast addresses", func() {
+		for host, why := range map[string]string{
+			"192.168.60.0":   "network address",
+			"192.168.60.1":   "gateway",
+			"192.168.60.255": "broadcast address",
+		} {
+			err := validateEndpointAgainstManagedNetwork(with(host, net(nil)))
+			Expect(err).To(HaveOccurred(), "%s is the %s", host, why)
+			Expect(err.Error()).To(ContainSubstring(why))
+		}
+	})
+
+	It("refuses an endpoint outside the subnet entirely", func() {
+		err := validateEndpointAgainstManagedNetwork(with("192.168.15.10", net(nil)))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("not inside managedNetwork.subnet"))
+	})
+
+	// A /30 is accepted by the backend's subnet check, and this is where it
+	// fails for the right reason: gateway plus one host, and that host is inside
+	// any DHCP range, so no endpoint is left.
+	It("leaves a /30 with nowhere to put an endpoint", func() {
+		small := net(func(n *infrav1.HydraManagedNetwork) {
+			n.Subnet = testSmallNet
+			n.DHCPStart = testSmallHost
+			n.DHCPEnd = testSmallHost
+		})
+		Expect(validateEndpointAgainstManagedNetwork(with(testSmallHost, small))).NotTo(Succeed())
+	})
+
+	It("says nothing about a DNS name, which is the operator's to keep", func() {
+		Expect(validateEndpointAgainstManagedNetwork(with("api.hydra.example", net(nil)))).To(Succeed())
+	})
+
+	It("is inert when no managed network is declared", func() {
+		Expect(validateEndpointAgainstManagedNetwork(with("192.168.15.10", nil))).To(Succeed())
+	})
+})

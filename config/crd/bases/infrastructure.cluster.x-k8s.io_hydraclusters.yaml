@@ -140,6 +140,86 @@ spec:
                   rule: '!has(oldSelf.host) || (has(self.host) && self.host == oldSelf.host)'
                 - message: controlPlaneEndpoint.port is immutable once set
                   rule: '!has(oldSelf.port) || (has(self.port) && self.port == oldSelf.port)'
+              managedNetwork:
+                description: |-
+                  managedNetwork asks Hydra to create and own a network for this cluster,
+                  instead of only attaching machines to networks an operator prepared.
+
+                  It exists to solve the control-plane endpoint problem. A
+                  KubeadmControlPlane needs an endpoint that survives replicas coming and
+                  going, so controlPlaneEndpoint must be an address no DHCP server will ever
+                  hand to a machine -- and it is immutable, so a wrong guess is not
+                  repairable. On a bridged site network there is no way to know that: the
+                  addresses a DHCP server has already issued say nothing about the bounds of
+                  its pool, because many allocate by hashing the client ID rather than
+                  counting upward.
+
+                  Declaring one here makes the answer structural. Hydra sets the DHCP range,
+                  so which addresses can be handed to a machine is known rather than guessed
+                  at from someone else's router.
+
+                  "Outside the range" is not the same as "usable", and the difference has
+                  bitten before. The network address, the broadcast address and the gateway
+                  -- libvirt takes the first host address -- all sit outside the range and
+                  none can serve an endpoint. The controller refuses a controlPlaneEndpoint
+                  on any of them, and on anything inside the range, because the field is
+                  immutable and the alternative is a cluster that admits cleanly and then
+                  cannot be reached.
+
+                  Machines receive an interface on this network IN ADDITION to networks
+                  above, not instead of them -- the site network is what gives them internet
+                  access and the address they register as Nodes.
+                properties:
+                  dhcpEnd:
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+                    type: string
+                  dhcpStart:
+                    description: |-
+                      dhcpStart and dhcpEnd bound the addresses handed to machines.
+
+                      The point of stating them is what they LEAVE OUT: a controlPlaneEndpoint
+                      outside this range cannot be handed to a machine, which is the guarantee a
+                      bridged site network cannot give.
+
+                      Outside the range still leaves three addresses that were never available
+                      -- the network address, the broadcast address, and the gateway on the first
+                      host address -- so the usable space is the subnet minus those minus this
+                      range. The controller checks it rather than trusting the arithmetic.
+
+                      Leave room. A range covering the whole subnet is accepted, because
+                      refusing it would be second-guessing an operator who has some other plan
+                      for the endpoint, but it gives Hydra nothing to allocate from.
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+                    type: string
+                  name:
+                    description: |-
+                      name is the network's name on the hypervisor.
+
+                      Hydra creates it if it is absent and verifies it if it is not, so naming an
+                      existing network adopts it -- which is why the checks are strict about the
+                      subnet and range matching rather than reconfiguring what it finds.
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  subnet:
+                    description: |-
+                      subnet is the address range of the network, in CIDR form.
+
+                      Hydra takes the first address for the gateway, the way libvirt's own
+                      networks do.
+                    pattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[12][0-9]|3[0-2])$
+                    type: string
+                required:
+                - dhcpEnd
+                - dhcpStart
+                - name
+                - subnet
+                type: object
+                x-kubernetes-validations:
+                - message: managedNetwork is immutable; machines are attached to it
+                    for their whole lives
+                  rule: self == oldSelf
               networks:
                 description: |-
                   networks are the network attachments machines in this cluster receive when
@@ -215,6 +295,11 @@ spec:
                 it selects the manager's pool, which is equally binding
               rule: has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool)
                 || self.storagePool == oldSelf.storagePool)
+            - message: managedNetwork cannot be added or removed after the cluster
+                is created; machines keep the attachments they were built with, so
+                either change leaves the control-plane endpoint on a network only
+                part of the cluster is attached to
+              rule: has(self.managedNetwork) == has(oldSelf.managedNetwork)
           status:
             description: status defines the observed state of HydraCluster
             properties:

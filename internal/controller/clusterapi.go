@@ -361,7 +361,7 @@ func clusterReadyForCreate(link *linkage) error {
 	// would protect only the first machine ever created, and every machine after
 	// a regression would sail through and fail one at a time inside Create --
 	// which is precisely the late, repeated, per-machine confusion that
-	// CheckInfrastructure exists to replace.
+	// EnsureInfrastructure exists to replace.
 	if link.hydraCluster != nil {
 		ready := apimeta.FindStatusCondition(link.hydraCluster.Status.Conditions, infrav1.ClusterReadyCondition)
 		switch {

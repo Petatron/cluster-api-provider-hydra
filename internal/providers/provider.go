@@ -91,6 +91,29 @@ type Network struct {
 	Name string
 }
 
+// ManagedNetwork is a network the provider creates and owns, rather than one an
+// operator prepared and the provider merely attaches to.
+//
+// It exists so a cluster's control-plane endpoint can come from a range the
+// provider controls. On a network someone else runs there is no way to know
+// which addresses its DHCP server may hand out -- the ones it has already
+// issued say nothing about the bounds of its pool -- and the endpoint is
+// immutable, so guessing wrong is not repairable. Setting the range makes every
+// address outside it free by construction.
+//
+// A backend with no notion of this may reject it; none is required to invent one.
+type ManagedNetwork struct {
+	Name string
+
+	// Subnet in CIDR form. The first address is the gateway.
+	Subnet string
+
+	// DHCPStart and DHCPEnd bound what machines may be given. What they leave
+	// out is the point: that is the space the endpoint comes from.
+	DHCPStart string
+	DHCPEnd   string
+}
+
 // InfrastructureSpec describes the cluster-scoped prerequisites a backend needs
 // in place before any machine can be created.
 //
@@ -106,6 +129,12 @@ type InfrastructureSpec struct {
 	// Image is the base image machines will be cloned from. A zero value means
 	// the backend's own default.
 	Image Image
+
+	// ManagedNetwork, when set, is created if absent and verified if present --
+	// the same shape as the checks above it, and for the same reason: an absence
+	// that would fail every machine identically belongs on the cluster, reported
+	// once.
+	ManagedNetwork *ManagedNetwork
 }
 
 // MachineSpec is the backend-neutral description of a machine to create.
@@ -130,6 +159,13 @@ type MachineSpec struct {
 
 	Image    Image
 	Networks []Network
+
+	// ManagedNetwork, when set, gets an interface on this machine IN ADDITION to
+	// Networks, not instead of them. The site network is what gives a machine
+	// internet access and the address it registers with; this one carries the
+	// cluster's endpoint. A machine attached only to the managed network could
+	// not install anything at boot.
+	ManagedNetwork *ManagedNetwork
 
 	// StoragePool is where this machine's disks are created, and where its base
 	// image is expected to be found. Empty means the backend's own default.
@@ -237,17 +273,25 @@ type MachineProvider interface {
 	// and the second attempt finding nothing is success, not failure.
 	Delete(ctx context.Context, id string) error
 
-	// CheckInfrastructure verifies the cluster-scoped prerequisites in spec.
+	// EnsureInfrastructure makes the cluster-scoped prerequisites in spec usable,
+	// and reports whether machines could now be created against them.
 	//
-	// Returns nil when machines could be created against them. Wraps ErrTerminal
-	// when they are absent or misconfigured, and an unwrapped error when the
-	// backend simply could not be reached -- the same distinction Create draws,
-	// and for the same reason: only the first should invite intervention.
+	// Wraps ErrTerminal when they are absent or misconfigured, and an unwrapped
+	// error when the backend simply could not be reached -- the same distinction
+	// Create draws, and for the same reason: only the first should invite
+	// intervention.
 	//
-	// Implementations must not create anything. Provisioning cluster
-	// infrastructure on someone's host is a separate decision from consuming it,
-	// and this method is the consuming half.
-	CheckInfrastructure(ctx context.Context, spec InfrastructureSpec) error
+	// The line this draws is ownership, not action. An implementation MAY create
+	// what the cluster explicitly asked it to own -- ManagedNetwork is the only
+	// such field today -- and MUST NOT create, reconfigure or remove anything
+	// else. A storage pool and a base image are the operator's; finding them
+	// absent is reported, never fixed.
+	//
+	// It was called CheckInfrastructure, and said implementations must create
+	// nothing. That was true until a cluster could declare a network it wanted
+	// Hydra to own, and a name promising a pure check while the libvirt backend
+	// defined networks was worse than either behaviour.
+	EnsureInfrastructure(ctx context.Context, spec InfrastructureSpec) error
 
 	// DeleteByName removes the machine and any partial resources keyed by the
 	// idempotency name -- including a clone volume whose domain was never

@@ -39,6 +39,13 @@ const (
 	// diskTypeFile is the only disk type this provider emits. See domainXML for
 	// why the pool/volume alternative is not an option.
 	diskTypeFile = "file"
+
+	// netForwardOpen is the forward mode Hydra's managed networks must have, on
+	// creation and on adoption alike. See networkXML: the other modes either
+	// block the inbound connections the management cluster makes to a workload
+	// cluster's API server, or need a route back that only the site's own router
+	// can provide.
+	netForwardOpen = "open"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -172,6 +179,75 @@ type volFormatDef struct {
 type volBackingDef struct {
 	Path   string       `xml:"path"`
 	Format volFormatDef `xml:"format"`
+}
+
+// networkDef is a libvirt network Hydra creates and owns.
+type networkDef struct {
+	XMLName xml.Name      `xml:"network"`
+	Name    string        `xml:"name"`
+	Forward netForwardDef `xml:"forward"`
+	Bridge  netBridgeDef  `xml:"bridge"`
+	IP      netIPDef      `xml:"ip"`
+}
+
+type netForwardDef struct {
+	Mode string `xml:"mode,attr"`
+}
+
+type netBridgeDef struct {
+	// Left for libvirt to fill in. Naming it would mean inventing a virbrN that
+	// might already exist, and nothing needs to predict it -- the provider reads
+	// the name back off the network when it attaches a machine.
+	Name string `xml:"name,attr,omitempty"`
+	STP  string `xml:"stp,attr,omitempty"`
+}
+
+type netIPDef struct {
+	Address string      `xml:"address,attr"`
+	Netmask string      `xml:"netmask,attr"`
+	DHCP    *netDHCPDef `xml:"dhcp,omitempty"`
+}
+
+type netDHCPDef struct {
+	Range netRangeDef `xml:"range"`
+}
+
+type netRangeDef struct {
+	Start string `xml:"start,attr"`
+	End   string `xml:"end,attr"`
+}
+
+// networkXML renders a network definition for a cluster's managed network.
+//
+// forward mode is "open", and that choice is the whole reason this works.
+//
+// A "nat" network is the obvious pick and is wrong here: libvirt installs
+// filtering rules for it that accept only RELATED,ESTABLISHED traffic inbound,
+// so the management cluster's controllers cannot open a connection to a
+// workload cluster's API server on it. "route" allows that but needs the
+// upstream router to know a route back, which is exactly the dependency on
+// someone else's network equipment this whole feature removes.
+//
+// "open" installs no filtering rules at all and leaves the host's ordinary
+// forwarding in charge, which is what makes the network reachable inbound
+// without any hand-maintained firewall state. Machines still reach the internet
+// through their site-network interface, so nothing here needs to provide NAT.
+func networkXML(spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
+	n := networkDef{
+		Name:    spec.Name,
+		Forward: netForwardDef{Mode: netForwardOpen},
+		Bridge:  netBridgeDef{STP: "on"},
+		IP: netIPDef{
+			Address: gateway,
+			Netmask: netmask,
+			DHCP:    &netDHCPDef{Range: netRangeDef{Start: spec.DHCPStart, End: spec.DHCPEnd}},
+		},
+	}
+	out, err := xml.Marshal(n)
+	if err != nil {
+		return "", fmt.Errorf("libvirt: rendering network %q: %w", spec.Name, err)
+	}
+	return string(out), nil
 }
 
 // domainXML renders the libvirt domain definition for a machine.
