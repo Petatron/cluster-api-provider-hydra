@@ -77,16 +77,23 @@ var (
 
 	// MachineFailureTotal counts reconciles that ended in an error.
 	//
-	// stage says where, reason says why, and terminal says whether retrying can
-	// help -- the last being the one an operator most needs, since it is the
-	// difference between waiting and intervening.
+	// stage says where it happened; cause says what kind of failure it was, in
+	// the same vocabulary ProviderOperationDuration uses, so the two can be read
+	// against each other.
+	//
+	// An earlier version carried reason and terminal alongside stage. That was
+	// three labels holding two facts: reason was always "<stage>Failed" or
+	// "<stage>FailedRetrying", so it was fully determined by the other two and
+	// explained nothing on its own. cause is the dimension that actually varies
+	// independently -- whether the backend refused, could not be reached, or
+	// reported the thing missing -- and terminality is recoverable from it.
 	MachineFailureTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "machine_failure_total",
-			Help:      "Reconciles that ended in an error, by stage, reason and whether the error is terminal.",
+			Help:      "Reconciles that ended in an error, by stage and cause.",
 		},
-		[]string{"stage", "reason", "terminal"},
+		[]string{"stage", "cause"},
 	)
 )
 

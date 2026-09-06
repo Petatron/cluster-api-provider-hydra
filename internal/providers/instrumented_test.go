@@ -21,13 +21,20 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/Petatron/cluster-api-provider-hydra/internal/metrics"
 )
 
 // The outcome label is the whole reason this decorator earns its place. A graph
 // that cannot separate "the hypervisor refused" from "the hypervisor was not
 // reachable" cannot tell a misconfigured cluster from a flaky one, which is the
 // question an operator is actually asking.
-func TestOutcomeOf(t *testing.T) {
+func TestClassifyOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -43,8 +50,8 @@ func TestOutcomeOf(t *testing.T) {
 		// Terminal wins when both are present: it is the actionable half.
 		{"terminal wrapping not-found", fmt.Errorf("%w: %w", ErrTerminal, ErrNotFound), outcomeTerminal},
 	} {
-		if got := outcomeOf(tc.err); got != tc.want {
-			t.Errorf("outcomeOf(%s) = %q, want %q", tc.name, got, tc.want)
+		if got := ClassifyOutcome(tc.err); got != tc.want {
+			t.Errorf("ClassifyOutcome(%s) = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -67,6 +74,33 @@ func TestInstrumentedPassesResultsThrough(t *testing.T) {
 	backend.err = wantErr
 	if _, err := p.Get(t.Context(), "abc"); !errors.Is(err, wantErr) {
 		t.Errorf("Get() = %v, want the backend's error unchanged", err)
+	}
+}
+
+// The dial is the operation most likely to hang -- an unreachable hypervisor
+// consumes the whole timeout -- and it happens inside the constructor, before
+// there is a provider to wrap. Without this it would be the only operation
+// producing no sample at all, which is exactly the case the metric exists for.
+func TestObserveDialRecordsASample(t *testing.T) {
+	before := testutil.CollectAndCount(metrics.ProviderOperationDuration)
+
+	ObserveDial(time.Now(), errors.New("dial unix: connection refused"))
+
+	if after := testutil.CollectAndCount(metrics.ProviderOperationDuration); after <= before {
+		t.Fatalf("series count %d -> %d; the dial recorded nothing", before, after)
+	}
+	// Labelled as a failed reach, not as a refusal: an unreachable hypervisor is
+	// the thing an operator waits out, not the thing they go and fix.
+	obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues("Dial", outcomeError)
+	if err != nil {
+		t.Fatalf("no Dial/%s series: %v", outcomeError, err)
+	}
+	var m dto.Metric
+	if err := obs.(prometheus.Metric).Write(&m); err != nil {
+		t.Fatalf("reading the histogram: %v", err)
+	}
+	if got := m.GetHistogram().GetSampleCount(); got != 1 {
+		t.Errorf("Dial/%s sample count = %d, want 1", outcomeError, got)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"flag"
 	"os"
 	"sync"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -258,7 +259,13 @@ func main() {
 		if machineProvider != nil {
 			return machineProvider, nil
 		}
+		// Timed here rather than in the decorator, because the dial and handshake
+		// happen inside the constructor -- before there is a provider to wrap.
+		// An unreachable hypervisor consumes the whole dial timeout, and without
+		// this that would be the one operation producing no sample at all.
+		dialStart := time.Now()
 		p, err := libvirtprovider.New(ctx, libvirtCfg)
+		providers.ObserveDial(dialStart, err)
 		if err != nil {
 			// Deliberately not cached. A hypervisor that was down at first
 			// reconcile is retried, not remembered as broken.

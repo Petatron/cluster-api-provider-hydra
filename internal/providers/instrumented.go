@@ -56,14 +56,19 @@ const (
 	outcomeError    = "error"
 )
 
-// outcomeOf classifies an error the way the rest of the provider does.
+// ClassifyOutcome describes an error in the vocabulary the provider's metrics
+// use.
 //
-// The split is deliberate and is the point of the label: "terminal" is a
-// backend that refused and will refuse again, "error" is a backend that could
-// not be reached and may work in a moment. Collapsing them would produce a
-// graph that cannot distinguish a misconfigured cluster from a flaky
-// hypervisor.
-func outcomeOf(err error) string {
+// Exported because two different metrics need it -- backend operations here and
+// machine failures in the controller -- and two independent classifications
+// would eventually disagree about what "terminal" means, leaving a dashboard
+// that reads one label against the other.
+//
+// The split is the point: "terminal" is a backend that refused and will refuse
+// again, "error" is a backend that could not be reached and may work in a
+// moment. Collapsing them would produce a graph that cannot distinguish a
+// misconfigured cluster from a flaky hypervisor.
+func ClassifyOutcome(err error) string {
 	switch {
 	case err == nil:
 		return outcomeSuccess
@@ -79,9 +84,23 @@ func outcomeOf(err error) string {
 	}
 }
 
+// ObserveDial records establishing a connection to the backend.
+//
+// It exists because that happens before a provider exists to be wrapped: the
+// dial and handshake are inside the constructor, so without this the one
+// operation most likely to hang -- an unreachable hypervisor, consuming the
+// whole dial timeout -- would be the only one producing no sample at all, and
+// the first slow reconcile could not be attributed to it.
+//
+// Narrowly named on purpose. A general exported observe() would become the
+// escape hatch through which unbounded labels arrive.
+func ObserveDial(start time.Time, err error) {
+	observe("Dial", start, err)
+}
+
 func observe(operation string, start time.Time, err error) {
 	metrics.ProviderOperationDuration.
-		WithLabelValues(operation, outcomeOf(err)).
+		WithLabelValues(operation, ClassifyOutcome(err)).
 		Observe(time.Since(start).Seconds())
 }
 

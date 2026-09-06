@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -632,11 +631,13 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 		reason = phase + "FailedRetrying"
 	}
 
-	// terminal is its own label rather than being folded into reason, because it
-	// is the question an operator actually asks of a failure graph: is this
-	// something that will clear, or something waiting on me?
+	// The cause, not the reason. reason is "<phase>Failed" or
+	// "<phase>FailedRetrying", which is exactly phase plus terminality -- it
+	// would have been a third label carrying no information the other two did
+	// not already hold. Classified through the providers package so this and the
+	// backend operation metric describe a failure the same way.
 	metrics.MachineFailureTotal.
-		WithLabelValues(phase, reason, strconv.FormatBool(terminal)).
+		WithLabelValues(phase, providers.ClassifyOutcome(cause)).
 		Inc()
 
 	patch := client.MergeFrom(machine.DeepCopy())
