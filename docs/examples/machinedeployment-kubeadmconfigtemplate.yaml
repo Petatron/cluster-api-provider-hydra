@@ -1,0 +1,125 @@
+# Workers for a cluster Hydra built, via a KubeadmConfigTemplate.
+#
+# Verified end to end on real hardware (PET-17), exactly as written here: two
+# worker VMs created through libvirt, CABPK generating a bootstrap Secret per
+# machine, both Nodes Ready with providerIDs matching their Machines, and the
+# MachineDeployment reporting readyReplicas 2/2.
+#
+# This is the normal bootstrap path, and the counterpart to
+# machinedeployment-adopted-cluster.yaml in this directory. Prefer this one.
+# That file exists for a cluster Cluster API did not build, where CABPK refuses
+# to generate a join because nothing sets the Cluster's ControlPlaneInitialized
+# condition -- so it supplies bootstrap data directly instead. On a cluster
+# built by a KubeadmControlPlane that restriction is gone, and configRef works.
+#
+# LAB-SPECIFIC VALUES -- change these for another site:
+#   clusterName        the Cluster these workers join
+#   the package versions pinned in preKubeadmCommands, to match the control
+#   plane's Kubernetes version
+#
+# Note what is NOT here: --node-ip. Control-plane machines need it because
+# kube-vip puts a second, floating address on the leader's NIC and the kubelet
+# would register that as the node's own identity. A worker runs no kube-vip and
+# has one address, so the kubelet's own choice is correct.
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  name: hydra-wl0-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      vcpus: 2
+      memory: 4Gi
+      diskSize: 40Gi
+      # image and networks inherited from HydraCluster/hydra-wl0.
+      # Deliberately NOT annotated standalone: Cluster API owns every machine
+      # stamped from this template, so each must wait for its bootstrap data.
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfigTemplate
+metadata:
+  name: hydra-wl0-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      files:
+        # kubeadm's preflight refuses to join without these, exactly as it
+        # refuses to init without them. `sysctl --system` applies whatever is
+        # on disk; nothing else puts these there.
+        - path: /etc/modules-load.d/k8s.conf
+          owner: root:root
+          permissions: "0644"
+          content: |
+            overlay
+            br_netfilter
+        - path: /etc/sysctl.d/k8s.conf
+          owner: root:root
+          permissions: "0644"
+          content: |
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward                 = 1
+      joinConfiguration:
+        nodeRegistration:
+          # The node name is left implicit so it comes from the hostname, which
+          # the provider writes into this machine's cidata meta-data. Setting it
+          # here would let the two disagree.
+          criSocket: unix:///run/containerd/containerd.sock
+      preKubeadmCommands:
+        # No --node-ip here, unlike the control plane. That flag exists only
+        # because kube-vip puts a second, floating address on the leader's NIC
+        # and the kubelet would register it. Workers run no kube-vip and have
+        # exactly one address, so the kubelet's own choice is correct.
+        - |
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            > /etc/default/kubelet
+        - modprobe overlay
+        - modprobe br_netfilter
+        - sysctl --system
+        - DEBIAN_FRONTEND=noninteractive apt-get update
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y containerd apt-transport-https ca-certificates curl gpg qemu-guest-agent
+        - systemctl enable --now qemu-guest-agent
+        - mkdir -p /etc/containerd
+        - containerd config default > /etc/containerd/config.toml
+        - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        - systemctl restart containerd
+        - mkdir -p /etc/apt/keyrings
+        - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+        - DEBIAN_FRONTEND=noninteractive apt-get update
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=1.35.3-* kubeadm=1.35.3-*
+        - apt-mark hold kubelet kubeadm
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: hydra-wl0-md-0
+  namespace: default
+spec:
+  clusterName: hydra-wl0
+  replicas: 2
+  selector:
+    matchLabels:
+      hydra.md: hydra-wl0-md-0
+  template:
+    metadata:
+      labels:
+        hydra.md: hydra-wl0-md-0
+        cluster.x-k8s.io/cluster-name: hydra-wl0
+    spec:
+      clusterName: hydra-wl0
+      version: v1.35.3
+      bootstrap:
+        # configRef, not dataSecretName. This is the normal path, and the one
+        # PET-37 could not ship an example for.
+        configRef:
+          apiGroup: bootstrap.cluster.x-k8s.io
+          kind: KubeadmConfigTemplate
+          name: hydra-wl0-md-0
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: hydra-wl0-md-0
