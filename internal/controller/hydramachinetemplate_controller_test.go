@@ -24,9 +24,11 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -158,6 +160,93 @@ var _ = Describe("HydraMachineTemplate Reconciler", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(reload(r).Status.NodeInfo.Architecture).To(Equal(infrav1.HydraNodeArchitectureARM64))
+	})
+
+	// Honoured exactly as the machine and cluster reconcilers honour it. The
+	// reason is not only consistency: clusterctl move pauses a Cluster so that no
+	// controller writes to its objects mid-migration, and a status write is a
+	// write. Skipping costs nothing, because an immutable spec means whatever was
+	// already published is still correct.
+	It("publishes nothing while the template itself is paused", func() {
+		tmpl.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+
+		r := build(libvirtprovider.NodePlatform())
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(requeueTemplatePaused))
+
+		out := reload(r)
+		Expect(out.Status.Capacity).To(BeEmpty())
+		cond := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachineTemplatePausedCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Message).To(ContainSubstring(clusterv1.PausedAnnotation))
+	})
+
+	// The owner reference is really there -- Cluster API sets a Cluster owner on
+	// infrastructure machine templates -- so this is the signal clusterctl move
+	// actually uses, not a hypothetical one.
+	It("publishes nothing while the owning Cluster is paused", func() {
+		paused := true
+		cluster := &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      linkClusterName,
+				Namespace: linkNamespace,
+				UID:       types.UID("uid-cluster"),
+			},
+			Spec: clusterv1.ClusterSpec{Paused: &paused},
+		}
+		tmpl.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       clusterKind,
+			Name:       linkClusterName,
+			UID:        types.UID("uid-cluster"),
+		}}
+
+		s := linkScheme()
+		c := fakeclient.NewClientBuilder().
+			WithScheme(s).
+			WithObjects(tmpl, cluster).
+			WithStatusSubresource(&infrav1.HydraMachineTemplate{}).
+			Build()
+		r := &HydraMachineTemplateReconciler{Client: c, Scheme: s, Platform: libvirtprovider.NodePlatform()}
+
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(requeueTemplatePaused))
+
+		out := reload(r)
+		Expect(out.Status.Capacity).To(BeEmpty())
+		cond := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachineTemplatePausedCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Message).To(ContainSubstring(linkClusterName))
+	})
+
+	// Un-pausing the owning Cluster changes an object this controller does not
+	// watch, which is the whole reason the paused path requeues. Without that,
+	// a template unpaused this way would stay unpublished indefinitely.
+	It("publishes once the pause is lifted", func() {
+		tmpl.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+
+		r := build(libvirtprovider.NodePlatform())
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reload(r).Status.Capacity).To(BeEmpty())
+
+		live := reload(r)
+		live.Annotations = nil
+		Expect(r.Update(ctx, live)).To(Succeed())
+
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		out := reload(r)
+		Expect(out.Status.Capacity).To(HaveKey(corev1.ResourceCPU))
+		cond := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachineTemplatePausedCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 	})
 
 	It("does not touch a template being deleted", func() {

@@ -47,12 +47,17 @@ is not this project's to name:
 
 ```sh
 kubectl create clusterrolebinding hydra-autoscaler-templates \
-  --clusterrole=hydramachinetemplate-autoscaler-role \
+  --clusterrole=cluster-api-provider-hydra-hydramachinetemplate-autoscaler-role \
   --serviceaccount=<namespace>:<autoscaler service account>
 ```
 
-Miss this and the autoscaler logs the RBAC failure only at `-v=4`, then skips
-the node group. At default verbosity a pool it cannot read and a pool with
+That is the **rendered** name, not the one in the file: `config/default` applies
+`namePrefix: cluster-api-provider-hydra-`. Binding the unprefixed name fails
+with "ClusterRole not found". `kubectl get clusterrole | grep autoscaler-role`
+confirms what you actually have.
+
+Miss the binding and the autoscaler logs the RBAC failure only at `-v=4`, then
+skips the node group. At default verbosity a pool it cannot read and a pool with
 nothing to scale look identical.
 
 ## Precedence

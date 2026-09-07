@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -30,6 +31,13 @@ import (
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
+
+// requeueTemplatePaused is how often a paused template is re-checked.
+//
+// Only reached while paused. Un-pausing the owning Cluster changes an object
+// this controller does not watch, so without a re-check its templates would
+// stay unpublished indefinitely.
+const requeueTemplatePaused = 1 * time.Minute
 
 // HydraMachineTemplateReconciler reconciles a HydraMachineTemplate object.
 //
@@ -56,6 +64,7 @@ type HydraMachineTemplateReconciler struct {
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachinetemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachinetemplates/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 
 // Reconcile publishes a HydraMachineTemplate's capacity and node platform.
 func (r *HydraMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -73,10 +82,31 @@ func (r *HydraMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, nil
 	}
 
-	// The Cluster API paused annotation is deliberately not honoured. Pausing
-	// exists to stop a controller acting on infrastructure while an operator
-	// works on it; this one only restates immutable spec fields, so suspending it
-	// would withdraw capacity from the autoscaler while protecting nothing.
+	// Pausing is honoured here exactly as it is on the machine and cluster
+	// reconcilers, and the earlier argument for exempting this one was wrong on
+	// both halves: skipping a reconcile does not withdraw capacity -- status keeps
+	// whatever it already published -- and pause is not only for protecting
+	// infrastructure. clusterctl move pauses a Cluster precisely so that no
+	// controller writes to objects mid-migration, and a status write is a write.
+	cluster, err := ownerClusterOf(ctx, r.Client, template)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if reason := pausedReason(template.Annotations, cluster); reason != "" {
+		log.V(1).Info("Reconciliation is paused", "name", template.Name, "reason", reason)
+		if err := r.setPaused(ctx, template, reason); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Requeue only while paused, and only because of the Cluster-level signal:
+		// a change to this object's own annotation already enqueues it through the
+		// primary watch, but nothing here watches Clusters, so un-pausing one would
+		// otherwise leave its templates unpublished forever. The polling stops the
+		// moment the object is not paused, since that path requeues nothing.
+		return ctrl.Result{RequeueAfter: requeueTemplatePaused}, nil
+	}
+	if err := r.setPaused(ctx, template, ""); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	capacity := capacityFor(template)
 	nodeInfo := infrav1.HydraNodeInfo{
@@ -168,6 +198,18 @@ func capacityEqual(a, b infrav1.HydraNodeCapacity) bool {
 		}
 	}
 	return true
+}
+
+// setPaused surfaces whether reconciliation is suspended, and why.
+//
+// Mirrors the cluster and machine reconcilers rather than leaving an empty
+// status to be interpreted. A paused template that has never published capacity
+// is otherwise indistinguishable from a pool the autoscaler simply will not
+// scale, since the autoscaler skips an unsized node group without logging at
+// default verbosity.
+func (r *HydraMachineTemplateReconciler) setPaused(ctx context.Context, template *infrav1.HydraMachineTemplate, reason string) error {
+	return setPausedCondition(ctx, r.Client, template, &template.Status.Conditions,
+		infrav1.MachineTemplatePausedCondition, reason)
 }
 
 // SetupWithManager sets up the controller with the Manager.

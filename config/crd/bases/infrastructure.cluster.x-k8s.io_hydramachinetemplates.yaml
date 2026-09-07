@@ -297,9 +297,10 @@ spec:
                   offers rather than a prediction of it. The autoscaler simulates a node whose
                   allocatable equals capacity; a real node is lower both because the guest
                   sees less RAM and disk than the machine was given and because the kubelet
-                  holds back its eviction thresholds. Measured at 6.8% for memory and 15.2%
-                  for ephemeral storage -- see docs/scale-from-zero.md, which also covers the
-                  annotations that override this per pool.
+                  holds back its eviction thresholds. Measured against a live 2 vCPU / 4Gi /
+                  40Gi Ubuntu 24.04 node at 6.8% over allocatable memory and 15.2% over
+                  allocatable ephemeral storage -- docs/scale-from-zero.md carries the full
+                  figures and the annotations that override this per pool.
 
                   Every value must be a JSON string. The autoscaler reads this map with
                   unstructured.NestedStringMap, which fails whole rather than per-key: a

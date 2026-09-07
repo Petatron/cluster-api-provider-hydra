@@ -8,8 +8,14 @@
 # is the operator's to make:
 #
 #   kubectl create clusterrolebinding hydra-autoscaler-templates \
-#     --clusterrole=hydramachinetemplate-autoscaler-role \
+#     --clusterrole=cluster-api-provider-hydra-hydramachinetemplate-autoscaler-role \
 #     --serviceaccount=<namespace>:<autoscaler service account>
+#
+# The name above is the RENDERED one, not the one in this file: config/default
+# applies namePrefix: cluster-api-provider-hydra-, so binding the unprefixed
+# name fails with "ClusterRole not found" after make deploy. Confirm with
+#
+#   kubectl get clusterrole | grep autoscaler-role
 #
 # Without it the autoscaler logs an RBAC failure at -v=4 and then skips the node
 # group, so a pool that will not scale from zero and a pool the autoscaler cannot
