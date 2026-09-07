@@ -111,14 +111,21 @@ func (r *HydraMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl
 // capacityFor derives the capacity of the node a machine from this template
 // becomes.
 //
-// These are raw machine sizes, matching what the resulting Node will report as
-// status.capacity -- not what it will report as allocatable, which is lower by
-// the kubelet's reserved and eviction amounts. Cluster Autoscaler simulates a
-// node whose allocatable equals capacity, so it models marginally more
-// schedulable space than exists. Reporting reduced figures instead would trade a
-// documented overestimate for a field that matches neither the Node's capacity
-// nor its allocatable; docs/scale-from-zero.md carries the measured gap and the
-// annotation override that corrects it.
+// These are raw machine sizes, and they are an UPPER BOUND on the node rather
+// than a prediction of it. Cluster Autoscaler simulates a node whose allocatable
+// equals capacity, and measured on hardware a 4Gi/40Gi machine yields a node
+// with 6.8% less allocatable memory and 15.2% less allocatable ephemeral storage
+// than published here. Two losses stack: the guest kernel does not see all the
+// RAM it was given and the root filesystem is smaller than the raw disk (~4-6%,
+// before the kubelet is involved), then the eviction thresholds take 100Mi and
+// 10% on top.
+//
+// Raw is still what gets published, because the first loss is a property of the
+// guest image and its kernel and this provider cannot know it. A hardcoded
+// reduction would be correct for one image at one disk size and wrong for the
+// next -- a guess wearing the costume of a measurement. The capacity annotations
+// are the per-pool correction, where the image IS known.
+// docs/scale-from-zero.md carries the measurements.
 //
 // maxPods is not reported. The autoscaler overwrites the pods entry
 // unconditionally, from its own annotation or its default of 110, so a value

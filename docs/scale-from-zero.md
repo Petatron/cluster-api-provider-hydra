@@ -97,27 +97,46 @@ The one exception is indirect: `status.nodeInfo` becomes the simulated node's
 `kubernetes.io/arch` and `kubernetes.io/os` labels. Everything else belongs on
 the MachineDeployment.
 
-### Published capacity is capacity, not allocatable
+### Published capacity is an upper bound, and the gap is bigger than it looks
 
-The autoscaler builds its simulated node with `Allocatable = Capacity`. A real
-node reports allocatable *below* capacity, so the simulation models slightly
-more schedulable room than the machine will actually offer.
+The autoscaler builds its simulated node with `Allocatable = Capacity`, so
+whatever is published here is what it believes is schedulable. A real node
+offers less, and by more than the kubelet's reservations alone.
 
-Hydra publishes raw machine sizing, which is what the resulting `Node` reports
-as `status.capacity`. Publishing pre-reduced numbers instead would produce a
-field matching neither the node's capacity nor its allocatable, and every other
-Cluster API provider publishes raw sizing too.
+Measured on `hydra-wl0` against a worker built from a 2 vCPU / 4Gi / 40Gi
+`HydraMachineTemplate` — Ubuntu 24.04, kubeadm defaults, no `kube-reserved` or
+`system-reserved`:
 
-The gap on a kubeadm node with no `kube-reserved` or `system-reserved` — the
-default — is the eviction threshold: about 100Mi of memory, and 10% of the
-filesystem for ephemeral storage. `ephemeral-storage` is further over, because
-the node's figure is the filesystem holding `/var/lib/kubelet` rather than the
-raw disk, which loses the partition table, `/boot` and filesystem metadata.
+| | published | node capacity | node allocatable | published is over allocatable by |
+| --- | --- | --- | --- | --- |
+| `cpu` | `2` | `2` | `2` | — exact |
+| `memory` | `4Gi` | 4010004Ki | 3907604Ki | **6.8%** |
+| `ephemeral-storage` | `40Gi` | 39535100Ki | ~35581590Ki | **15.2%** |
 
-It matters in one case: a pod requesting nearly a whole node cannot fit the node
-the autoscaler simulated, so the scale-up happens and does not help. If a pool
-runs pods sized that close to the machine, publish corrected figures with the
-capacity annotations.
+Two separate losses stack, and only the second is the kubelet's:
+
+1. **The node's own capacity is already below the machine's size.** The guest
+   kernel does not see all the RAM it was given — about 180Mi goes to kernel and
+   firmware reservations — and the root filesystem is about 2.3Gi smaller than
+   the raw disk once the partition table, `/boot` and filesystem metadata are
+   taken. So published capacity is *not* equal to `Node.status.capacity`; it is
+   4.4% and 5.7% above it respectively.
+2. **Allocatable is below that by the eviction thresholds**, exactly as
+   configured: `memory.available<100Mi` and `nodefs.available<10%`. Both were
+   confirmed to the byte.
+
+Hydra publishes raw sizing anyway, because the first loss is a property of the
+guest image and its kernel, which the provider does not and cannot know. A
+hardcoded reduction would be right for this image at this disk size and wrong
+for the next one — a guess wearing the costume of a measurement. Raw sizing is
+also what every other Cluster API provider publishes.
+
+**When it matters:** a pod whose requests come within ~7% of the machine's
+memory, or ~15% of its disk, is simulated as fitting and then does not fit. The
+autoscaler adds a node and the pod stays `Pending`, which looks like the
+autoscaler being broken. For a pool that runs pods sized that close, publish
+corrected figures with the capacity annotations — they override this field
+entirely, and they are per-pool, where the image is known.
 
 ### GPUs are representable, but Hydra publishes none
 
