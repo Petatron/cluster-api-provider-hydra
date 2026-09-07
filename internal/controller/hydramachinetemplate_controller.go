@@ -19,25 +19,20 @@ package controller
 import (
 	"context"
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
-
-// requeueTemplatePaused is how often a paused template is re-checked.
-//
-// Only reached while paused. Un-pausing the owning Cluster changes an object
-// this controller does not watch, so without a re-check its templates would
-// stay unpublished indefinitely.
-const requeueTemplatePaused = 1 * time.Minute
 
 // HydraMachineTemplateReconciler reconciles a HydraMachineTemplate object.
 //
@@ -97,12 +92,7 @@ func (r *HydraMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl
 		if err := r.setPaused(ctx, template, reason); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Requeue only while paused, and only because of the Cluster-level signal:
-		// a change to this object's own annotation already enqueues it through the
-		// primary watch, but nothing here watches Clusters, so un-pausing one would
-		// otherwise leave its templates unpublished forever. The polling stops the
-		// moment the object is not paused, since that path requeues nothing.
-		return ctrl.Result{RequeueAfter: requeueTemplatePaused}, nil
+		return ctrl.Result{}, nil
 	}
 	if err := r.setPaused(ctx, template, ""); err != nil {
 		return ctrl.Result{}, err
@@ -212,10 +202,40 @@ func (r *HydraMachineTemplateReconciler) setPaused(ctx context.Context, template
 		infrav1.MachineTemplatePausedCondition, reason)
 }
 
+// clusterToHydraMachineTemplates enqueues templates owned by a changed Cluster,
+// so both pause transitions are observed even when a template is otherwise idle.
+func (r *HydraMachineTemplateReconciler) clusterToHydraMachineTemplates(ctx context.Context, obj client.Object) []reconcile.Request {
+	cluster, ok := obj.(*clusterv1.Cluster)
+	if !ok {
+		return nil
+	}
+	templates := &infrav1.HydraMachineTemplateList{}
+	if err := r.List(ctx, templates, client.InNamespace(cluster.Namespace)); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list HydraMachineTemplates for a Cluster event", "cluster", cluster.Name)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(templates.Items))
+	for i := range templates.Items {
+		template := &templates.Items[i]
+		// Match ownerClusterOf, including its protection against name reuse.
+		// Templates need not carry the cluster-name label or a controller owner.
+		ref := ownerRefOfKind(template.OwnerReferences, clusterKind)
+		if ref == nil || ref.Name != cluster.Name || (ref.UID != "" && ref.UID != cluster.UID) {
+			continue
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(template)})
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *HydraMachineTemplateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.HydraMachineTemplate{}).
 		Named("hydramachinetemplate").
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.clusterToHydraMachineTemplates),
+		).
 		Complete(r)
 }

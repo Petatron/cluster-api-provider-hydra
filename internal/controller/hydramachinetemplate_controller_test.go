@@ -173,7 +173,7 @@ var _ = Describe("HydraMachineTemplate Reconciler", func() {
 		r := build(libvirtprovider.NodePlatform())
 		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(requeueTemplatePaused))
+		Expect(res.RequeueAfter).To(BeZero())
 
 		out := reload(r)
 		Expect(out.Status.Capacity).To(BeEmpty())
@@ -213,7 +213,7 @@ var _ = Describe("HydraMachineTemplate Reconciler", func() {
 
 		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(requeueTemplatePaused))
+		Expect(res.RequeueAfter).To(BeZero())
 
 		out := reload(r)
 		Expect(out.Status.Capacity).To(BeEmpty())
@@ -223,9 +223,7 @@ var _ = Describe("HydraMachineTemplate Reconciler", func() {
 		Expect(cond.Message).To(ContainSubstring(linkClusterName))
 	})
 
-	// Un-pausing the owning Cluster changes an object this controller does not
-	// watch, which is the whole reason the paused path requeues. Without that,
-	// a template unpaused this way would stay unpublished indefinitely.
+	// Removing the template annotation is observed through the primary watch.
 	It("publishes once the pause is lifted", func() {
 		tmpl.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
 
@@ -247,6 +245,92 @@ var _ = Describe("HydraMachineTemplate Reconciler", func() {
 		cond := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachineTemplatePausedCondition)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+	})
+
+	It("maps Cluster events only to templates with matching owners in its namespace", func() {
+		cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{
+			Name: linkClusterName, Namespace: linkNamespace, UID: "template-owner-uid",
+		}}
+		tmpl.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: clusterv1.GroupVersion.String(), Kind: clusterKind,
+			Name: cluster.Name, UID: cluster.UID,
+		}}
+		r := build(libvirtprovider.NodePlatform())
+		expected := []ctrl.Request{{NamespacedName: key}}
+		for _, tc := range []struct {
+			name    string
+			mutate  func(*infrav1.HydraMachineTemplate)
+			matches bool
+		}{
+			{"older-api", func(t *infrav1.HydraMachineTemplate) {
+				t.OwnerReferences[0].APIVersion = "cluster.x-k8s.io/v1beta1"
+			}, true},
+			{"no-owner-uid", func(t *infrav1.HydraMachineTemplate) { t.OwnerReferences[0].UID = "" }, true},
+			{"unowned", func(t *infrav1.HydraMachineTemplate) { t.OwnerReferences = nil }, false},
+			{"other-namespace", func(t *infrav1.HydraMachineTemplate) { t.Namespace = "other" }, false},
+			{"other-cluster", func(t *infrav1.HydraMachineTemplate) { t.OwnerReferences[0].Name = "other" }, false},
+			{"stale-owner", func(t *infrav1.HydraMachineTemplate) { t.OwnerReferences[0].UID = "old-uid" }, false},
+			{"other-group", func(t *infrav1.HydraMachineTemplate) {
+				t.OwnerReferences[0].APIVersion = "other.example.com/v1"
+			}, false},
+			{"other-kind", func(t *infrav1.HydraMachineTemplate) { t.OwnerReferences[0].Kind = machineKind }, false},
+		} {
+			other := tmpl.DeepCopy()
+			other.Name = tc.name
+			other.ResourceVersion = ""
+			tc.mutate(other)
+			Expect(r.Create(ctx, other)).To(Succeed())
+			if tc.matches {
+				expected = append(expected, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(other)})
+			}
+		}
+		Expect(r.clusterToHydraMachineTemplates(ctx, cluster)).To(ConsistOf(expected))
+		Expect(r.clusterToHydraMachineTemplates(ctx, tmpl)).To(BeEmpty())
+	})
+
+	It("observes both Cluster pause transitions without polling or changing template capacity", func() {
+		cluster := &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{
+			Name: linkClusterName, Namespace: linkNamespace, UID: "pause-owner-uid",
+		}}
+		tmpl.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: clusterv1.GroupVersion.String(), Kind: clusterKind,
+			Name: cluster.Name, UID: cluster.UID,
+		}}
+		r := build(libvirtprovider.NodePlatform())
+		Expect(r.Create(ctx, cluster)).To(Succeed())
+		result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(ctrl.Result{}))
+		published := reload(r).Status
+		Expect(published.Capacity).NotTo(BeEmpty())
+
+		for _, signal := range []string{"spec", "annotation"} {
+			for _, paused := range []bool{true, false} {
+				if signal == "spec" {
+					cluster.Spec.Paused = &paused
+				} else if paused {
+					cluster.Annotations = map[string]string{clusterv1.PausedAnnotation: ""}
+				} else {
+					cluster.Annotations = nil
+				}
+				Expect(r.Update(ctx, cluster)).To(Succeed())
+				requests := r.clusterToHydraMachineTemplates(ctx, cluster)
+				Expect(requests).To(ConsistOf(ctrl.Request{NamespacedName: key}))
+				result, err = r.Reconcile(ctx, requests[0])
+				Expect(err).NotTo(HaveOccurred())
+				Expect(result).To(Equal(ctrl.Result{}))
+				out := reload(r)
+				condition := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachineTemplatePausedCondition)
+				Expect(condition).NotTo(BeNil())
+				if paused {
+					Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+				} else {
+					Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+				}
+				Expect(capacityEqual(out.Status.Capacity, published.Capacity)).To(BeTrue())
+				Expect(out.Status.NodeInfo).To(Equal(published.NodeInfo))
+			}
+		}
 	})
 
 	It("does not touch a template being deleted", func() {
