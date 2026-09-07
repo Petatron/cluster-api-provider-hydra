@@ -531,41 +531,8 @@ func (r *HydraMachineReconciler) updateStatus(ctx context.Context, machine *infr
 // spec.paused, and the Cluster's annotation -- and "paused" alone would leave an
 // operator hunting for which one is in effect.
 func (r *HydraMachineReconciler) setPaused(ctx context.Context, machine *infrav1.HydraMachine, reason string) error {
-	paused := reason != ""
-
-	existing := apimeta.FindStatusCondition(machine.Status.Conditions, infrav1.MachinePausedCondition)
-	if !paused && existing == nil {
-		// Nothing to clear, and no reason to issue a write on every reconcile.
-		return nil
-	}
-
-	cond := metav1.Condition{
-		Type:               infrav1.MachinePausedCondition,
-		Status:             metav1.ConditionFalse,
-		Reason:             "NotPaused",
-		Message:            "reconciliation is active",
-		ObservedGeneration: machine.Generation,
-	}
-	if paused {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = "Paused"
-		cond.Message = fmt.Sprintf("reconciliation is suspended by %s", reason)
-	}
-
-	// Skip the write only when the condition already says exactly this. Comparing
-	// status alone would pin the first reason recorded, so a machine paused by its
-	// annotation and then also by its Cluster would keep reporting the annotation
-	// after the annotation was removed.
-	if existing != nil && existing.Status == cond.Status && existing.Message == cond.Message {
-		return nil
-	}
-
-	patch := client.MergeFrom(machine.DeepCopy())
-	apimeta.SetStatusCondition(&machine.Status.Conditions, cond)
-	if err := r.Status().Patch(ctx, machine, patch); err != nil {
-		return fmt.Errorf("recording paused state: %w", err)
-	}
-	return nil
+	return setPausedCondition(ctx, r.Client, machine, &machine.Status.Conditions,
+		infrav1.MachinePausedCondition, reason)
 }
 
 // waitReasonFor maps a wait to the condition reason that names it, or returns

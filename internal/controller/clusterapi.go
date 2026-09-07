@@ -291,6 +291,104 @@ func ownerRefOfKind(refs []metav1.OwnerReference, kind string) *metav1.OwnerRefe
 	return nil
 }
 
+// setPausedCondition records whether reconciliation is suspended, and why, on
+// any object carrying a conditions list. An empty reason means not paused.
+//
+// The Cluster API contract asks providers to report this so an operator can see
+// why an object stopped progressing rather than concluding the controller is
+// broken.
+//
+// One implementation for all three reconcilers. The rules are identical and
+// subtle in two places worth naming:
+//
+//   - The reason is carried in the message rather than inferred, because there
+//     are three ways to pause -- the object's own annotation, the owning
+//     Cluster's spec.paused, and the Cluster's annotation -- and "paused" alone
+//     leaves an operator hunting for which is in effect.
+//   - The write is skipped only when the condition already says exactly this,
+//     message included. Comparing status alone would pin the first reason
+//     recorded, so an object paused by its annotation and then also by its
+//     Cluster would keep naming the annotation after it was removed.
+func setPausedCondition(
+	ctx context.Context,
+	c client.Client,
+	obj client.Object,
+	conditions *[]metav1.Condition,
+	conditionType string,
+	reason string,
+) error {
+	paused := reason != ""
+
+	existing := apimeta.FindStatusCondition(*conditions, conditionType)
+	if !paused && existing == nil {
+		// Nothing to clear, and no reason to issue a write on every reconcile.
+		return nil
+	}
+
+	cond := metav1.Condition{
+		Type:               conditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             "NotPaused",
+		Message:            "reconciliation is active",
+		ObservedGeneration: obj.GetGeneration(),
+	}
+	if paused {
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = "Paused"
+		cond.Message = fmt.Sprintf("reconciliation is suspended by %s", reason)
+	}
+
+	if existing != nil && existing.Status == cond.Status && existing.Message == cond.Message {
+		return nil
+	}
+
+	// Copied before the conditions slice is touched: it aliases into obj, so
+	// mutating first would make the patch base identical to the patched object
+	// and the update a no-op.
+	base, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("recording paused state: %T is not a client.Object", obj)
+	}
+	apimeta.SetStatusCondition(conditions, cond)
+	if err := c.Status().Patch(ctx, obj, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("recording paused state: %w", err)
+	}
+	return nil
+}
+
+// ownerClusterOf returns the Cluster API Cluster that owns an object, or nil.
+//
+// Absent is normal rather than exceptional: Cluster API attaches the reference
+// in a later reconcile, so every owned object is briefly indistinguishable from
+// an unowned one.
+//
+// Shared by the cluster and template reconcilers because the rules are subtle
+// and identical, and pausedReason's own comment already records why two copies
+// are the wrong shape. The UID check is the subtle part: a name is not an
+// identity, so a Cluster deleted and recreated under the same name is a
+// different object and must not inherit decisions made about its predecessor.
+func ownerClusterOf(ctx context.Context, reader client.Reader, obj client.Object) (*clusterv1.Cluster, error) {
+	ref := ownerRefOfKind(obj.GetOwnerReferences(), clusterKind)
+	if ref == nil {
+		return nil, nil
+	}
+
+	cluster := &clusterv1.Cluster{}
+	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: ref.Name}
+	if err := reader.Get(ctx, key, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).V(1).Info("Owner Cluster is not visible", "cluster", ref.Name)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading owner Cluster %q: %w", ref.Name, err)
+	}
+	if ref.UID != "" && cluster.UID != ref.UID {
+		logf.FromContext(ctx).V(1).Info("Owner Cluster name is reused by a different object", "cluster", ref.Name)
+		return nil, nil
+	}
+	return cluster, nil
+}
+
 // pausedReason explains why reconciliation is suspended, or returns "".
 //
 // PET-8 could only see the annotation on the HydraMachine itself. The contract

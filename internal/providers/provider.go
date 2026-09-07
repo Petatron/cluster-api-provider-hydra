@@ -114,6 +114,32 @@ type ManagedNetwork struct {
 	DHCPEnd   string
 }
 
+// NodePlatform is the platform of the Kubernetes node a machine becomes, as
+// opposed to the platform of the machine itself.
+//
+// It exists for scale-from-zero. Cluster Autoscaler simulates a node for a pool
+// that has no replicas, and needs its architecture and operating system to build
+// the kubernetes.io/arch and kubernetes.io/os labels that pod scheduling is
+// predicated on. There is no Node to read them from, and no user field that
+// could be trusted to state them: a machine boots what the backend can build, so
+// only the backend knows.
+//
+// Deliberately NOT a method on MachineProvider. It is a property of the backend
+// implementation, not of a connection to one, and the values can never change
+// for a given build. Requiring a live provider to report them would make
+// scale-from-zero depend on the hypervisor being reachable, so a routine blip
+// would stop an autoscaler from sizing a pool -- for an answer that was already
+// fixed at compile time.
+type NodePlatform struct {
+	// Architecture is the Kubernetes CPU architecture, e.g. "amd64". This is the
+	// Kubernetes spelling, not the backend's: libvirt calls the same thing
+	// "x86_64", and the value that reaches a node label has to be the former.
+	Architecture string
+
+	// OperatingSystem is the Kubernetes operating system, e.g. "linux".
+	OperatingSystem string
+}
+
 // InfrastructureSpec describes the cluster-scoped prerequisites a backend needs
 // in place before any machine can be created.
 //

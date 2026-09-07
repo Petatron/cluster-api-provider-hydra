@@ -37,6 +37,7 @@ rules:
   resources:
   - hydraclusters/status
   - hydramachines/status
+  - hydramachinetemplates/status
   verbs:
   - get
   - patch
@@ -47,3 +48,11 @@ rules:
   - hydramachines/finalizers
   verbs:
   - update
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - hydramachinetemplates
+  verbs:
+  - get
+  - list
+  - watch

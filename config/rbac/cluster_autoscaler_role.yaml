@@ -1,0 +1,39 @@
+# Cluster Autoscaler needs to read HydraMachineTemplates to scale a node pool
+# from zero. With no replicas there is no Node to inspect, so the only source of
+# the pool's capacity is the template's status -- and the autoscaler reads it
+# with a dynamic client that must be able to list and watch, not merely get.
+#
+# This ClusterRole is intentionally NOT bound to anything. Cluster Autoscaler
+# runs under a ServiceAccount this project does not own or create, so the binding
+# is the operator's to make:
+#
+#   kubectl create clusterrolebinding hydra-autoscaler-templates \
+#     --clusterrole=cluster-api-provider-hydra-hydramachinetemplate-autoscaler-role \
+#     --serviceaccount=<namespace>:<autoscaler service account>
+#
+# The name above is the RENDERED one, not the one in this file: config/default
+# applies namePrefix: cluster-api-provider-hydra-, so binding the unprefixed
+# name fails with "ClusterRole not found" after make deploy. Confirm with
+#
+#   kubectl get clusterrole | grep autoscaler-role
+#
+# Without it the autoscaler logs an RBAC failure at -v=4 and then skips the node
+# group, so a pool that will not scale from zero and a pool the autoscaler cannot
+# read look the same at default verbosity. See docs/scale-from-zero.md.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: cluster-api-provider-hydra
+    app.kubernetes.io/managed-by: kustomize
+  name: hydramachinetemplate-autoscaler-role
+rules:
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - hydramachinetemplates
+  verbs:
+  - get
+  - list
+  - watch

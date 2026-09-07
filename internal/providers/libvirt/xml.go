@@ -274,6 +274,32 @@ func networkXML(spec providers.ManagedNetwork, gateway, netmask string) (string,
 // cidataPath is the cloud-init NoCloud image, attached as a CD-ROM. An empty
 // value attaches nothing, which is the no-bootstrap-data case: the machine boots
 // the base image and configures nothing.
+// domainArch is the CPU architecture every domain this backend defines is given,
+// and nodeArch is the same architecture spelled the way Kubernetes spells it.
+//
+// They live together, and NodePlatform below reads the second, so the
+// architecture reported for scale-from-zero cannot drift from the architecture
+// actually built. A domain is x86_64 because that is the only thing this backend
+// emits -- and since a guest image has to match its domain's architecture, it is
+// also the only image that can boot here. Making either of these configurable is
+// a real gap in Hydra's genericity, but it is one change, in one place.
+const (
+	domainArch = "x86_64"
+	nodeArch   = "amd64"
+
+	// nodeOS is the operating system a machine from this backend becomes as a
+	// Kubernetes node. Not a free choice either: machines configure themselves
+	// through cloud-init, netplan and a Linux package manager.
+	nodeOS = "linux"
+)
+
+// NodePlatform reports the platform of the Kubernetes node a machine from this
+// backend becomes. See providers.NodePlatform for why this is not on the
+// MachineProvider interface.
+func NodePlatform() providers.NodePlatform {
+	return providers.NodePlatform{Architecture: nodeArch, OperatingSystem: nodeOS}
+}
+
 func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 	d := domainDef{
 		Type:   "kvm",
@@ -281,7 +307,7 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 		Memory: memoryDef{Unit: unitBytes, Value: spec.MemoryBytes},
 		VCPU:   spec.VCPUs,
 		OS: osDef{
-			Type: osTypeDef{Arch: "x86_64", Machine: "q35", Value: "hvm"},
+			Type: osTypeDef{Arch: domainArch, Machine: "q35", Value: "hvm"},
 			Boot: []bootDef{{Dev: "hd"}},
 		},
 		Devices: devices{

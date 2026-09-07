@@ -25,7 +25,6 @@ import (
 	"sync"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -194,28 +193,7 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 // shortly after the object appears, and verification does not depend on the
 // Cluster anyway. The only thing a missing owner costs is the paused check.
 func (r *HydraClusterReconciler) ownerCluster(ctx context.Context, hydraCluster *infrav1.HydraCluster) (*clusterv1.Cluster, error) {
-	ref := ownerRefOfKind(hydraCluster.OwnerReferences, clusterKind)
-	if ref == nil {
-		return nil, nil
-	}
-
-	cluster := &clusterv1.Cluster{}
-	key := types.NamespacedName{Namespace: hydraCluster.Namespace, Name: ref.Name}
-	if err := r.Get(ctx, key, cluster); err != nil {
-		if apierrors.IsNotFound(err) {
-			logf.FromContext(ctx).V(1).Info("Owner Cluster is not visible", "cluster", ref.Name)
-			return nil, nil
-		}
-		return nil, fmt.Errorf("reading owner Cluster %q: %w", ref.Name, err)
-	}
-	// A name is not an identity -- same reasoning as the machine reconciler's
-	// owner check. A Cluster deleted and recreated under the same name is a
-	// different object, and pausing decisions must not follow it.
-	if ref.UID != "" && cluster.UID != ref.UID {
-		logf.FromContext(ctx).V(1).Info("Owner Cluster name is reused by a different object", "cluster", ref.Name)
-		return nil, nil
-	}
-	return cluster, nil
+	return ownerClusterOf(ctx, r.Client, hydraCluster)
 }
 
 // infrastructureSpecFor converts the API object into what the backend checks.
@@ -308,38 +286,8 @@ func (r *HydraClusterReconciler) recordUnverified(ctx context.Context, hydraClus
 
 // setPaused surfaces whether reconciliation is suspended, and why.
 func (r *HydraClusterReconciler) setPaused(ctx context.Context, hydraCluster *infrav1.HydraCluster, reason string) error {
-	paused := reason != ""
-
-	existing := apimeta.FindStatusCondition(hydraCluster.Status.Conditions, infrav1.ClusterPausedCondition)
-	if !paused && existing == nil {
-		return nil
-	}
-
-	cond := metav1.Condition{
-		Type:               infrav1.ClusterPausedCondition,
-		Status:             metav1.ConditionFalse,
-		Reason:             "NotPaused",
-		Message:            "reconciliation is active",
-		ObservedGeneration: hydraCluster.Generation,
-	}
-	if paused {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = "Paused"
-		cond.Message = fmt.Sprintf("reconciliation is suspended by %s", reason)
-	}
-
-	// Compare the message too, not just the status, so a machine paused by two
-	// signals reports the one currently in effect.
-	if existing != nil && existing.Status == cond.Status && existing.Message == cond.Message {
-		return nil
-	}
-
-	patch := client.MergeFrom(hydraCluster.DeepCopy())
-	apimeta.SetStatusCondition(&hydraCluster.Status.Conditions, cond)
-	if err := r.Status().Patch(ctx, hydraCluster, patch); err != nil {
-		return fmt.Errorf("recording paused state: %w", err)
-	}
-	return nil
+	return setPausedCondition(ctx, r.Client, hydraCluster, &hydraCluster.Status.Conditions,
+		infrav1.ClusterPausedCondition, reason)
 }
 
 // clusterToHydraCluster maps a Cluster to the HydraCluster it references.

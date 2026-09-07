@@ -172,6 +172,12 @@ which keeps a template an accurate record of what its machines were built from.
 Setting `providerID` inside a template is rejected outright: it identifies one
 machine, and a template describes many.
 
+Its `status` carries the capacity and node platform a machine cloned from it
+would have. That is the whole of the contract Cluster Autoscaler needs to scale a
+node pool from **zero** replicas, where there is no `Node` left to inspect —
+see [docs/scale-from-zero.md](./docs/scale-from-zero.md), which also covers what
+the autoscaler will and will not read from a template.
+
 > **Known limitation.** Immutability is enforced with CEL rather than an admission
 > webhook. The Cluster API contract asks providers to skip template immutability
 > checks during the topology controller's server-side-apply dry runs, which needs
@@ -298,10 +304,11 @@ far; nothing above the interface names it.
 | PET-8 | Implement the libvirt machine backend and reconciliation | shipped |
 | PET-9 | Integrate CABPK bootstrap data, delivered to guests as a NoCloud image | shipped |
 | PET-15 | Define `HydraCluster` and the cluster-wide defaults machines inherit | shipped |
-| PET-37 | Prove `MachineDeployment` scale-out on real hardware | in progress |
+| PET-37 | Prove `MachineDeployment` scale-out on real hardware | shipped |
+| PET-40 | Let a cluster own its own network, so its endpoint comes from a range Hydra controls | shipped |
+| PET-30 | Controller and provisioning-lifecycle metrics | shipped |
+| PET-27 | `InfraMachineTemplate` capacity contract for autoscaler scale-from-zero | in progress |
 | PET-38 | Move the hypervisor connection onto `HydraCluster`, with TLS | planned |
-| PET-27 | `InfraMachineTemplate` capacity contract for autoscaler scale-from-zero | planned |
-| PET-30 | Controller and provisioning-lifecycle metrics | planned |
 
 ## License
 

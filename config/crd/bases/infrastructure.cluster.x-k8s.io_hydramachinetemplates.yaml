@@ -33,6 +33,20 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    - description: Capacity published for scale-from-zero; empty means Cluster Autoscaler
+        cannot size this pool at zero replicas
+      jsonPath: .status.capacity.cpu
+      name: Reported CPU
+      priority: 1
+      type: string
+    - jsonPath: .status.capacity.memory
+      name: Reported Memory
+      priority: 1
+      type: string
+    - jsonPath: .status.nodeInfo.architecture
+      name: Arch
+      priority: 1
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -264,6 +278,43 @@ spec:
           status:
             description: status defines the observed state of HydraMachineTemplate
             properties:
+              capacity:
+                additionalProperties:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                description: |-
+                  capacity is the resource capacity of a node created from this template.
+
+                  This is how Cluster Autoscaler sizes a node pool that has zero replicas:
+                  with no Node to inspect, the capacity has to come from the template. cpu
+                  and memory are both required for scale-from-zero to work at all -- the
+                  autoscaler skips a node group that cannot report both.
+
+                  The values are raw machine sizing, and are an UPPER BOUND on what the node
+                  offers rather than a prediction of it. The autoscaler simulates a node whose
+                  allocatable equals capacity; a real node is lower both because the guest
+                  sees less RAM and disk than the machine was given and because the kubelet
+                  holds back its eviction thresholds. Measured against a live 2 vCPU / 4Gi /
+                  40Gi Ubuntu 24.04 node at 6.8% over allocatable memory and 15.2% over
+                  allocatable ephemeral storage -- docs/scale-from-zero.md carries the full
+                  figures and the annotations that override this per pool.
+
+                  Every value must be a JSON string. The autoscaler reads this map with
+                  unstructured.NestedStringMap, which fails whole rather than per-key: a
+                  single integer value -- which the quantity schema would otherwise admit --
+                  drops the entire capacity map and disables scale-from-zero with no error
+                  reported anywhere. The validation rule below refuses that write instead.
+
+                  NOTE: this field is part of the Cluster API InfraMachineTemplate contract.
+                maxProperties: 32
+                type: object
+                x-kubernetes-validations:
+                - message: capacity values must be strings; Cluster Autoscaler reads
+                    this map as strings and silently discards all of it otherwise
+                  rule: self.all(k, type(self[k]) == string)
               conditions:
                 description: |-
                   conditions represent the current state of the HydraMachineTemplate
@@ -326,6 +377,28 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              nodeInfo:
+                description: |-
+                  nodeInfo describes the platform of a node created from this template.
+
+                  NOTE: this field is part of the Cluster API InfraMachineTemplate contract.
+                minProperties: 1
+                properties:
+                  architecture:
+                    description: architecture is the CPU architecture of the node.
+                    enum:
+                    - amd64
+                    - arm64
+                    - s390x
+                    - ppc64le
+                    type: string
+                  operatingSystem:
+                    description: operatingSystem is the operating system the node
+                      runs, for example "linux".
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                type: object
             type: object
         required:
         - spec
