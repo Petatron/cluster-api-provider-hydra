@@ -37,6 +37,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/metrics"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
@@ -606,6 +607,8 @@ func (r *HydraMachineReconciler) recordWaiting(ctx context.Context, machine *inf
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("recording waiting state: %w", err)
 	}
+	// Count only persisted waits, using the bounded reasons from waitReasonFor.
+	metrics.MachineWaitTotal.WithLabelValues(reason).Inc()
 	return nil
 }
 
@@ -645,6 +648,10 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("recording failure: %w", err)
 	}
+	// Count only persisted failures, classified like backend operation outcomes.
+	metrics.MachineFailureTotal.
+		WithLabelValues(phase, providers.ClassifyOutcome(cause)).
+		Inc()
 	return nil
 }
 
