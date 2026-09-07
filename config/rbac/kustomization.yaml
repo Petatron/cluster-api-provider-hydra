@@ -18,6 +18,10 @@ resources:
 - metrics_auth_role.yaml
 - metrics_auth_role_binding.yaml
 - metrics_reader_role.yaml
+# Read access to HydraMachineTemplates for Cluster Autoscaler, so it can size a
+# node pool that has zero replicas. Shipped unbound -- the autoscaler's
+# ServiceAccount is not ours to name. See the file for the binding command.
+- cluster_autoscaler_role.yaml
 # For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
 # default, aiding admins in cluster management. Those roles are
 # not used by the cluster-api-provider-hydra itself. You can comment the following lines

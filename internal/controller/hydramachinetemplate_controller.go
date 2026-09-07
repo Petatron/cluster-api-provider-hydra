@@ -1,0 +1,172 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
+)
+
+// HydraMachineTemplateReconciler reconciles a HydraMachineTemplate object.
+//
+// It publishes one thing: the capacity and platform of the node a machine
+// cloned from this template would become. That is the whole InfraMachineTemplate
+// contract, and it exists for exactly one consumer -- Cluster Autoscaler sizing
+// a node pool that currently has no replicas. With zero replicas there is no
+// Node to inspect, so the numbers have to come from the template or the pool
+// cannot be scaled up at all.
+//
+// Notably absent: any call to the infrastructure backend. Capacity is a pure
+// function of an immutable spec, so there is nothing to ask a hypervisor and
+// nothing that can change once answered. Dialling would only add a way for a
+// transient libvirt outage to stop an autoscaler from sizing a pool.
+type HydraMachineTemplateReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+
+	// Platform is the node platform the configured backend produces. Injected
+	// rather than looked up so this controller keeps no backend dependency, and
+	// so a test can assert a non-amd64 pool reports itself as one.
+	Platform providers.NodePlatform
+}
+
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachinetemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachinetemplates/status,verbs=get;update;patch
+
+// Reconcile publishes a HydraMachineTemplate's capacity and node platform.
+func (r *HydraMachineTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	template := &infrav1.HydraMachineTemplate{}
+	if err := r.Get(ctx, req.NamespacedName, template); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// No finalizer: this controller creates nothing outside the object's own
+	// status, and unlike the cluster reconciler that is a tautology rather than a
+	// policy -- there is no backend call here that could leave anything behind.
+	if !template.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	// The Cluster API paused annotation is deliberately not honoured. Pausing
+	// exists to stop a controller acting on infrastructure while an operator
+	// works on it; this one only restates immutable spec fields, so suspending it
+	// would withdraw capacity from the autoscaler while protecting nothing.
+
+	capacity := capacityFor(template)
+	nodeInfo := infrav1.HydraNodeInfo{
+		Architecture:    infrav1.HydraNodeArchitecture(r.Platform.Architecture),
+		OperatingSystem: r.Platform.OperatingSystem,
+	}
+
+	// Only write when something would change. This controller watches its own
+	// kind, and a status patch produces an event for the object that was patched,
+	// so an unconditional write is an unconditional loop.
+	if capacityEqual(template.Status.Capacity, capacity) && template.Status.NodeInfo == nodeInfo {
+		return ctrl.Result{}, nil
+	}
+
+	patch := client.MergeFrom(template.DeepCopy())
+	template.Status.Capacity = capacity
+	template.Status.NodeInfo = nodeInfo
+	if err := r.Status().Patch(ctx, template, patch); err != nil {
+		return ctrl.Result{}, fmt.Errorf("publishing template capacity: %w", err)
+	}
+
+	cpu, memory := capacity[corev1.ResourceCPU], capacity[corev1.ResourceMemory]
+	log.V(1).Info("Published HydraMachineTemplate capacity",
+		"name", template.Name,
+		"cpu", cpu.String(),
+		"memory", memory.String(),
+		"architecture", nodeInfo.Architecture,
+	)
+	return ctrl.Result{}, nil
+}
+
+// capacityFor derives the capacity of the node a machine from this template
+// becomes.
+//
+// These are raw machine sizes, matching what the resulting Node will report as
+// status.capacity -- not what it will report as allocatable, which is lower by
+// the kubelet's reserved and eviction amounts. Cluster Autoscaler simulates a
+// node whose allocatable equals capacity, so it models marginally more
+// schedulable space than exists. Reporting reduced figures instead would trade a
+// documented overestimate for a field that matches neither the Node's capacity
+// nor its allocatable; docs/scale-from-zero.md carries the measured gap and the
+// annotation override that corrects it.
+//
+// maxPods is not reported. The autoscaler overwrites the pods entry
+// unconditionally, from its own annotation or its default of 110, so a value
+// here would be read and discarded -- precise-looking and inert.
+//
+// Extended resources, GPUs included, are not reported either: nothing in the
+// machine spec declares any, and PET-33 has not yet decided how libvirt exposes
+// a GPU. The capacity annotations cover a min=0 GPU pool in the meantime, and
+// the autoscaler accepts arbitrary resource names from this map, so adding them
+// later breaks nothing.
+func capacityFor(template *infrav1.HydraMachineTemplate) infrav1.HydraNodeCapacity {
+	spec := template.Spec.Template.Spec
+	return infrav1.HydraNodeCapacity{
+		corev1.ResourceCPU:    *resource.NewQuantity(int64(spec.VCPUs), resource.DecimalSI),
+		corev1.ResourceMemory: spec.Memory.DeepCopy(),
+
+		// The root disk is where ephemeral storage comes from, so this is the
+		// right number to report, but it is an upper bound: the node's
+		// ephemeral-storage capacity is the filesystem holding /var/lib/kubelet,
+		// which is smaller than the raw disk by the partition table, /boot and
+		// filesystem overhead.
+		corev1.ResourceEphemeralStorage: spec.DiskSize.DeepCopy(),
+	}
+}
+
+// capacityEqual compares two capacity maps by quantity value.
+//
+// Not reflect.DeepEqual: resource.Quantity carries a cached string form and a
+// format, so "8Gi" and "8589934592" are different structs holding the same
+// quantity. Comparing structs would rewrite status forever on a template whose
+// spec was applied in a different but equivalent notation.
+func capacityEqual(a, b infrav1.HydraNodeCapacity) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, want := range b {
+		got, ok := a[name]
+		if !ok || got.Cmp(want) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *HydraMachineTemplateReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&infrav1.HydraMachineTemplate{}).
+		Named("hydramachinetemplate").
+		Complete(r)
+}

@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -61,14 +63,87 @@ type HydraMachineTemplateSpec struct {
 	Template HydraMachineTemplateResource `json:"template"`
 }
 
-// HydraMachineTemplateStatus defines the observed state of HydraMachineTemplate.
+// HydraNodeCapacity is the resource capacity of a node, keyed by resource name.
 //
-// Intentionally minimal. The Cluster API contract also allows a template to
-// report status.capacity and status.nodeInfo, which is how Cluster Autoscaler
-// sizes a node pool that currently has zero replicas -- there is no Node to
-// inspect, so the capacity has to come from the template. That is PET-27, and
-// adding those fields later is an additive, non-breaking change.
+// Structurally a corev1.ResourceList, and identical on the wire, but declared
+// here so the bound and the validation rule below can be attached to it. Neither
+// marker can be applied to an imported named map type, and without a bound the
+// API server rejects the whole CRD: a rule that walks an unbounded map blows the
+// CEL cost budget by more than 100x.
+//
+// +kubebuilder:validation:MaxProperties=32
+// +kubebuilder:validation:XValidation:rule="self.all(k, type(self[k]) == string)",message="capacity values must be strings; Cluster Autoscaler reads this map as strings and silently discards all of it otherwise"
+type HydraNodeCapacity map[corev1.ResourceName]resource.Quantity
+
+// HydraNodeArchitecture is the CPU architecture of the node a machine becomes.
+//
+// The value set is fixed by the Cluster API contract, not by us: Cluster
+// Autoscaler copies it into the simulated Node's kubernetes.io/arch label, and
+// a value outside this set would produce a label no pod nodeSelector matches.
+//
+// +kubebuilder:validation:Enum=amd64;arm64;s390x;ppc64le
+type HydraNodeArchitecture string
+
+const (
+	HydraNodeArchitectureAMD64 HydraNodeArchitecture = "amd64"
+	HydraNodeArchitectureARM64 HydraNodeArchitecture = "arm64"
+)
+
+// HydraNodeInfo describes the platform of the node a machine cloned from this
+// template becomes.
+//
+// It exists for scale-from-zero: with no Node to inspect, Cluster Autoscaler
+// derives the simulated node's kubernetes.io/arch and kubernetes.io/os labels
+// from here. Omitting it is not neutral -- the autoscaler falls back to
+// CAPI_SCALE_ZERO_DEFAULT_ARCH or amd64/linux, so an arm64 pool with no
+// nodeInfo simulates as amd64 and schedules pods that cannot run.
+//
+// NOTE: this struct is part of the Cluster API InfraMachineTemplate contract.
+//
+// +kubebuilder:validation:MinProperties=1
+type HydraNodeInfo struct {
+	// architecture is the CPU architecture of the node.
+	// +optional
+	Architecture HydraNodeArchitecture `json:"architecture,omitempty"`
+
+	// operatingSystem is the operating system the node runs, for example "linux".
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	OperatingSystem string `json:"operatingSystem,omitempty"`
+}
+
+// HydraMachineTemplateStatus defines the observed state of HydraMachineTemplate.
 type HydraMachineTemplateStatus struct {
+	// capacity is the resource capacity of a node created from this template.
+	//
+	// This is how Cluster Autoscaler sizes a node pool that has zero replicas:
+	// with no Node to inspect, the capacity has to come from the template. cpu
+	// and memory are both required for scale-from-zero to work at all -- the
+	// autoscaler skips a node group that cannot report both.
+	//
+	// The values are raw machine sizing, matching what the resulting Node reports
+	// as status.capacity. They are NOT allocatable: a real node subtracts
+	// reserved and eviction-threshold amounts, and the autoscaler simulates a
+	// node with allocatable equal to capacity, so it models slightly more
+	// schedulable room than a real node offers. See docs/scale-from-zero.md.
+	//
+	// Every value must be a JSON string. The autoscaler reads this map with
+	// unstructured.NestedStringMap, which fails whole rather than per-key: a
+	// single integer value -- which the quantity schema would otherwise admit --
+	// drops the entire capacity map and disables scale-from-zero with no error
+	// reported anywhere. The validation rule below refuses that write instead.
+	//
+	// NOTE: this field is part of the Cluster API InfraMachineTemplate contract.
+	// +optional
+	Capacity HydraNodeCapacity `json:"capacity,omitempty"`
+
+	// nodeInfo describes the platform of a node created from this template.
+	//
+	// NOTE: this field is part of the Cluster API InfraMachineTemplate contract.
+	// +optional
+	NodeInfo HydraNodeInfo `json:"nodeInfo,omitempty,omitzero"`
+
 	// conditions represent the current state of the HydraMachineTemplate
 	// resource.
 	// +listType=map
@@ -86,6 +161,9 @@ type HydraMachineTemplateStatus struct {
 // +kubebuilder:printcolumn:name="Disk",type="string",JSONPath=".spec.template.spec.diskSize"
 // +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".spec.template.spec.image.name",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:printcolumn:name="Reported CPU",type="string",JSONPath=".status.capacity.cpu",priority=1,description="Capacity published for scale-from-zero; empty means Cluster Autoscaler cannot size this pool at zero replicas"
+// +kubebuilder:printcolumn:name="Reported Memory",type="string",JSONPath=".status.capacity.memory",priority=1
+// +kubebuilder:printcolumn:name="Arch",type="string",JSONPath=".status.nodeInfo.architecture",priority=1
 
 // HydraMachineTemplate is the Schema for the hydramachinetemplates API
 type HydraMachineTemplate struct {

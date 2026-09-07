@@ -289,6 +289,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// No provider, by design. Template capacity is a pure function of an
+	// immutable spec, and the node platform is a property of the backend build --
+	// see providers.NodePlatform.
+	if err := (&controller.HydraMachineTemplateReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Platform: libvirtprovider.NodePlatform(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "hydramachinetemplate")
+		os.Exit(1)
+	}
+
 	if err := (&controller.HydraMachineReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
