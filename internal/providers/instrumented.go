@@ -33,8 +33,8 @@ import (
 // one place instead of once per backend, so a second backend cannot quietly
 // publish a different set.
 //
-// The operation label is the interface method name, so its cardinality is fixed
-// by the interface and cannot grow at runtime.
+// The operation label is bounded to MachineProvider method names plus Dial
+// for provider construction; its cardinality cannot grow at runtime.
 type Instrumented struct {
 	MachineProvider
 }

@@ -595,11 +595,6 @@ func waitReasonFor(err error) string {
 // a MachineHealthCheck may act on it, so a machine waiting on its bootstrap
 // Secret must not carry it.
 func (r *HydraMachineReconciler) recordWaiting(ctx context.Context, machine *infrav1.HydraMachine, reason, message string) error {
-	// The reason, never the machine. There are four of these and the set is
-	// fixed by waitReasonFor; a machine name here would add a series per machine
-	// and never remove one.
-	metrics.MachineWaitTotal.WithLabelValues(reason).Inc()
-
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
 		Type:               infrav1.MachineReadyCondition,
@@ -612,6 +607,8 @@ func (r *HydraMachineReconciler) recordWaiting(ctx context.Context, machine *inf
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("recording waiting state: %w", err)
 	}
+	// Count only persisted waits, using the bounded reasons from waitReasonFor.
+	metrics.MachineWaitTotal.WithLabelValues(reason).Inc()
 	return nil
 }
 
@@ -630,15 +627,6 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 	if !terminal {
 		reason = phase + "FailedRetrying"
 	}
-
-	// The cause, not the reason. reason is "<phase>Failed" or
-	// "<phase>FailedRetrying", which is exactly phase plus terminality -- it
-	// would have been a third label carrying no information the other two did
-	// not already hold. Classified through the providers package so this and the
-	// backend operation metric describe a failure the same way.
-	metrics.MachineFailureTotal.
-		WithLabelValues(phase, providers.ClassifyOutcome(cause)).
-		Inc()
 
 	patch := client.MergeFrom(machine.DeepCopy())
 	apimeta.SetStatusCondition(&machine.Status.Conditions, metav1.Condition{
@@ -660,6 +648,10 @@ func (r *HydraMachineReconciler) recordError(ctx context.Context, machine *infra
 	if err := r.Status().Patch(ctx, machine, patch); err != nil {
 		return fmt.Errorf("recording failure: %w", err)
 	}
+	// Count only persisted failures, classified like backend operation outcomes.
+	metrics.MachineFailureTotal.
+		WithLabelValues(phase, providers.ClassifyOutcome(cause)).
+		Inc()
 	return nil
 }
 
