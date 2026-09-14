@@ -178,6 +178,14 @@ node pool from **zero** replicas, where there is no `Node` left to inspect —
 see [docs/scale-from-zero.md](./docs/scale-from-zero.md), which also covers what
 the autoscaler will and will not read from a template.
 
+A template is one third of a **node pool** — a group of interchangeable machines
+declared by shape and size rather than by name. Hydra adds no node-pool CRD and
+no second controller: a pool is a `MachineDeployment`, a `HydraMachineTemplate`
+and a `KubeadmConfigTemplate`, and Cluster API already reconciles replica counts,
+rolling replacement and autoscaler integration. [docs/node-pools.md](./docs/node-pools.md)
+covers which field belongs on which of the three — most of which is not
+guessable — and three traps where a field is accepted and then does nothing.
+
 > **Known limitation.** Immutability is enforced with CEL rather than an admission
 > webhook. The Cluster API contract asks providers to skip template immutability
 > checks during the topology controller's server-side-apply dry runs, which needs
@@ -307,7 +315,8 @@ far; nothing above the interface names it.
 | PET-37 | Prove `MachineDeployment` scale-out on real hardware | shipped |
 | PET-40 | Let a cluster own its own network, so its endpoint comes from a range Hydra controls | shipped |
 | PET-30 | Controller and provisioning-lifecycle metrics | shipped |
-| PET-27 | `InfraMachineTemplate` capacity contract for autoscaler scale-from-zero | in progress |
+| PET-27 | `InfraMachineTemplate` capacity contract for autoscaler scale-from-zero | shipped |
+| PET-28 | Define the node-pool and machine-class model | in progress |
 | PET-38 | Move the hypervisor connection onto `HydraCluster`, with TLS | planned |
 
 ## License

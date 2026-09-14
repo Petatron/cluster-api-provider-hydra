@@ -1,0 +1,154 @@
+# System node pool -- cluster add-ons, never scales to zero.
+#
+# A pool is this MachineDeployment + HydraMachineTemplate + KubeadmConfigTemplate.
+# See ../node-pools.md for why there is no node-pool CRD.
+#
+# THE TAINT ONLY REPELS. It does not pull add-ons onto this pool. Workloads that
+# belong here need BOTH a matching toleration and a nodeSelector on
+# hydra.petatron.io/pool=system -- otherwise they simply land elsewhere and this
+# pool runs nothing. The pair is in ../node-pools.md.
+#
+# The bootstrap below is the join recipe proven on this hardware in PET-37 and
+# PET-17, copied from machinedeployment-kubeadmconfigtemplate.yaml with only the
+# pool's own labels and taints layered on. It is duplicated rather than
+# referenced because an operator applies ONE file, and a bootstrap assembled by
+# hand from two is how a half-configured node gets built. When the proven recipe
+# changes -- a Kubernetes version bump, most likely -- every pool example has to
+# change with it; the pinned 1.35.3 below is the thing that will go stale first.
+#
+# Substitute CLUSTER_NAME.
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: HydraMachineTemplate
+metadata:
+  name: pool-system-2c4g
+  namespace: default
+spec:
+  template:
+    spec:
+      vcpus: 2
+      memory: 4Gi
+      diskSize: 40Gi
+      # image and networks are omitted on purpose: both resolve from the
+      # HydraCluster when absent, which keeps one template usable in more than
+      # one cluster. Set them here only to override the cluster.
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfigTemplate
+metadata:
+  name: pool-system
+  namespace: default
+spec:
+  template:
+    spec:
+      files:
+        # kubeadm's preflight refuses to join without these. `sysctl --system`
+        # applies whatever is on disk; nothing else puts these there, and
+        # net.bridge.* is a no-op until br_netfilter is loaded below.
+        - path: /etc/modules-load.d/k8s.conf
+          owner: root:root
+          permissions: "0644"
+          content: |
+            overlay
+            br_netfilter
+        - path: /etc/sysctl.d/k8s.conf
+          owner: root:root
+          permissions: "0644"
+          content: |
+            net.bridge.bridge-nf-call-iptables  = 1
+            net.bridge.bridge-nf-call-ip6tables = 1
+            net.ipv4.ip_forward                 = 1
+      joinConfiguration:
+        nodeRegistration:
+          # The node name is left implicit so it comes from the hostname the
+          # provider writes into this machine's cidata meta-data.
+          criSocket: unix:///run/containerd/containerd.sock
+          taints:
+            - key: CriticalAddonsOnly
+              value: "true"
+              effect: NoSchedule
+          # Labels and taints go HERE, not on the MachineDeployment:
+          # spec.template.spec.taints needs the MachineTaintPropagation gate
+          # (off on this cluster), and Cluster API propagates Machine labels to
+          # Nodes only inside three managed domains. kubeadm applies both with
+          # no gate and no domain restriction. See ../node-pools.md.
+          #
+          # A list of {name, value} in v1beta2 -- NOT the v1beta1 map, which is
+          # rejected at admission.
+          kubeletExtraArgs:
+            - name: node-labels
+              value: hydra.petatron.io/pool=system,hydra.petatron.io/class=2c4g
+      preKubeadmCommands:
+        # providerID is what pairs the Node with its Machine; without it Cluster
+        # API never sets nodeRef and the Machine stays unlinked forever.
+        #
+        # This writes KUBELET_EXTRA_ARGS while kubeadm writes the pool's
+        # node-labels and taints into /var/lib/kubelet/kubeadm-flags.env. The
+        # kubelet unit sources both and its ExecStart passes
+        # $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS, so the two compose rather
+        # than overwrite -- which is the only reason nodeRegistration above and
+        # this block can coexist.
+        - |
+          printf 'KUBELET_EXTRA_ARGS=--provider-id=hydra://libvirt/%s\n' \
+            "$(tr 'A-Z' 'a-z' < /sys/class/dmi/id/product_uuid)" \
+            > /etc/default/kubelet
+        - modprobe overlay
+        - modprobe br_netfilter
+        - sysctl --system
+        - DEBIAN_FRONTEND=noninteractive apt-get update
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y containerd apt-transport-https ca-certificates curl gpg qemu-guest-agent
+        - systemctl enable --now qemu-guest-agent
+        - mkdir -p /etc/containerd
+        - containerd config default > /etc/containerd/config.toml
+        - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        - systemctl restart containerd
+        - mkdir -p /etc/apt/keyrings
+        - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+        - DEBIAN_FRONTEND=noninteractive apt-get update
+        - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=1.35.3-* kubeadm=1.35.3-*
+        - apt-mark hold kubelet kubeadm
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: pool-system
+  namespace: default
+  annotations:
+    # Without BOTH of these the pool is not a node group and Cluster Autoscaler
+    # ignores it entirely -- logging that only at -v=4.
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "3"
+    # The autoscaler's copy of the labels above. It cannot read the
+    # KubeadmConfigTemplate, and the path it does look at
+    # (spec.template.spec.metadata.labels) does not exist in v1beta2 -- so this
+    # annotation is the only channel. Keep it in step with node-labels above;
+    # nothing enforces that they agree.
+    capacity.cluster-autoscaler.kubernetes.io/labels: hydra.petatron.io/pool=system,hydra.petatron.io/class=2c4g
+    # The autoscaler's copy of the taint. Without it the autoscaler simulates an
+    # untainted node, concludes any pending pod fits here, and scales this pool
+    # up for work the real taint then repels.
+    capacity.cluster-autoscaler.kubernetes.io/taints: CriticalAddonsOnly=true:NoSchedule
+spec:
+  clusterName: CLUSTER_NAME
+  replicas: 1
+  selector:
+    matchLabels:
+      hydra.md: pool-system
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: CLUSTER_NAME
+        hydra.md: pool-system
+    spec:
+      clusterName: CLUSTER_NAME
+      version: v1.35.3
+      bootstrap:
+        configRef:
+          apiGroup: bootstrap.cluster.x-k8s.io
+          kind: KubeadmConfigTemplate
+          name: pool-system
+      infrastructureRef:
+        apiGroup: infrastructure.cluster.x-k8s.io
+        kind: HydraMachineTemplate
+        name: pool-system-2c4g
