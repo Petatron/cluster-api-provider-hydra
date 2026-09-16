@@ -40,7 +40,7 @@ HydraMachineTemplate  — the template a MachineDeployment stamps machines from
 | Go | **1.26** | Per `go.mod`. The installed toolchain may be newer; **`go.mod` wins.** |
 | Cluster API | **v1.14.0** | Contract **v1beta2** |
 | controller-runtime | v0.24.1 | |
-| kubebuilder | v4.15.0 | At `~/go/bin/kubebuilder` — **not on `PATH`, use the full path** |
+| kubebuilder | v4.15.0 | Invoke via its full path if it is not on your `PATH` |
 
 **CAPI v1.14 moved its API types into a separate Go module.** Import from
 `sigs.k8s.io/cluster-api/api`, core package `sigs.k8s.io/cluster-api/api/core/v1beta2`. Any guide or
@@ -58,7 +58,7 @@ Makefile. Docker is required for image builds.
 
 - `config/crd/bases/*.yaml` — from `make manifests`
 - `config/rbac/role.yaml` — from `make manifests`
-- `config/webhook/manifests.yaml` — from `make manifests`
+- `config/webhook/manifests.yaml` — from `make manifests` (once webhooks are added; no webhooks exist yet)
 - `**/zz_generated.*.go` — from `make generate`
 - `PROJECT` — kubebuilder metadata
 
@@ -82,14 +82,28 @@ make test                 # unit tests (envtest: real kube-apiserver + etcd)
 Full local loop before opening a PR: `make manifests generate lint test`.
 
 Other targets: `make run` (run against current kubeconfig), `make build`,
-`make docker-build docker-push IMG=…`, `make deploy IMG=…`, `make release-manifests`,
+`make docker-build docker-push IMG=…`, `make release-manifests`,
 `make test-e2e` (needs an **isolated Kind cluster** — never a real dev or prod cluster;
-`make setup-test-e2e` / `make cleanup-test-e2e` manage it).
+`make setup-test-e2e` / `make cleanup-test-e2e` manage it). **`make deploy` is not in that
+list on purpose — see the traps below before running it.**
 
 CI on every PR: `lint`, `test`, `verify`. `test-e2e` runs on `main` and manual dispatch. `release`
 publishes to ghcr on `main` and cuts a GitHub Release on `v*` tags.
 
 ## Repo-specific traps
+
+**`make deploy` strips the manager's libvirt access (PET-45, still open).** The socket
+`volumeMount`, the `hostPath` volume, the `nodeSelector` and the `supplementalGroups` that the live
+Deployment needs exist **only in the cluster** — in `config/manager/manager.yaml` all of them are
+commented out. `make deploy` runs `kustomize build config/default | kubectl apply -f -`, which
+removes all four from the running Deployment. Every libvirt dial then fails with
+`connect: no such file or directory`, each `HydraMachine`/`HydraCluster` flips to `Ready=False`, and
+reconciliation stops.
+
+The failure is **silent at deploy time**: the rollout succeeds, the pod is healthy, metrics still
+serve, and nothing looks wrong until a reconcile actually needs libvirt. So a green
+`kubectl rollout status` proves nothing here. Capture the running pod template *before* deploying,
+re-apply the mount/nodeSelector/groups after, and verify libvirt is reachable.
 
 **Example manifests go in `docs/examples/`, NOT `config/samples/`.** The samples suite applies every
 file under `config/samples/` against envtest, which loads only *this* provider's CRDs — Cluster API's
