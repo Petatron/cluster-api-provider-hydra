@@ -79,7 +79,12 @@ make lint-fix             # after editing any *.go
 make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
-Full local loop before opening a PR: `make manifests generate lint test`.
+Full local loop before opening a PR: `make manifests generate lint test build`.
+
+**Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
+it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
+compile `./cmd` (the package) rather than `cmd/main.go`; naming a single file compiles only that
+file, so anything else in `package main` is silently left out.
 
 Other targets: `make run` (run against current kubeconfig), `make build`,
 `make docker-build docker-push IMG=…`, `make release-manifests`,
@@ -92,18 +97,32 @@ publishes to ghcr on `main` and cuts a GitHub Release on `v*` tags.
 
 ## Repo-specific traps
 
-**`make deploy` strips the manager's libvirt access (PET-45, still open).** The socket
-`volumeMount`, the `hostPath` volume, the `nodeSelector` and the `supplementalGroups` that the live
-Deployment needs exist **only in the cluster** — in `config/manager/manager.yaml` all of them are
-commented out. `make deploy` runs `kustomize build config/default | kubectl apply -f -`, which
-removes all four from the running Deployment. Every libvirt dial then fails with
-`connect: no such file or directory`, each `HydraMachine`/`HydraCluster` flips to `Ready=False`, and
-reconciliation stops.
+**The backend ConfigMap is yours, not the kustomization's (PET-45).** `libvirt-config` holds
+site-specific values — a hypervisor address, a storage pool, a base image. `config/manager` ships
+`libvirt-config.example.yaml`, which is **deliberately not listed in `kustomization.yaml`**, so
+`make deploy` never creates or overwrites it. Create it once yourself; it then survives every
+redeploy.
 
-The failure is **silent at deploy time**: the rollout succeeds, the pod is healthy, metrics still
-serve, and nothing looks wrong until a reconcile actually needs libvirt. So a green
-`kubectl rollout status` proves nothing here. Capture the running pod template *before* deploying,
-re-apply the mount/nodeSelector/groups after, and verify libvirt is reachable.
+It used to be shipped, and that is how `make deploy` broke a working provider: the placeholders
+(`remoteAddr: ""`) were applied over the operator's real values, and an empty remote address selects
+a local socket the pod does not have. Every `HydraMachine`/`HydraCluster` went `Ready=False` with
+`connect: no such file or directory`.
+
+**The failure is silent at deploy time**: the rollout succeeds, the pod is healthy, metrics still
+serve, and nothing surfaces until a reconcile actually needs libvirt — so a green
+`kubectl rollout status` proves nothing. The manager now logs its resolved backend at startup, and
+logs an error when that backend cannot work, so check the first lines of the log after any deploy:
+
+```bash
+kubectl logs -n cluster-api-provider-hydra-system deploy/cluster-api-provider-hydra-controller-manager \
+  | grep -i 'libvirt backend'
+```
+
+Two related things worth knowing. The `--libvirt-*` flags are **not** passed as args; each defaults
+from its `LIBVIRT_*` environment variable, because `--flag=$(VAR)` cannot be combined with an
+optional ConfigMap — Kubernetes leaves an unresolvable `$(VAR)` literally in place. And the
+ConfigMap's name is now the unprefixed `libvirt-config`: kustomize only rewrites references to
+resources it manages, and it no longer manages this one.
 
 **Example manifests go in `docs/examples/`, NOT `config/samples/`.** The samples suite applies every
 file under `config/samples/` against envtest, which loads only *this* provider's CRDs — Cluster API's

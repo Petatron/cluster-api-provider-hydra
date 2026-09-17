@@ -1,0 +1,110 @@
+# Backend configuration for the Hydra provider -- EXAMPLE, NOT APPLIED.
+#
+# This file is not listed in kustomization.yaml, so `make deploy` never creates
+# or overwrites this ConfigMap. You own it. Copy this file, set the values for
+# your site, and apply it once:
+#
+#   kubectl apply -n cluster-api-provider-hydra-system -f my-libvirt-config.yaml
+#
+# THE NAME IS `libvirt-config`, EXACTLY AS BELOW -- no prefix.
+#
+# It used to be prefixed to `cluster-api-provider-hydra-libvirt-config`, because
+# kustomize rewrites references to resources it manages, and this ConfigMap was
+# one. Now that it is not shipped, kustomize no longer rewrites anything and the
+# Deployment reads the plain name. That is the better arrangement -- an object
+# the operator owns should not have its name decided by our kustomization -- but
+# it does mean an EXISTING deployment must migrate its ConfigMap once:
+#
+#   kubectl -n cluster-api-provider-hydra-system get configmap \
+#     cluster-api-provider-hydra-libvirt-config -o json \
+#     | jq '{apiVersion, kind, metadata: {name: "libvirt-config"}, data}' \
+#     | kubectl apply -n cluster-api-provider-hydra-system -f -
+#
+# Rebuild the object rather than sed-ing the name. A `get -o yaml | sed | apply`
+# carries over metadata.uid, resourceVersion, the last-applied annotation, and --
+# the one that actually bites -- the `cluster.x-k8s.io/provider` label that
+# config/default stamps on everything it ships. clusterctl uses that label to
+# decide which objects belong to this provider, so a copy that keeps it would be
+# deleted by a later `clusterctl delete` or pruned on upgrade: the operator's site
+# config removed by a different verb, which is the same surprise this file exists
+# to prevent. Keeping only apiVersion, kind, name and data leaves a clean object.
+#
+# Do that BEFORE rolling out a manager built from this change, or the manager
+# will find no ConfigMap and log that its backend cannot work -- naming both this
+# name and the old one, because the old object still exists and `kubectl get cm`
+# will look perfectly healthy.
+#
+# Why it is not shipped: these values are site-specific -- somebody's hypervisor
+# address, their storage pool, their base image -- so there is no correct
+# default, and a default that is merely *plausible* is worse than none. Shipping
+# them meant every `make deploy` applied empty placeholders over a working
+# configuration, which cut the manager off from libvirt without any deploy-time
+# error at all (PET-45).
+#
+# Every key is optional to the Deployment, and the manager starts regardless of
+# what is set here -- the backend is still built on the first HydraMachine
+# reconcile, not at startup. That is deliberate: connecting at startup meant a
+# missing pool or an offline hypervisor crash-looped the manager before its
+# health probes came up, so an operator saw a restart count instead of a message.
+#
+# Where a problem shows up depends on which kind it is:
+#
+#   * NOT CONFIGURED -- this ConfigMap missing, or remoteAddr empty with no socket
+#     mounted. The manager says so in its first few log lines: it logs the backend
+#     it resolved, then an error if that backend cannot work. Look here first.
+#
+#         kubectl logs -n cluster-api-provider-hydra-system \
+#           deploy/cluster-api-provider-hydra-controller-manager | head
+#
+#   * CONFIGURED BUT WRONG -- a pool that does not exist, an unreachable address,
+#     a missing base image. Nothing can know that without dialling, so it arrives
+#     as a terminal condition on the object: `kubectl describe hydramachine`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: libvirt-config
+data:
+  # libvirt connection URI.
+  uri: "qemu:///system"
+
+  # host:port of a remote libvirt daemon (TLS port 16514, or 16509 with
+  # insecure: "true").
+  #
+  # REQUIRED for the in-cluster deployment. Leaving it empty selects the local
+  # socket at /var/run/libvirt/libvirt-sock, which the manager pod does not have
+  # because nothing mounts it. The manager does NOT fail at startup -- the pod
+  # stays healthy and keeps serving metrics -- but it logs an error saying the
+  # backend cannot work, and every machine reconcile then fails to connect.
+  # Local-socket mode is for `make run` outside the cluster, or for a pod
+  # deliberately pinned to the hypervisor with the socket mounted -- see the
+  # commented block in manager.yaml.
+  #
+  # Remote connections use TLS. Privileged domain RPCs must not cross an
+  # untrusted network in the clear. Set insecure to "true" only for a trusted
+  # tunnel (SSH, WireGuard). Mount client PKI at pkiPath -- see manager.yaml.
+  #
+  # Preferring a remote address is also the honest default: per architectural
+  # principle 9, the controller must not assume it shares a host with the
+  # hypervisor.
+  remoteAddr: ""
+
+  # "true" dials remoteAddr over raw TCP instead of TLS. Default "false".
+  insecure: "false"
+
+  # Directory inside the container with clientcert.pem, clientkey.pem and
+  # cacert.pem. Unused when insecure is "true" or remoteAddr is empty.
+  pkiPath: "/etc/pki/libvirt"
+
+  # Storage pool that machine disks are created in.
+  #
+  # A fallback now, not a requirement: a HydraCluster names the pool its own
+  # machines use, and that wins. Leave this empty when every cluster names its
+  # own. If neither names one, that is reported as a terminal condition against
+  # the object which can be fixed.
+  storagePool: ""
+
+  # Volume name of a default base image. OPTIONAL, and no longer unreachable:
+  # since HydraMachine's image became optional, a machine that names none falls
+  # back to its HydraCluster's baseImage and then to this value. Resolution is
+  # machine, then cluster, then here.
+  baseImage: ""

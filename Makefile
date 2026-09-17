@@ -133,13 +133,28 @@ release-manifests: manifests generate kustomize ## Build the infrastructure-comp
 		cp metadata.yaml out/metadata.yaml; \
 		exit $$status
 
+.PHONY: verify-installer
+verify-installer: release-manifests ## Assert the release installer ships no operator-owned ConfigMap.
+	@# PET-45: libvirt-config holds site-specific values and is created by whoever
+	@# owns the site, so the installer must never carry a ConfigMap that would
+	@# overwrite it on deploy or upgrade. The comment in
+	@# config/manager/kustomization.yaml is guidance, not a guard -- re-listing the
+	@# example file would pass lint, tests and verify alike. This is the guard.
+	@if grep -qE '^kind: ConfigMap$$' out/infrastructure-components.yaml; then \
+		echo "ERROR: out/infrastructure-components.yaml contains a ConfigMap."; \
+		echo "The provider must not ship one -- see PET-45 and config/manager/libvirt-config.example.yaml."; \
+		grep -nE '^kind: ConfigMap$$' out/infrastructure-components.yaml; \
+		exit 1; \
+	fi
+	@echo "verify-installer: the release installer ships no ConfigMap"
+
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -o bin/manager ./cmd
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run ./cmd
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.

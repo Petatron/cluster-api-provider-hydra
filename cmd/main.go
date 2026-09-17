@@ -76,20 +76,27 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
-	flag.StringVar(&libvirtURI, "libvirt-uri", "qemu:///system",
-		"libvirt connection URI the provider drives.")
-	flag.StringVar(&libvirtRemoteAddr, "libvirt-remote-addr", "",
+	// These six default from the environment rather than being passed as
+	// `--flag=$(VAR)` arguments by the Deployment. The values are site-specific
+	// and live in a ConfigMap the operator owns, which `make deploy` does not
+	// manage -- see envOr and config/manager/libvirt-config.example.yaml.
+	libvirtInsecureDefault, libvirtInsecureErr := envBoolOr("LIBVIRT_INSECURE", false)
+	flag.StringVar(&libvirtURI, "libvirt-uri", envOr("LIBVIRT_URI", "qemu:///system"),
+		"libvirt connection URI the provider drives. Defaults to $LIBVIRT_URI.")
+	flag.StringVar(&libvirtRemoteAddr, "libvirt-remote-addr", envOr("LIBVIRT_REMOTE_ADDR", ""),
 		"host:port of a remote libvirt daemon. Empty uses the local socket. Remote "+
-			"connections use TLS; set --libvirt-insecure for plaintext TCP over a trusted tunnel.")
-	flag.BoolVar(&libvirtInsecure, "libvirt-insecure", false,
-		"Dial the remote libvirt daemon over raw TCP instead of TLS. Only for a trusted tunnel.")
-	flag.StringVar(&libvirtPKIPath, "libvirt-pki-path", "",
+			"connections use TLS; set --libvirt-insecure for plaintext TCP over a trusted tunnel. "+
+			"Defaults to $LIBVIRT_REMOTE_ADDR.")
+	flag.BoolVar(&libvirtInsecure, "libvirt-insecure", libvirtInsecureDefault,
+		"Dial the remote libvirt daemon over raw TCP instead of TLS. Only for a trusted tunnel. "+
+			"Defaults to $LIBVIRT_INSECURE.")
+	flag.StringVar(&libvirtPKIPath, "libvirt-pki-path", envOr("LIBVIRT_PKI_PATH", ""),
 		"Directory containing clientcert.pem, clientkey.pem and cacert.pem for TLS. "+
-			"Empty uses go-libvirt's default search paths.")
-	flag.StringVar(&libvirtPool, "libvirt-storage-pool", "",
-		"libvirt storage pool that machine disks are created in. Required.")
-	flag.StringVar(&libvirtBaseImage, "libvirt-base-image", "",
-		"volume name of the backing image machines are cloned from. Required.")
+			"Empty uses go-libvirt's default search paths. Defaults to $LIBVIRT_PKI_PATH.")
+	flag.StringVar(&libvirtPool, "libvirt-storage-pool", envOr("LIBVIRT_STORAGE_POOL", ""),
+		"libvirt storage pool that machine disks are created in. Defaults to $LIBVIRT_STORAGE_POOL.")
+	flag.StringVar(&libvirtBaseImage, "libvirt-base-image", envOr("LIBVIRT_BASE_IMAGE", ""),
+		"volume name of the backing image machines are cloned from. Defaults to $LIBVIRT_BASE_IMAGE.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -114,6 +121,13 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Reported here rather than at parse time: the logger does not exist until
+	// flags are parsed. Defaulting to TLS on an unparseable value is the safe
+	// direction, but it must not be silent.
+	if libvirtInsecureErr != nil {
+		setupLog.Error(libvirtInsecureErr, "Ignoring unparseable LIBVIRT_INSECURE; defaulting to TLS")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -226,6 +240,15 @@ func main() {
 		PKIPath:     libvirtPKIPath,
 		StoragePool: libvirtPool,
 		BaseImage:   libvirtBaseImage,
+	}
+
+	// Because the backend is built lazily, this log line is the only evidence at
+	// startup of how the manager will reach libvirt. Without it, a ConfigMap that
+	// was never created -- or was overwritten -- shows up only when a machine
+	// reconcile fails, which is the silent failure PET-45 was filed for.
+	setupLog.Info("Resolved libvirt backend configuration", describeBackend(libvirtCfg)...)
+	if err := backendWarning(libvirtCfg, runningInCluster(), socketExists); err != nil {
+		setupLog.Error(err, "Libvirt backend cannot be reached with this configuration")
 	}
 
 	var providerMu sync.Mutex
