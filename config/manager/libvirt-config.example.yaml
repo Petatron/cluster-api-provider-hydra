@@ -1,7 +1,38 @@
-# Backend configuration for the Hydra provider.
+# Backend configuration for the Hydra provider -- EXAMPLE, NOT APPLIED.
 #
-# These values are site-specific -- they name a storage pool and a base image on
-# your hypervisor -- so there is no correct default. Edit them before deploying.
+# This file is not listed in kustomization.yaml, so `make deploy` never creates
+# or overwrites this ConfigMap. You own it. Copy this file, set the values for
+# your site, and apply it once:
+#
+#   kubectl apply -n cluster-api-provider-hydra-system -f my-libvirt-config.yaml
+#
+# THE NAME IS `libvirt-config`, EXACTLY AS BELOW -- no prefix.
+#
+# It used to be prefixed to `cluster-api-provider-hydra-libvirt-config`, because
+# kustomize rewrites references to resources it manages, and this ConfigMap was
+# one. Now that it is not shipped, kustomize no longer rewrites anything and the
+# Deployment reads the plain name. That is the better arrangement -- an object
+# the operator owns should not have its name decided by our kustomization -- but
+# it does mean an EXISTING deployment must migrate its ConfigMap once:
+#
+#   kubectl -n cluster-api-provider-hydra-system get configmap \
+#     cluster-api-provider-hydra-libvirt-config -o yaml \
+#     | sed 's/name: cluster-api-provider-hydra-libvirt-config/name: libvirt-config/' \
+#     | kubectl apply -f -
+#
+# Do that BEFORE rolling out a manager built from this change, or the manager
+# will find no ConfigMap and log that its backend cannot work.
+#
+# Why it is not shipped: these values are site-specific -- somebody's hypervisor
+# address, their storage pool, their base image -- so there is no correct
+# default, and a default that is merely *plausible* is worse than none. Shipping
+# them meant every `make deploy` applied empty placeholders over a working
+# configuration, which cut the manager off from libvirt without any deploy-time
+# error at all (PET-45).
+#
+# Every key is optional to the Deployment. If this ConfigMap does not exist the
+# manager still starts, logs the backend it resolved, and logs an error if that
+# backend cannot work.
 #
 # The manager starts regardless of what is set here. The backend is built on the
 # first HydraMachine reconcile, not at startup, so a missing or wrong value shows

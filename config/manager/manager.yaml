@@ -63,34 +63,45 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-          - --libvirt-uri=$(LIBVIRT_URI)
-          - --libvirt-remote-addr=$(LIBVIRT_REMOTE_ADDR)
-          - --libvirt-insecure=$(LIBVIRT_INSECURE)
-          - --libvirt-pki-path=$(LIBVIRT_PKI_PATH)
-          - --libvirt-storage-pool=$(LIBVIRT_STORAGE_POOL)
-          - --libvirt-base-image=$(LIBVIRT_BASE_IMAGE)
+        # The libvirt settings are NOT passed as args. Each --libvirt-* flag
+        # defaults from the matching variable below, so an absent ConfigMap
+        # leaves the flags at their built-in defaults.
+        #
+        # They used to be `--libvirt-remote-addr=$(LIBVIRT_REMOTE_ADDR)`. That
+        # cannot be combined with optional: true -- Kubernetes leaves an
+        # unresolvable $(VAR) literally in place rather than expanding it to
+        # nothing, so a missing ConfigMap would hand the flag the string
+        # "$(LIBVIRT_REMOTE_ADDR)" and the manager would report an unparseable
+        # address instead of "not configured".
         env:
-          # Sourced from the libvirt-config ConfigMap, which must be edited before
-          # deploying: storagePool and baseImage are site-specific and have no
-          # sensible default.
+          # Sourced from the libvirt-config ConfigMap, which this kustomization
+          # deliberately DOES NOT SHIP -- see libvirt-config.example.yaml. The
+          # values are site-specific (somebody's hypervisor, pool and image), so
+          # applying our placeholders over the operator's real ones is how
+          # `make deploy` used to break a working provider (PET-45).
+          #
+          # optional: true on every key, so a cluster where the ConfigMap has
+          # not been created yet still starts the manager. It logs the resolved
+          # backend at startup and an error if that backend cannot work, rather
+          # than crash-looping -- connecting at startup was tried and was worse.
           - name: LIBVIRT_URI
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: uri}
+              configMapKeyRef: {name: libvirt-config, key: uri, optional: true}
           - name: LIBVIRT_REMOTE_ADDR
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: remoteAddr}
+              configMapKeyRef: {name: libvirt-config, key: remoteAddr, optional: true}
           - name: LIBVIRT_INSECURE
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: insecure}
+              configMapKeyRef: {name: libvirt-config, key: insecure, optional: true}
           - name: LIBVIRT_PKI_PATH
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: pkiPath}
+              configMapKeyRef: {name: libvirt-config, key: pkiPath, optional: true}
           - name: LIBVIRT_STORAGE_POOL
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: storagePool}
+              configMapKeyRef: {name: libvirt-config, key: storagePool, optional: true}
           - name: LIBVIRT_BASE_IMAGE
             valueFrom:
-              configMapKeyRef: {name: libvirt-config, key: baseImage}
+              configMapKeyRef: {name: libvirt-config, key: baseImage, optional: true}
         image: controller:latest
         name: manager
         ports:

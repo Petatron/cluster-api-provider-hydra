@@ -1,6 +1,9 @@
 resources:
 - manager.yaml
-- libvirt-config.yaml
+# libvirt-config.example.yaml is deliberately NOT listed. Its values are
+# site-specific and the operator owns the real ConfigMap; shipping ours here
+# meant `make deploy` applied empty placeholders over a working configuration
+# and silently cut the manager off from libvirt (PET-45).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
