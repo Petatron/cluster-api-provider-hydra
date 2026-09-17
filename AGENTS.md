@@ -79,7 +79,12 @@ make lint-fix             # after editing any *.go
 make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
-Full local loop before opening a PR: `make manifests generate lint test`.
+Full local loop before opening a PR: `make manifests generate lint test build`.
+
+**Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
+it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
+compile `./cmd` (the package) rather than `cmd/main.go`; naming a single file compiles only that
+file, so anything else in `package main` is silently left out.
 
 Other targets: `make run` (run against current kubeconfig), `make build`,
 `make docker-build docker-push IMG=…`, `make release-manifests`,
