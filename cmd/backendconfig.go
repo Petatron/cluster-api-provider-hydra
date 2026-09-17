@@ -110,37 +110,51 @@ func orUnset(s string) string {
 	return s
 }
 
-// backendWarning returns a human-readable reason the configured backend cannot
-// work, or "" when nothing is obviously wrong.
+// backendConfigMapName is the ConfigMap the Deployment reads its LIBVIRT_*
+// variables from. The operator creates it; the kustomization does not ship it.
+const backendConfigMapName = "libvirt-config"
+
+// legacyBackendConfigMapName is what the same ConfigMap was called while it was
+// still a kustomization resource, since kustomize applies its namePrefix to
+// resources it manages. A cluster deployed before that changed still has the
+// object under this name, and the manager will not find it.
+const legacyBackendConfigMapName = "cluster-api-provider-hydra-libvirt-config"
+
+// backendWarning reports why the configured backend cannot work, or nil when
+// nothing is obviously wrong.
 //
 // This deliberately does not dial anything and never blocks startup. It catches
 // the one failure that is both common and silent: the manager running in a pod
-// with no remote address, which selects a local socket that is not mounted. That
-// is exactly what a `make deploy` over an operator-managed ConfigMap produces,
-// and until now it surfaced only as a per-object condition after the fact
-// (PET-45).
+// with no remote address, which selects a local socket that is not mounted --
+// until now visible only as a per-object condition after the fact (PET-45).
+//
+// The in-cluster message names both ConfigMap names on purpose. The most likely
+// way to reach this state is the rename: `kubectl get cm` shows an object that
+// looks entirely correct, because it is still the legacy prefixed one, and an
+// operator told only to "check the ConfigMap exists" is sent the wrong way.
 //
 // socketExists is injected so the check is testable off a real host.
-func backendWarning(cfg libvirtprovider.Config, inCluster bool, socketExists func(string) bool) string {
+func backendWarning(cfg libvirtprovider.Config, inCluster bool, socketExists func(string) bool) error {
 	if cfg.RemoteAddr != "" {
-		return ""
+		return nil
 	}
 	if socketExists(defaultLocalSocket) {
-		return ""
+		return nil
 	}
 	if inCluster {
-		return fmt.Sprintf(
-			"No libvirt remote address is configured and %s does not exist in this container, "+
-				"so every machine reconcile will fail to connect. Set remoteAddr in the "+
-				"libvirt-config ConfigMap, or mount the hypervisor's socket and pin this pod to "+
-				"that node. A `make deploy` overwrites an operator-managed ConfigMap only if it is "+
-				"listed in config/manager/kustomization.yaml -- it is not, so check whether the "+
-				"ConfigMap exists at all",
-			defaultLocalSocket,
+		return fmt.Errorf(
+			"no libvirt remote address is configured and %s does not exist in this container, "+
+				"so every machine reconcile will fail to connect: set remoteAddr in the %q "+
+				"ConfigMap in this namespace, or mount the hypervisor's socket and pin this pod "+
+				"to that node. If this deployment predates the rename, the values are still in "+
+				"%q and must be copied to %q -- the old object still exists, so the ConfigMap "+
+				"looks present while the manager reads nothing",
+			defaultLocalSocket, backendConfigMapName,
+			legacyBackendConfigMapName, backendConfigMapName,
 		)
 	}
-	return fmt.Sprintf(
-		"No libvirt remote address is configured and %s does not exist, so every machine "+
+	return fmt.Errorf(
+		"no libvirt remote address is configured and %s does not exist, so every machine "+
 			"reconcile will fail to connect", defaultLocalSocket,
 	)
 }

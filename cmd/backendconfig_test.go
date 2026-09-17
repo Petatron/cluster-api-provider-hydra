@@ -131,39 +131,48 @@ func TestBackendWarning(t *testing.T) {
 	present := func(string) bool { return true }
 
 	t.Run("remote address configured is never warned about", func(t *testing.T) {
-		if w := backendWarning(libvirtprovider.Config{RemoteAddr: testTLSAddr}, true, absent); w != "" {
-			t.Fatalf("warning = %q, want none", w)
+		if err := backendWarning(libvirtprovider.Config{RemoteAddr: testTLSAddr}, true, absent); err != nil {
+			t.Fatalf("warning = %v, want none", err)
 		}
 	})
 
 	t.Run("local socket present is fine", func(t *testing.T) {
-		if w := backendWarning(libvirtprovider.Config{}, false, present); w != "" {
-			t.Fatalf("warning = %q, want none", w)
+		if err := backendWarning(libvirtprovider.Config{}, false, present); err != nil {
+			t.Fatalf("warning = %v, want none", err)
 		}
 	})
 
 	// This is the PET-45 failure exactly: in a pod, no remote address, no socket
 	// mounted. It used to be visible only once a machine reconcile failed.
-	t.Run("in-cluster with no address and no socket warns", func(t *testing.T) {
-		w := backendWarning(libvirtprovider.Config{}, true, absent)
-		if w == "" {
+	//
+	// The names are asserted rather than just the word "ConfigMap": the most
+	// likely route into this state is the rename, where `kubectl get cm` shows
+	// the legacy object looking perfectly healthy. A message that does not say
+	// which name the manager actually reads sends the operator the wrong way.
+	t.Run("in-cluster names both the expected and the legacy ConfigMap", func(t *testing.T) {
+		err := backendWarning(libvirtprovider.Config{}, true, absent)
+		if err == nil {
 			t.Fatal("no warning for the in-cluster misconfiguration")
 		}
-		if !strings.Contains(w, defaultLocalSocket) {
-			t.Fatalf("warning %q does not name the socket path", w)
-		}
-		if !strings.Contains(w, "ConfigMap") {
-			t.Fatalf("warning %q does not point at the ConfigMap", w)
+		msg := err.Error()
+		for _, want := range []string{
+			defaultLocalSocket,
+			backendConfigMapName,
+			legacyBackendConfigMapName,
+		} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("warning %q does not name %q", msg, want)
+			}
 		}
 	})
 
 	t.Run("out of cluster still warns but does not mention the ConfigMap", func(t *testing.T) {
-		w := backendWarning(libvirtprovider.Config{}, false, absent)
-		if w == "" {
+		err := backendWarning(libvirtprovider.Config{}, false, absent)
+		if err == nil {
 			t.Fatal("no warning when the socket is genuinely missing")
 		}
-		if strings.Contains(w, "ConfigMap") {
-			t.Fatalf("warning %q mentions the ConfigMap outside the cluster", w)
+		if strings.Contains(err.Error(), "ConfigMap") {
+			t.Fatalf("warning %q mentions the ConfigMap outside the cluster", err)
 		}
 	})
 }

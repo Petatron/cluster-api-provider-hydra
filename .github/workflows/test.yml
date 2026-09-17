@@ -62,6 +62,12 @@ jobs:
       - name: Build clusterctl release manifests
         run: make release-manifests
 
+      # The provider must never ship the operator-owned libvirt-config ConfigMap
+      # (PET-45). Nothing else would catch it being listed again: it renders,
+      # lints and tests perfectly well.
+      - name: Assert the installer ships no ConfigMap
+        run: make verify-installer
+
       - name: Upload release manifests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -247,8 +247,8 @@ func main() {
 	// was never created -- or was overwritten -- shows up only when a machine
 	// reconcile fails, which is the silent failure PET-45 was filed for.
 	setupLog.Info("Resolved libvirt backend configuration", describeBackend(libvirtCfg)...)
-	if warning := backendWarning(libvirtCfg, runningInCluster(), socketExists); warning != "" {
-		setupLog.Error(nil, warning)
+	if err := backendWarning(libvirtCfg, runningInCluster(), socketExists); err != nil {
+		setupLog.Error(err, "Libvirt backend cannot be reached with this configuration")
 	}
 
 	var providerMu sync.Mutex

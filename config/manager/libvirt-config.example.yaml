@@ -16,12 +16,23 @@
 # it does mean an EXISTING deployment must migrate its ConfigMap once:
 #
 #   kubectl -n cluster-api-provider-hydra-system get configmap \
-#     cluster-api-provider-hydra-libvirt-config -o yaml \
-#     | sed 's/name: cluster-api-provider-hydra-libvirt-config/name: libvirt-config/' \
-#     | kubectl apply -f -
+#     cluster-api-provider-hydra-libvirt-config -o json \
+#     | jq '{apiVersion, kind, metadata: {name: "libvirt-config"}, data}' \
+#     | kubectl apply -n cluster-api-provider-hydra-system -f -
+#
+# Rebuild the object rather than sed-ing the name. A `get -o yaml | sed | apply`
+# carries over metadata.uid, resourceVersion, the last-applied annotation, and --
+# the one that actually bites -- the `cluster.x-k8s.io/provider` label that
+# config/default stamps on everything it ships. clusterctl uses that label to
+# decide which objects belong to this provider, so a copy that keeps it would be
+# deleted by a later `clusterctl delete` or pruned on upgrade: the operator's site
+# config removed by a different verb, which is the same surprise this file exists
+# to prevent. Keeping only apiVersion, kind, name and data leaves a clean object.
 #
 # Do that BEFORE rolling out a manager built from this change, or the manager
-# will find no ConfigMap and log that its backend cannot work.
+# will find no ConfigMap and log that its backend cannot work -- naming both this
+# name and the old one, because the old object still exists and `kubectl get cm`
+# will look perfectly healthy.
 #
 # Why it is not shipped: these values are site-specific -- somebody's hypervisor
 # address, their storage pool, their base image -- so there is no correct
@@ -30,18 +41,24 @@
 # configuration, which cut the manager off from libvirt without any deploy-time
 # error at all (PET-45).
 #
-# Every key is optional to the Deployment. If this ConfigMap does not exist the
-# manager still starts, logs the backend it resolved, and logs an error if that
-# backend cannot work.
+# Every key is optional to the Deployment, and the manager starts regardless of
+# what is set here -- the backend is still built on the first HydraMachine
+# reconcile, not at startup. That is deliberate: connecting at startup meant a
+# missing pool or an offline hypervisor crash-looped the manager before its
+# health probes came up, so an operator saw a restart count instead of a message.
 #
-# The manager starts regardless of what is set here. The backend is built on the
-# first HydraMachine reconcile, not at startup, so a missing or wrong value shows
-# up as a terminal condition on the HydraMachine rather than as a crash-looping
-# pod -- check `kubectl describe hydramachine`, not the manager logs.
+# Where a problem shows up depends on which kind it is:
 #
-# That is deliberate: connecting at startup meant a missing pool or an offline
-# hypervisor crash-looped the manager before its health probes came up, so an
-# operator saw a restart count instead of a message.
+#   * NOT CONFIGURED -- this ConfigMap missing, or remoteAddr empty with no socket
+#     mounted. The manager says so in its first few log lines: it logs the backend
+#     it resolved, then an error if that backend cannot work. Look here first.
+#
+#         kubectl logs -n cluster-api-provider-hydra-system \
+#           deploy/cluster-api-provider-hydra-controller-manager | head
+#
+#   * CONFIGURED BUT WRONG -- a pool that does not exist, an unreachable address,
+#     a missing base image. Nothing can know that without dialling, so it arrives
+#     as a terminal condition on the object: `kubectl describe hydramachine`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -54,10 +71,13 @@ data:
   # insecure: "true").
   #
   # REQUIRED for the in-cluster deployment. Leaving it empty selects the local
-  # socket at /var/run/libvirt/libvirt-sock, which the manager pod does not have:
-  # nothing mounts it, so the manager fails at startup. Local-socket mode is for
-  # `make run` outside the cluster, or for a pod deliberately pinned to the
-  # hypervisor with the socket mounted -- see the commented block in manager.yaml.
+  # socket at /var/run/libvirt/libvirt-sock, which the manager pod does not have
+  # because nothing mounts it. The manager does NOT fail at startup -- the pod
+  # stays healthy and keeps serving metrics -- but it logs an error saying the
+  # backend cannot work, and every machine reconcile then fails to connect.
+  # Local-socket mode is for `make run` outside the cluster, or for a pod
+  # deliberately pinned to the hypervisor with the socket mounted -- see the
+  # commented block in manager.yaml.
   #
   # Remote connections use TLS. Privileged domain RPCs must not cross an
   # untrusted network in the clear. Set insecure to "true" only for a trusted
