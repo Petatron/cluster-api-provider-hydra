@@ -40,6 +40,12 @@ metadata:
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
 ```
 
+Choosing those numbers is policy, not discovery, and is
+[`autoscaling-policy.md`](autoscaling-policy.md). One thing from there is worth
+repeating here because it is the opposite of what the names suggest: `min-size`
+is a floor for scale-*down*. It does not make the autoscaler grow a pool up to
+it unless `--enforce-node-group-min-size` is set, and it is not.
+
 **2. RBAC for the autoscaler to read templates.** It reads them with a dynamic
 client that lists and watches, not a plain get. `config/rbac/cluster_autoscaler_role.yaml`
 ships the `ClusterRole`, deliberately unbound — the autoscaler's ServiceAccount

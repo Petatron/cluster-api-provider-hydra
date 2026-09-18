@@ -117,6 +117,13 @@ metadata:
   annotations:
     # Without BOTH of these the pool is not a node group and Cluster Autoscaler
     # ignores it entirely -- logging that only at -v=4.
+    #
+    # min-size 1 records that this pool must never be empty -- it runs the
+    # cluster's own add-ons. It does NOT enforce that: min-size is a floor for
+    # scale-DOWN only, so what actually holds the floor is `replicas: 1` below.
+    # Scale this to zero by hand and nothing brings it back unless the
+    # autoscaler runs with --enforce-node-group-min-size. See
+    # ../autoscaling-policy.md.
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "3"
     # The autoscaler's copy of the labels above. It cannot read the
