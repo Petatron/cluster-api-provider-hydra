@@ -15,13 +15,73 @@ resource — never on the `HydraMachineTemplate`.
 This is **policy**: how many machines an operator is willing to pay for. It is a
 separate question from **capacity discovery**, which is how the autoscaler learns
 what one machine in the pool would look like, and which is
-[`scale-from-zero.md`](scale-from-zero.md). The two meet in only one place: a
-pool with `min-size: "0"` needs the capacity contract, because at zero replicas
-there is no `Node` to inspect and an unknown shape is one the autoscaler refuses
-to scale up. Everything else here is independent of it.
+[`scale-from-zero.md`](scale-from-zero.md). Everything below is independent of it
+except one thing, and that one thing is sharper than "needs the capacity
+contract":
 
-Without both annotations the pool is **not a node group at all**. The autoscaler
-discovers groups by these; capacity is irrelevant until they exist.
+**A pool sitting at `replicas: 0` with a broken capacity contract is not a node
+group at all — silently.** The check runs before the bounds are even looked at:
+
+```go
+// clusterapi_nodegroup.go, newNodeGroupFromScalableResource
+if found && replicas == 0 && !scalableResource.CanScaleFromZero() {
+    return nil, nil
+}
+```
+
+and `CanScaleFromZero()` is only "does the resolved capacity contain both `cpu`
+and `memory`". It returns `nil, nil` — no error, no log line, not even at
+`V(4)`. The pool never appears in `NodeGroups()` and does not come back until
+somebody scales it to 1 by hand.
+
+That matters most when validating a new pool: if the capacity contract is wrong,
+the symptom is **not** a discovered pool that declines to grow. It is total
+silence, indistinguishable from the autoscaler never having noticed the apply.
+
+## Only `max-size` is load-bearing for discovery
+
+The natural reading is that both annotations are required and a pool missing
+either is ignored. That is not what happens, and the asymmetry fails **open**.
+
+`parseScalingBounds` tolerates a *missing* annotation — it propagates an error
+only for a malformed one:
+
+```go
+// clusterapi_utils.go
+minSize, err := minSize(annotations)
+if err != nil && err != errMissingMinAnnotation {
+    return 0, 0, err
+}
+```
+
+`minSize()` returns `(0, errMissingMinAnnotation)` when the key is absent, and
+that error is swallowed, so the bound silently becomes `0`. What actually drops a
+resource is a later gate that looks only at the max:
+
+```go
+// clusterapi_nodegroup.go
+if scalableResource.MaxSize()-scalableResource.MinSize() < 0 || scalableResource.MaxSize() == 0 {
+    klog.V(4).Infof("nodegroup %s has no scaling capacity, skipping", scalableResource.Name())
+    return nil, nil
+}
+```
+
+| annotations | result |
+| --- | --- |
+| both, valid | discovered with those bounds |
+| `max-size` only | **discovered, `min-size` silently `0`** |
+| `min-size` only | skipped — `MaxSize() == 0` |
+| `max-size: "0"` | skipped, whatever the min says |
+| non-integer, negative, or `max < min` | hard error — see below |
+
+**Dropping `min-size` does not get you a pool the autoscaler ignores. It gets you
+a fully discovered pool with a floor of zero.** On the system pool that is inert
+today and a licence to drain the cluster's add-on nodes the day scale-down comes
+on.
+
+**A malformed value is not a local problem.** `nodeGroups()` returns `nil, err`
+on the first failure, so one `MachineDeployment` carrying `max-size: "six"` takes
+out discovery for **every** pool in the cluster.
 
 ## The part that surprises people
 
@@ -100,6 +160,24 @@ been tested.
 It is a whole-autoscaler flag, not per-pool. One pool needing a hard floor turns
 it on for every pool in the cluster.
 
+**That is true of this flag, not of scale-down policy generally.** The clusterapi
+provider reads per-node-group overrides off the scalable resource, under the
+prefix `cluster.x-k8s.io/autoscaling-options-`:
+
+```
+cluster.x-k8s.io/autoscaling-options-scaledownutilizationthreshold
+cluster.x-k8s.io/autoscaling-options-scaledowngpuutilizationthreshold
+cluster.x-k8s.io/autoscaling-options-scaledownunneededtime
+cluster.x-k8s.io/autoscaling-options-scaledownunreadytime
+cluster.x-k8s.io/autoscaling-options-maxnodeprovisiontime
+cluster.x-k8s.io/autoscaling-options-maxnodestartuptime
+```
+
+They override the cluster-wide defaults for that pool alone. All of them are
+inert while scale-down is off, so there is nothing to set today — but
+`scaledownunneededtime` on the GPU pool is an obvious PET-13 want, and this is
+where someone will come looking for it.
+
 ## The bounds and the replica count disagree at your peril
 
 Nothing validates `min-size <= replicas <= max-size`. The annotations are
@@ -116,24 +194,48 @@ The combinations that bite:
 - **`min-size` equal to `max-size`** — a fixed-size pool the autoscaler will
   neither grow nor shrink. Legitimate, but say so in a comment, because it reads
   like a mistake.
+- **`max-size: "0"`** — the pool is skipped entirely, whatever `min-size` says,
+  and the only trace is a `V(4)` line. Indistinguishable at default verbosity
+  from a pool with nothing to do.
+- **`min-size` missing** — not an error and not a skip: the pool is discovered
+  with a floor of zero. See above; this is the one that fails open.
+- **either value malformed** — `max-size: "six"`, a negative number, or
+  `max < min` — aborts discovery for every pool in the cluster, not just this
+  one.
 
 ## Checking it
 
 Node groups the autoscaler actually found, with their bounds:
 
 ```sh
-kubectl logs -n kube-system deploy/cluster-autoscaler | grep -i 'node group'
+kubectl logs -n cluster-autoscaler deploy/cluster-autoscaler | grep -iE 'node ?group'
 ```
+
+**The optional space is not a typo.** The two messages that matter are spelled
+differently, and the one worth reading is the odd one out:
+
+| message | source |
+| --- | --- |
+| `discovered node group: %s` | `clusterapi_controller.go` |
+| `nodegroup %s has no scaling capacity, skipping` | `clusterapi_nodegroup.go` |
+
+A `grep 'node group'` matches the first and drops the second — so the operator
+asking "why was my pool not discovered" greps away the answer.
+
+Note the namespace: the `hydra-wl0` autoscaler runs in `cluster-autoscaler`, not
+`kube-system`.
 
 Discovery and capacity resolution are logged at `V(4)`, which the `hydra-wl0`
 deployment sets. At default verbosity a pool the autoscaler skipped and a pool
 with nothing to do look identical — including a pool skipped for missing RBAC.
+And neither grep finds the zero-replica case at the top of this page, which logs
+nothing at all.
 
 The annotations as applied:
 
 ```sh
-kubectl get machinedeployment -o custom-columns=\
-'NAME:.metadata.name,REPLICAS:.spec.replicas,MIN:.metadata.annotations.cluster\.x-k8s\.io/cluster-api-autoscaler-node-group-min-size,MAX:.metadata.annotations.cluster\.x-k8s\.io/cluster-api-autoscaler-node-group-max-size'
+kubectl get machinedeployment -A -o custom-columns=\
+'NAMESPACE:.metadata.namespace,NAME:.metadata.name,REPLICAS:.spec.replicas,MIN:.metadata.annotations.cluster\.x-k8s\.io/cluster-api-autoscaler-node-group-min-size,MAX:.metadata.annotations.cluster\.x-k8s\.io/cluster-api-autoscaler-node-group-max-size'
 ```
 
 ## What is verified, and what is not
@@ -143,6 +245,15 @@ Cluster Autoscaler v1.35.2 source, which is the version `hydra-wl0` runs — not
 from documentation that might describe a different release. The deployed flag
 set (`--scale-down-enabled=false`, no `--enforce-node-group-min-size`) was read
 from the live manifest in `hydra-gitops`.
+
+**`--scale-down-enabled` is deprecated in that same version.** `flags.go`
+declares it `"[Deprecated] Should CA scale down the cluster"` and warns at
+startup whenever it is `false`, which on `hydra-wl0` is always. No replacement is
+offered. That is worth holding onto here, because the argument for setting
+`min-size` carefully now is "PET-13 will turn scale-down on" — and the flag
+PET-13 would flip may not exist by then. What is wanted is scale-down off
+entirely, not that particular flag; `hydra-gitops` records the same intent in the
+comment above the flag.
 
 **Not verified.** No pool in these examples has been applied to a cluster, so
 the autoscaler has never actually discovered one of them as a node group with
