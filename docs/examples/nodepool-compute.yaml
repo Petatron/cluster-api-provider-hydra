@@ -106,8 +106,20 @@ metadata:
   name: pool-compute
   namespace: default
   annotations:
-    # Without BOTH of these the pool is not a node group and Cluster Autoscaler
-    # ignores it entirely -- logging that only at -v=4.
+    # max-size is what makes this a node group. Because min-size here is 0,
+    # removing max-size or setting it "0" makes the autoscaler SKIP this pool --
+    # logging that only at -v=4. (On a pool with a nonzero min it would instead
+    # be max < min, a hard error; see nodepool-system.yaml.)
+    #
+    # min-size is NOT symmetric. A missing min is swallowed, not rejected, and
+    # the bound silently becomes 0 -- so dropping it gives a fully discovered
+    # pool with a floor of zero, not a pool that is ignored. A MALFORMED value in
+    # either aborts discovery for every pool in the cluster, not just this one.
+    #
+    # max-size is the bound that is always enforced. min-size is a floor for
+    # scale-DOWN only: it does not make the autoscaler grow the pool up to it
+    # unless --enforce-node-group-min-size is set, and it is not. See
+    # ../autoscaling-policy.md.
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "6"
     # The autoscaler's copy of the labels above. It cannot read the

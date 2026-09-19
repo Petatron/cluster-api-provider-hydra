@@ -233,5 +233,8 @@ dry-run tests.
 They **have not been applied**, since doing so creates virtual machines. So the
 field placement, the traps and the recipe are each verified, while the assembled
 result is not. A zero-replica pool is the cheap way to change that — it builds
-nothing until a pod pends — and that is PET-11's policy call and PET-12's
-demonstration.
+nothing until a pod pends — and the scale-up that follows is PET-12.
+
+How each pool's `min-size` and `max-size` were chosen, and why `min-size`
+currently constrains nothing on `hydra-wl0`, is
+[`autoscaling-policy.md`](autoscaling-policy.md).

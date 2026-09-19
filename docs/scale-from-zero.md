@@ -29,9 +29,13 @@ through cloud-init, so `amd64`/`linux` are structural facts rather than defaults
 
 Two things are needed, neither of them in this provider.
 
-**1. Min/max annotations on the MachineDeployment.** The autoscaler discovers
-node groups by these; without them the pool is not a node group at all.
-Capacity is irrelevant until they exist.
+**1. Min/max annotations on the MachineDeployment.** A missing annotation reads
+as `0`, and then `max < min` is a hard error while `max == 0` is a silent skip.
+For the `min-size: "0"` pool below that means removing `max-size` skips the pool;
+on a pool with a nonzero min the same edit errors and aborts discovery for every
+pool in the cluster. A missing `min-size` is never an error — the bound becomes
+`0`, giving a discovered pool with a floor of zero. See
+[`autoscaling-policy.md`](autoscaling-policy.md).
 
 ```yaml
 metadata:
@@ -39,6 +43,12 @@ metadata:
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
     cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
 ```
+
+Choosing those numbers is policy, not discovery, and is
+[`autoscaling-policy.md`](autoscaling-policy.md). One thing from there is worth
+repeating here because it is the opposite of what the names suggest: `min-size`
+is a floor for scale-*down*. It does not make the autoscaler grow a pool up to
+it unless `--enforce-node-group-min-size` is set, and it is not.
 
 **2. RBAC for the autoscaler to read templates.** It reads them with a dynamic
 client that lists and watches, not a plain get. `config/rbac/cluster_autoscaler_role.yaml`
