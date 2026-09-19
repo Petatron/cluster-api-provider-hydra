@@ -106,8 +106,10 @@ metadata:
   name: pool-compute
   namespace: default
   annotations:
-    # max-size is what makes this a node group: without it, or with it "0", the
-    # autoscaler skips the pool -- logging that only at -v=4.
+    # max-size is what makes this a node group. Because min-size here is 0,
+    # removing max-size or setting it "0" makes the autoscaler SKIP this pool --
+    # logging that only at -v=4. (On a pool with a nonzero min it would instead
+    # be max < min, a hard error; see nodepool-system.yaml.)
     #
     # min-size is NOT symmetric. A missing min is swallowed, not rejected, and
     # the bound silently becomes 0 -- so dropping it gives a fully discovered

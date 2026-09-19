@@ -29,11 +29,13 @@ through cloud-init, so `amd64`/`linux` are structural facts rather than defaults
 
 Two things are needed, neither of them in this provider.
 
-**1. Min/max annotations on the MachineDeployment.** `max-size` is what makes
-the pool a node group: without it, or with it `"0"`, the autoscaler skips the
-pool and capacity is irrelevant. A missing `min-size` is *not* symmetric — it is
-swallowed and the bound becomes `0`, giving a discovered pool with a floor of
-zero. See [`autoscaling-policy.md`](autoscaling-policy.md).
+**1. Min/max annotations on the MachineDeployment.** A missing annotation reads
+as `0`, and then `max < min` is a hard error while `max == 0` is a silent skip.
+For the `min-size: "0"` pool below that means removing `max-size` skips the pool;
+on a pool with a nonzero min the same edit errors and aborts discovery for every
+pool in the cluster. A missing `min-size` is never an error — the bound becomes
+`0`, giving a discovered pool with a floor of zero. See
+[`autoscaling-policy.md`](autoscaling-policy.md).
 
 ```yaml
 metadata:

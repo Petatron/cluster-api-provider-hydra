@@ -20,7 +20,10 @@ except one thing, and that one thing is sharper than "needs the capacity
 contract":
 
 **A pool sitting at `replicas: 0` with a broken capacity contract is not a node
-group at all — silently.** The check runs before the bounds are even looked at:
+group at all — silently.** The check runs before the `max == 0` gate, though
+*after* the bounds have been parsed and validated — so this silence assumes the
+annotations themselves parse cleanly. A pool with both a broken capacity contract
+and a malformed bound fails loudly instead:
 
 ```go
 // clusterapi_nodegroup.go, newNodeGroupFromScalableResource
@@ -35,16 +38,29 @@ and `memory`". It returns `nil, nil` — no error, no log line, not even at
 somebody scales it to 1 by hand.
 
 That matters most when validating a new pool: if the capacity contract is wrong,
-the symptom is **not** a discovered pool that declines to grow. It is total
-silence, indistinguishable from the autoscaler never having noticed the apply.
+the symptom is **not** a discovered pool that declines to grow. It is silence,
+indistinguishable from the autoscaler never having noticed the apply.
 
-## Only `max-size` is load-bearing for discovery
+So the first thing to check is `HydraMachineTemplate.status.capacity`, not the
+annotations — but for a reason specific to these examples rather than a general
+one. `InstanceCapacity()` *does* fall back to the capacity annotations when the
+infrastructure object cannot be read, but only `if len(capacityAnnotations) > 1`,
+and `pods` is populated unconditionally — so the fallback needs a real
+`capacity.cluster-autoscaler.kubernetes.io/cpu` or `/memory`. All three examples
+set only `/labels` and `/taints`, so there is no fallback and the template status
+is the only source.
 
-The natural reading is that both annotations are required and a pool missing
-either is ignored. That is not what happens, and the asymmetry fails **open**.
+## What the two annotations actually gate
 
-`parseScalingBounds` tolerates a *missing* annotation — it propagates an error
-only for a malformed one:
+The natural reading is that both are required and a pool missing either is
+ignored. That is not what happens. One rule covers every case:
+
+> **A missing annotation reads as `0`. Then two gates run, in order:
+> `max < min` is a hard error, and `max == 0` is a silent skip.**
+
+A missing annotation is tolerated, not rejected — `parseScalingBounds`
+propagates an error only for a malformed value, and the "missing" error is
+swallowed after the bound has already defaulted to `0`:
 
 ```go
 // clusterapi_utils.go
@@ -52,36 +68,46 @@ minSize, err := minSize(annotations)
 if err != nil && err != errMissingMinAnnotation {
     return 0, 0, err
 }
+...
+if maxSize < minSize {
+    return 0, 0, errInvalidMaxAnnotation   // gate 1: hard error
+}
 ```
-
-`minSize()` returns `(0, errMissingMinAnnotation)` when the key is absent, and
-that error is swallowed, so the bound silently becomes `0`. What actually drops a
-resource is a later gate that looks only at the max:
 
 ```go
 // clusterapi_nodegroup.go
 if scalableResource.MaxSize()-scalableResource.MinSize() < 0 || scalableResource.MaxSize() == 0 {
     klog.V(4).Infof("nodegroup %s has no scaling capacity, skipping", scalableResource.Name())
-    return nil, nil
+    return nil, nil                        // gate 2: silent skip
 }
 ```
 
-| annotations | result |
-| --- | --- |
-| both, valid | discovered with those bounds |
-| `max-size` only | **discovered, `min-size` silently `0`** |
-| `min-size` only | skipped — `MaxSize() == 0` |
-| `max-size: "0"` | skipped, whatever the min says |
-| non-integer, negative, or `max < min` | hard error — see below |
+Everything follows from that:
 
-**Dropping `min-size` does not get you a pool the autoscaler ignores. It gets you
-a fully discovered pool with a floor of zero.** On the system pool that is inert
-today and a licence to drain the cluster's add-on nodes the day scale-down comes
-on.
+| annotations | effective (min, max) | result |
+| --- | --- | --- |
+| `min "0"`, `max "6"` | (0, 6) | discovered |
+| `max "6"` only | (0, 6) | **discovered, `min` silently `0`** |
+| `min "0"` only | (0, 0) | skipped |
+| `min "1"` only | (1, 0) | **hard error — `max < min`** |
+| `max "0"`, min absent or `"0"` | (0, 0) | skipped |
+| `max "0"`, `min "1"` | (1, 0) | **hard error — `max < min`** |
+| non-integer or negative | — | hard error |
 
-**A malformed value is not a local problem.** `nodeGroups()` returns `nil, err`
-on the first failure, so one `MachineDeployment` carrying `max-size: "six"` takes
-out discovery for **every** pool in the cluster.
+Two consequences, and they pull in opposite directions.
+
+**Dropping `min-size` fails open.** It does not get you a pool the autoscaler
+ignores; it gets you a fully discovered pool with a floor of zero. On the system
+pool that is inert today and a licence to drain the cluster's add-on nodes the
+day scale-down comes on.
+
+**Dropping or zeroing `max-size` fails loudly — but only on a pool whose `min` is
+above zero, and not locally.** `nodeGroups()` returns `nil, err` on the first
+failure, so that one `MachineDeployment` takes out discovery for **every** pool
+in the cluster. The same edit on a `min-size: "0"` pool merely removes that pool,
+quietly. Of the three examples only
+[`nodepool-system.yaml`](examples/nodepool-system.yaml) has a nonzero min, which
+makes it the only one where this distinction is live.
 
 ## The part that surprises people
 
@@ -194,9 +220,10 @@ The combinations that bite:
 - **`min-size` equal to `max-size`** — a fixed-size pool the autoscaler will
   neither grow nor shrink. Legitimate, but say so in a comment, because it reads
   like a mistake.
-- **`max-size: "0"`** — the pool is skipped entirely, whatever `min-size` says,
-  and the only trace is a `V(4)` line. Indistinguishable at default verbosity
-  from a pool with nothing to do.
+- **`max-size: "0"`** — skipped when `min-size` is `0` or absent, with a `V(4)`
+  line as the only trace, indistinguishable at default verbosity from a pool
+  with nothing to do. With a nonzero `min-size` it is instead `max < min`, the
+  cluster-wide hard error below.
 - **`min-size` missing** — not an error and not a skip: the pool is discovered
   with a floor of zero. See above; this is the one that fails open.
 - **either value malformed** — `max-size: "six"`, a negative number, or
@@ -218,6 +245,7 @@ differently, and the one worth reading is the odd one out:
 | --- | --- |
 | `discovered node group: %s` | `clusterapi_controller.go` |
 | `nodegroup %s has no scaling capacity, skipping` | `clusterapi_nodegroup.go` |
+| `Unable to read infrastructure reference, error: %v` | `clusterapi_unstructured.go` |
 
 A `grep 'node group'` matches the first and drops the second — so the operator
 asking "why was my pool not discovered" greps away the answer.
@@ -225,11 +253,21 @@ asking "why was my pool not discovered" greps away the answer.
 Note the namespace: the `hydra-wl0` autoscaler runs in `cluster-autoscaler`, not
 `kube-system`.
 
+The third line is why the grep matters for the zero-replica case too. The
+capacity contract breaks in two ways and only one of them is truly silent:
+
+- **Template unreadable** — RBAC, wrong name, not created yet.
+  `readInfrastructureReferenceResource` logs `Unable to read infrastructure
+  reference` on the way out. A trace exists, but `grep 'node ?group'` does not
+  match it — the same trap as the `nodegroup`/`node group` split above.
+- **Template readable, `status.capacity` missing `cpu` or `memory`** — nothing is
+  logged anywhere, by anything.
+
+Both end at the same `return nil, nil` and the pool vanishes either way.
+
 Discovery and capacity resolution are logged at `V(4)`, which the `hydra-wl0`
 deployment sets. At default verbosity a pool the autoscaler skipped and a pool
 with nothing to do look identical — including a pool skipped for missing RBAC.
-And neither grep finds the zero-replica case at the top of this page, which logs
-nothing at all.
 
 The annotations as applied:
 

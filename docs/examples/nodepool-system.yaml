@@ -115,13 +115,16 @@ metadata:
   name: pool-system
   namespace: default
   annotations:
-    # max-size is what makes this a node group: without it, or with it "0", the
-    # autoscaler skips the pool -- logging that only at -v=4.
+    # max-size is what makes this a node group. Remove it, or set it "0", and
+    # because min-size here is 1 this pool is NOT skipped -- it is max < min, a
+    # hard error, and that error aborts discovery for EVERY pool in the cluster.
+    # This is the only example pool with a nonzero min, so it is the only one
+    # where that distinction is live.
     #
-    # min-size is NOT symmetric. A missing min is swallowed, not rejected, and
-    # the bound silently becomes 0 -- so dropping it gives a fully discovered
-    # pool with a floor of zero, not a pool that is ignored. A MALFORMED value in
-    # either aborts discovery for every pool in the cluster, not just this one.
+    # min-size is NOT symmetric with it. A missing min is swallowed, not
+    # rejected, and the bound silently becomes 0 -- so dropping THIS line gives a
+    # fully discovered pool with a floor of zero, which is exactly the floor this
+    # pool must not have.
     #
     # min-size 1 records that this pool must never be empty -- it runs the
     # cluster's own add-ons. It does NOT enforce that: min-size is a floor for
