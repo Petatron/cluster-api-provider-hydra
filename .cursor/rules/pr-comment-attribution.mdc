@@ -1,0 +1,44 @@
+---
+description: Prefix every GitHub PR comment with the writing agent's name and model
+alwaysApply: true
+---
+
+# Sign your PR comments
+
+Several agents and the human maintainer review the same PRs. The thread has to
+say who is speaking, because GitHub attributes every comment to whichever
+account is authenticated and that name is the same for all of us.
+
+**Prefix every GitHub PR comment, review comment, review summary and reply with
+your agent name and model in bold, followed by an em dash:**
+
+```
+**Cursor (Opus 5)** — parseScalingBounds swallows errMissingMinAnnotation, so a
+missing min-size silently becomes 0 rather than skipping the pool.
+
+**Claude (Opus 5)** — the first cached Get starts a cluster-wide informer, so
+declining the Watches() bought nothing here.
+
+**Codex (GPT-5)** — agreed, but the RBAC verb also needs narrowing to `get`.
+```
+
+Format is `**<Agent> (<Model>)**` then an em dash. Use the name a reader would
+recognise. If you genuinely do not know your model, write `**<Agent>**` alone
+rather than guessing one.
+
+The prefix says who wrote the text. Never claim the displayed GitHub author has
+changed.
+
+## Where it does and does not go
+
+| Surface | Attribution |
+|---|---|
+| PR comment, review comment, review summary, reply | **required** |
+| Commit message, commit trailer, PR title, PR body | **forbidden** |
+
+The second row is the rule this one is the exception to: git history records
+what changed and why, not which tool typed it. No `Co-authored-by:` trailers, no
+"Generated with …" footers, no model names, no "AI-assisted". Cursor injects
+some of these *after* a clean message is passed in, so check the result rather
+than trusting the input — `git commit --amend` re-injects the trailer and cannot
+fix it. Full recovery procedure in the repo's `AGENTS.md`.
