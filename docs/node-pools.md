@@ -230,11 +230,16 @@ boot, look healthy, and never become Nodes. **Dry-run cannot catch that**: the
 bar for a pool example is joinability, not admission, and admission is all a
 dry-run tests.
 
-They **have not been applied**, since doing so creates virtual machines. So the
-field placement, the traps and the recipe are each verified, while the assembled
-result is not. A zero-replica pool is the cheap way to change that — it builds
-nothing until a pod pends — and the scale-up that follows is PET-12.
+**The compute pool has been applied and exercised end to end** on `hydra-wl0`:
+applied at `replicas: 0` and discovered (PET-11), scaled 0 → 1 by a pending pod
+onto a Hydra-built VM that joined and ran it (PET-12), and scaled 1 → 0 by the
+autoscaler once a PodDisruptionBudget stopped blocking it, with the VM and both
+its volumes reclaimed (PET-13). So for that pool the assembled result is
+verified, not only its parts.
 
-How each pool's `min-size` and `max-size` were chosen, and why `min-size`
-currently constrains nothing on `hydra-wl0`, is
-[`autoscaling-policy.md`](autoscaling-policy.md).
+**The system and GPU pools have not been applied.** Their field placement and
+bootstrap are verified as above, but not the assembled result — and the GPU pool
+cannot be, until PET-33 decides how a guest gets a GPU.
+
+How each pool's `min-size` and `max-size` were chosen, and what `min-size` does
+now that scale-down is on, is [`autoscaling-policy.md`](autoscaling-policy.md).

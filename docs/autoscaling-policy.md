@@ -97,9 +97,9 @@ Everything follows from that:
 Two consequences, and they pull in opposite directions.
 
 **Dropping `min-size` fails open.** It does not get you a pool the autoscaler
-ignores; it gets you a fully discovered pool with a floor of zero. On the system
-pool that is inert today and a licence to drain the cluster's add-on nodes the
-day scale-down comes on.
+ignores; it gets you a fully discovered pool with a floor of zero. With
+scale-down on — as it has been on `hydra-wl0` since PET-13 — that is a licence to
+drain the system pool's add-on nodes the moment they look idle.
 
 **Dropping or zeroing `max-size` fails loudly — but only on a pool whose `min` is
 above zero, and not locally.** `nodeGroups()` returns `nil, err` on the first
@@ -124,13 +124,12 @@ verified against the v1.35.2 source:
 So on a default deployment, `min-size: "1"` does not guarantee one machine. It
 guarantees the autoscaler will not be the thing that removes the last one.
 
-**On `hydra-wl0` today, `min-size` constrains nothing whatsoever.** That
-deployment sets `--scale-down-enabled=false` (PET-10 deliberately left scale-down
-to PET-13), and `--enforce-node-group-min-size` is not set. Scale-down is the
-only behaviour `min-size` bounds, and it never runs — so the annotation is a
-declaration of intent that becomes load-bearing the day PET-13 turns scale-down
-on. It is worth setting correctly now precisely because nothing will complain if
-it is wrong.
+**On `hydra-wl0`, `min-size` has been load-bearing since PET-13 turned
+scale-down on.** Before that the deployment ran `--scale-down-enabled=false`, and
+since scale-down is the only behaviour `min-size` bounds, the annotation
+constrained nothing at all. Now it is the floor the autoscaler will not shrink a
+pool below. `--enforce-node-group-min-size` is still not set, so it is *only* a
+scale-down floor: nothing grows a pool back up to it.
 
 The practical consequence: **a pool's actual floor is its `replicas`, not its
 `min-size`.** The system pool in
@@ -180,8 +179,8 @@ Know what it costs before doing so: it makes the autoscaler build machines
 because of a number, with no pending pod anywhere. On a pool whose `min-size`
 was set aspirationally rather than deliberately, that is a fleet of idle
 machines appearing the moment the flag is added. Audit every pool's `min-size`
-first — on this deployment they have never been enforced, so they have never
-been tested.
+first — on this deployment they have never been enforced as a scale-*up* floor,
+so in that role they have never been tested.
 
 It is a whole-autoscaler flag, not per-pool. One pool needing a hard floor turns
 it on for every pool in the cluster.
@@ -199,10 +198,73 @@ cluster.x-k8s.io/autoscaling-options-maxnodeprovisiontime
 cluster.x-k8s.io/autoscaling-options-maxnodestartuptime
 ```
 
-They override the cluster-wide defaults for that pool alone. All of them are
-inert while scale-down is off, so there is nothing to set today — but
-`scaledownunneededtime` on the GPU pool is an obvious PET-13 want, and this is
-where someone will come looking for it.
+They override the cluster-wide defaults for that pool alone, and since PET-13
+they are live on `hydra-wl0`. The one in use is the exemption on
+`hydra-wl0-md-0`, whose workers run all of Argo CD with no PodDisruptionBudget:
+
+```yaml
+cluster.x-k8s.io/autoscaling-options-scaledownutilizationthreshold: "0"
+```
+
+It works, with a limit worth knowing. A node counts as underutilised when its
+utilisation is **at or below** the threshold — the source tests
+`Utilization > threshold` for "not underutilised" — so `"0"` protects every node
+that requests anything, but **not** a node with literally nothing requested.
+DaemonSets normally keep a node above zero (on md-0 they alone request 20m CPU),
+so the exemption holds in practice rather than by construction; `min-size` stays
+the absolute floor.
+
+Two failure modes, neither of which raises an error. A value that does not parse
+logs `failed to convert autoscaling_options option … to float` at warning level
+and the cluster default applies; an **empty** value is skipped with no log at all.
+The key is lowercase and the prefix match is case-sensitive. Confirm an exemption
+from the log rather than trusting the annotation — see [Checking it](#checking-it).
+
+`scaledownunneededtime` on the GPU pool remains an obvious want once that pool is
+real (PET-33).
+
+## How scale-down removes a node
+
+What PET-13 observed on `hydra-wl0`, with the governing defaults read from the
+1.35.2 source:
+
+1. **Underutilised.** Utilisation is the higher of cpu and memory *requested*
+   over allocatable — a GPU node uses its GPU instead. At or below
+   `--scale-down-utilization-threshold` (default `0.5`), or the pool's override,
+   the node becomes a candidate.
+2. **Simulated.** The autoscaler simulates moving every pod elsewhere. One pod
+   that cannot move makes the whole node unremovable: a PodDisruptionBudget with
+   no disruptions left, a pod using local storage such as `emptyDir` or `hostPath`
+   (`--skip-nodes-with-local-storage` defaults to true), or nowhere to schedule.
+
+   ```
+   Node pool-compute-… cannot be removed: not enough pod disruption budget to move default/pdb-demo-…
+   ```
+
+   An unremovable node is re-simulated only after
+   `--unremovable-node-recheck-timeout` (default 5 minutes), not on every loop.
+   PET-13's refusals landed 5 minutes apart. A log sample shorter than that can
+   show nothing at all and look like a failure.
+3. **Unneeded.** A node that passes the simulation must stay unneeded for
+   `--scale-down-unneeded-time` (default 10 minutes, overridable per pool) before
+   anything happens. PET-13 measured 10m15s from "unneeded" to cordon.
+4. **Cooldown.** For `--scale-down-delay-after-add` (default 10 minutes) after any
+   scale-up, nothing is deleted — but steps 1 and 2 still run. So a refusal logged
+   during cooldown is evidence about the PodDisruptionBudget, not about safety,
+   since nothing would have been deleted anyway. A node that survives *after*
+   cooldown is the evidence that counts.
+5. **Drained by the autoscaler, then deleted by Cluster API.** The autoscaler
+   cordons the node and evicts its pods itself — DaemonSet pods included, since
+   `--daemonset-eviction-for-occupied-nodes` defaults to true — and only then
+   marks the Machine with `cluster.x-k8s.io/delete-machine` and lowers the
+   replica count. The MachineSet deletes exactly the marked Machine, and Cluster
+   API runs its normal delete lifecycle on the already-empty node: drain, volume
+   detach, infrastructure (the VM), bootstrap, Node. In PET-13 that took four
+   seconds.
+
+Marking a Machine is an `update` on it, which RBAC cannot pin by name because
+Machine names are generated. How `hydra-wl0` fences that grant is in
+`hydra-gitops/clusters/hydra-wl0/management-cluster/cluster-autoscaler-rbac.yaml`.
 
 ## The bounds and the replica count disagree at your peril
 
@@ -212,9 +274,9 @@ treats what it finds as the truth.
 
 The combinations that bite:
 
-- **`replicas` above `max-size`** — the autoscaler will not scale the group down
-  to the bound (that is scale-down, which is off here), and will refuse to scale
-  it up. The pool sits over budget indefinitely.
+- **`replicas` above `max-size`** — scale-up is refused, and scale-down does
+  not treat the bound as a target: it removes only nodes it finds underutilised.
+  So the pool stays over budget until its nodes happen to go idle.
 - **`replicas` below `min-size`, enforcement off** — nothing happens, which is
   the case described above. The floor is fiction.
 - **`min-size` equal to `max-size`** — a fixed-size pool the autoscaler will
@@ -269,6 +331,23 @@ Discovery and capacity resolution are logged at `V(4)`, which the `hydra-wl0`
 deployment sets. At default verbosity a pool the autoscaler skipped and a pool
 with nothing to do look identical — including a pool skipped for missing RBAC.
 
+Scale-down, node by node:
+
+```sh
+kubectl logs -n cluster-autoscaler deploy/cluster-autoscaler \
+  | grep -iE 'unremovable|cannot be removed|unneeded|Scale-down: node|failed to convert autoscaling_options'
+```
+
+| message | meaning |
+| --- | --- |
+| `Node %s unremovable: %s requested (…% of allocatable) is above the scale-down utilization threshold` | not a candidate. This is also how a working exemption shows up. The resource named is whichever of cpu and memory is higher, ties going to memory, so `memory requested` is not a failure |
+| `Node %s cannot be removed: %s` | a candidate the simulation refused — PodDisruptionBudget, local storage, or nowhere to go |
+| `%s was unneeded for %s` | a candidate, with the unneeded clock running |
+| `Scale-down: node %s removed with drain` | gone |
+| `failed to convert autoscaling_options option … to float` | a per-pool override did not parse; the default applies |
+
+Sample at least five minutes of log: see step 2 above.
+
 The annotations as applied:
 
 ```sh
@@ -278,24 +357,24 @@ kubectl get machinedeployment -A -o custom-columns=\
 
 ## What is verified, and what is not
 
-**Verified.** The flag names, defaults and semantics above were read from the
-Cluster Autoscaler v1.35.2 source, which is the version `hydra-wl0` runs — not
-from documentation that might describe a different release. The deployed flag
-set (`--scale-down-enabled=false`, no `--enforce-node-group-min-size`) was read
-from the live manifest in `hydra-gitops`.
+**Verified from source.** Flag names, defaults and semantics were read from the
+Cluster Autoscaler v1.35.2 source, the version `hydra-wl0` runs, rather than from
+documentation that might describe another release.
 
-**`--scale-down-enabled` is deprecated in that same version.** `flags.go`
-declares it `"[Deprecated] Should CA scale down the cluster"` and warns at
-startup whenever it is `false`, which on `hydra-wl0` is always. No replacement is
-offered. That is worth holding onto here, because the argument for setting
-`min-size` carefully now is "PET-13 will turn scale-down on" — and the flag
-PET-13 would flip may not exist by then. What is wanted is scale-down off
-entirely, not that particular flag; `hydra-gitops` records the same intent in the
-comment above the flag.
+**Verified on hardware**, against [`examples/nodepool-compute.yaml`](examples/nodepool-compute.yaml)
+on `hydra-wl0`:
 
-**Not verified.** No pool in these examples has been applied to a cluster, so
-the autoscaler has never actually discovered one of them as a node group with
-these bounds. Discovery was proven in PET-10 against the management cluster's own
-pool, not against these. Applying the compute pool at `replicas: 0` is the cheap
-way to close that — it creates no virtual machines until a pod pends — and the
-scale-up that follows is PET-12.
+| ticket | what was shown |
+| --- | --- |
+| PET-11 | applied at `replicas: 0`, discovered as `(min: 0, max: 6, replicas: 0)`, no VM built |
+| PET-12 | a pending pod scaled it 0 → 1; Running on a Hydra-built VM in 111 seconds (116 on a repeat) |
+| PET-13 | a PodDisruptionBudget blocked its removal with scale-down fully armed; once relaxed, it scaled 1 → 0 and the VM and both volumes were reclaimed |
+
+The deployed flag set was read from the live manifest in `hydra-gitops`:
+scale-down on (the deprecated `--scale-down-enabled` flag is simply absent), no
+`--enforce-node-group-min-size`, and `hydra-wl0-md-0` exempt as described above.
+
+**Not verified.** The system and GPU pools have never been applied. No pool with
+`min-size` above zero has been scaled down to its floor, so the scale-down floor
+itself is still untested in practice. `--enforce-node-group-min-size` has never
+been turned on.
