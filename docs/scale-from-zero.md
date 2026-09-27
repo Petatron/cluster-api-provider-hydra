@@ -118,40 +118,70 @@ The autoscaler builds its simulated node with `Allocatable = Capacity`, so
 whatever is published here is what it believes is schedulable. A real node
 offers less, and by more than the kubelet's reservations alone.
 
-Measured on `hydra-wl0` against a worker built from a 2 vCPU / 4Gi / 40Gi
-`HydraMachineTemplate` — Ubuntu 24.04, kubeadm defaults, no `kube-reserved` or
-`system-reserved`:
+Measured on `hydra-wl0` — Ubuntu 24.04, kubeadm defaults, no `kube-reserved` or
+`system-reserved`. Each loss depends on the size of **that resource**, not on the
+machine as a whole: the 8Gi control-plane nodes report exactly the memory figures
+of the 8Gi pool worker, and their 40Gi disks exactly the disk figures of the
+2c4g workers. So the table is by resource size, with every node that contributed:
 
-| | published | node capacity | node allocatable | published is over allocatable by |
-| --- | --- | --- | --- | --- |
-| `cpu` | `2` | `2` | `2` | — exact |
-| `memory` | `4Gi` | 4010004Ki | 3907604Ki | **6.8%** |
-| `ephemeral-storage` | `40Gi` | 39535100Ki | ~35581590Ki | **15.2%** |
+| resource | published | `Node.status.capacity` | `Node.status.allocatable` | allocatable below published | nodes measured |
+| --- | --- | --- | --- | --- | --- |
+| `cpu` | `2`, `4` | same | same | — exact | all |
+| `memory` | `4Gi` | 4010004Ki | 3907604Ki | **6.8%** | 2 workers (2c4g) |
+| `memory` | `8Gi` | 8131908Ki | 8029508Ki | **4.3%** | 1 pool worker (4c8g), 3 control plane |
+| `ephemeral-storage` | `40Gi` | 39535100Ki | `36435548100` — bytes | **15.2%** | 2 workers, 3 control plane |
+| `ephemeral-storage` | `80Gi` | 80162804Ki | `73878040045` — bytes | **14.0%** | 1 pool worker |
 
-Two separate losses stack, and only the second is the kubelet's:
+**Read the allocatable disk figure carefully.** The kubelet reports allocatable
+`ephemeral-storage` in plain bytes while capacity is in `Ki`, so `36435548100` is
+35581590Ki — not a figure roughly a thousand times larger than capacity.
+
+Two separate losses stack, and only the second is the kubelet's.
 
 1. **The node's own capacity is already below the machine's size.** The guest
-   kernel does not see all the RAM it was given — about 180Mi goes to kernel and
-   firmware reservations — and the root filesystem is about 2.3Gi smaller than
-   the raw disk once the partition table, `/boot` and filesystem metadata are
-   taken. So published capacity is *not* equal to `Node.status.capacity`; it is
-   4.4% and 5.7% above it respectively.
-2. **Allocatable is below that by the eviction thresholds**, exactly as
-   configured: `memory.available<100Mi` and `nodefs.available<10%`. Both were
-   confirmed to the byte.
+   kernel does not see all the RAM it was given, and the root filesystem is
+   smaller than the raw disk once the partition table, `/boot` and filesystem
+   metadata are taken:
 
-Hydra publishes raw sizing anyway, because the first loss is a property of the
-guest image and its kernel, which the provider does not and cannot know. A
-hardcoded reduction would be right for this image at this disk size and wrong
-for the next one — a guess wearing the costume of a measurement. Raw sizing is
-also what every other Cluster API provider publishes.
+   | | smaller size | larger size |
+   | --- | --- | --- |
+   | RAM kept by kernel and firmware | 4Gi → ~180Mi (4.4%) | 8Gi → ~251Mi (3.1%) |
+   | disk lost to partitioning and filesystem | 40Gi → ~2.3Gi (5.7%) | 80Gi → ~3.55Gi (4.4%) |
 
-**When it matters:** a pod whose requests come within ~7% of the machine's
-memory, or ~15% of its disk, is simulated as fitting and then does not fit. The
-autoscaler adds a node and the pod stays `Pending`, which looks like the
-autoscaler being broken. For a pool that runs pods sized that close, publish
-corrected figures with the capacity annotations — they override this field
-entirely, and they are per-pool, where the image is known.
+   Neither loss is a fixed amount — both grow with the resource, only more slowly
+   than it. They are not even identical between machines of one size: two 4Gi
+   workers report capacity 4Ki apart, and one 8Gi control-plane node sits 12Ki
+   from the others.
+
+2. **Allocatable is below capacity by the eviction thresholds**, as configured:
+   `memory.available<100Mi` — exactly 102400Ki on every node measured — and
+   `nodefs.available<10%`, to within about a hundred bytes.
+
+That second loss is why the two resources behave differently as machines grow:
+
+- **Memory's gap shrinks** — 6.8% at 4Gi, 4.3% at 8Gi — because its eviction
+  threshold is an absolute 100Mi, and the kernel's share grows more slowly than
+  the RAM.
+- **Disk's gap barely moves** — 15.2% at 40Gi, 14.0% at 80Gi — because its
+  eviction threshold is itself a percentage. Expect roughly 14–15% at any size.
+
+Hydra publishes raw sizing anyway. The first loss is a property of the guest
+image and its kernel, which the provider does not and cannot know, and the
+measurements show why a fixed correction would fail: any one percentage would be
+wrong for memory at one of these two sizes, and any size-scaled one would be wrong
+for disk. A hardcoded reduction would be a guess wearing the costume of a
+measurement. Raw sizing is also what every other Cluster API provider publishes.
+
+**When it matters:** a pod whose memory request comes within the memory gap of
+the machine — about 7% on a 4Gi machine, about 4% on an 8Gi one — or within about
+15% of its disk, is simulated as fitting and then does not fit. The autoscaler
+adds a node and the pod stays `Pending`, which looks like the autoscaler being
+broken. For a pool that runs pods sized that close, **measure its class** —
+build one node and read `Node.status.allocatable` — then publish corrected
+figures with the capacity annotations. They override this field entirely, and
+they are per-pool, where the image is known. Two data points per resource are
+enough to show the shape; they are not enough to extrapolate a formula from, so
+do not.
 
 ### GPUs are representable, but Hydra publishes none
 
