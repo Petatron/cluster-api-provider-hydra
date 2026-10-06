@@ -132,9 +132,9 @@ type Config struct {
 	// BaseImage is the volume name of the backing image machines are cloned from.
 	BaseImage string
 
-	// DialTimeout bounds connection establishment. Defaults to 10s. TLS
-	// connections use go-libvirt's own dial timeout; this applies to the local
-	// socket and to Insecure TCP.
+	// DialTimeout bounds connection establishment on every transport. Defaults
+	// to 10s. For TLS it covers the connect, the handshake and libvirtd's
+	// certificate-verification reply together.
 	DialTimeout time.Duration
 
 	// RPCTimeout bounds each exported provider call when the caller did not
