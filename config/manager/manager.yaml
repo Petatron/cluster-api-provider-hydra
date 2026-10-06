@@ -65,6 +65,11 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+        # Lets the manager read the libvirt-pki Secret below at mode 0440. Secret
+        # files are owned by root, and the image runs as 65532:65532, so without
+        # this the only readable mode would be 0444 -- world-readable, for a
+        # private key that controls a hypervisor.
+        fsGroup: 65532
       containers:
       - command:
         - /manager
@@ -155,10 +160,16 @@ spec:
           # any machine that has bootstrap data.
           - name: tmp
             mountPath: /tmp
-        # [REMOTE-TLS] Add:
-        #   - name: libvirt-pki
-        #     mountPath: /etc/pki/libvirt
-        #     readOnly: true
+          # Client PKI for a TLS hypervisor connection: cacert.pem,
+          # clientcert.pem and clientkey.pem, at the libvirt-config ConfigMap's
+          # default pkiPath. Shipped rather than left for the operator to add,
+          # because a hand-added mount is wiped by the next deploy -- the same
+          # way the old socket wiring was (PET-45). The Secret behind it is
+          # optional, so a cluster that has not created it still starts; see
+          # libvirt-config.example.yaml for how to create it.
+          - name: libvirt-pki
+            mountPath: /etc/pki/libvirt
+            readOnly: true
         # [LOCAL-LIBVIRT] To drive libvirt over the host's local socket instead
         # of a remote address, add the entries below and pin the pod to the
         # hypervisor node with a nodeSelector. Add, not replace -- the tmp mount
@@ -217,10 +228,15 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Mi
-      # [REMOTE-TLS] Companion to the PKI mount above:
-      #   - name: libvirt-pki
-      #     secret:
-      #       secretName: libvirt-pki
+        # Like libvirt-config, this Secret is the operator's, never shipped: it
+        # holds a private key. optional: true, because a missing Secret must not
+        # stop the manager starting -- it is only read when TLS is selected,
+        # and then a missing file is reported by name.
+        - name: libvirt-pki
+          secret:
+            secretName: libvirt-pki
+            optional: true
+            defaultMode: 0440
       # [LOCAL-LIBVIRT] Companion to the socket mount above.
       # /run here and /var/run there, deliberately: this path is resolved on the
       # host, where /run is where the socket actually lives.
