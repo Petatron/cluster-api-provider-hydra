@@ -93,6 +93,18 @@ data:
 
   # Directory inside the container with clientcert.pem, clientkey.pem and
   # cacert.pem. Unused when insecure is "true" or remoteAddr is empty.
+  #
+  # The manager mounts an optional Secret named libvirt-pki here. Create it
+  # from a client certificate signed by the CA that signed the hypervisor's
+  # server certificate. The file names are the keys, and they matter:
+  #
+  #   kubectl -n cluster-api-provider-hydra-system create secret generic libvirt-pki \
+  #     --from-file=cacert.pem --from-file=clientcert.pem --from-file=clientkey.pem
+  #
+  # The server certificate must name the address in remoteAddr: dialling an IP
+  # needs that IP as a subjectAltName, not only as the CN. The connection is
+  # mutual TLS -- libvirtd verifies the client certificate too -- so this is
+  # what authenticates the provider, not only what encrypts it.
   pkiPath: "/etc/pki/libvirt"
 
   # Storage pool that machine disks are created in.
