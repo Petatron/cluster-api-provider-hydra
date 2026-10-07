@@ -24,22 +24,43 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// testDialTimeout is short so the bound is visible, and testCloseWithin is the
-// slack allowed for a closed socket to be noticed by the other end.
+// testDialTimeout is short so the bound is visible. testBoundWithin is how late
+// a stalled dial may return: tight enough that a deadline drifting off the
+// configured timeout fails (go-libvirt's was a fixed 20s), loose enough for a
+// loaded CI runner. testCloseWithin is the slack for the other end to notice a
+// closed socket.
 const (
 	testDialTimeout = 200 * time.Millisecond
+	testBoundWithin = 5 * testDialTimeout
 	testCloseWithin = 2 * time.Second
 )
+
+// requireBoundedByTimeout fails unless a stalled dial returned at its deadline:
+// not before it, which would mean something other than the deadline ended it,
+// and not long after it.
+func requireBoundedByTimeout(t *testing.T, elapsed time.Duration) {
+	t.Helper()
+	if elapsed < testDialTimeout {
+		t.Errorf("Dial returned after %s, before its %s deadline -- the deadline did not end it", elapsed, testDialTimeout)
+	}
+	if elapsed > testBoundWithin {
+		t.Errorf("Dial took %s, want it to return at its %s deadline (allowed up to %s)", elapsed, testDialTimeout, testBoundWithin)
+	}
+}
 
 // testPKI is a throwaway CA with a server certificate for 127.0.0.1 and a client
 // certificate, laid out the way the libvirt-pki Secret is mounted.
@@ -204,9 +225,7 @@ func TestTLSDialerBoundsStalledVerificationRead(t *testing.T) {
 	if !strings.Contains(err.Error(), "verify our client certificate") {
 		t.Errorf("Dial error = %q, want it to name the verification step", err)
 	}
-	if elapsed > testCloseWithin {
-		t.Errorf("Dial took %s, want it bounded by the %s dial timeout", elapsed, testDialTimeout)
-	}
+	requireBoundedByTimeout(t, elapsed)
 	requireClosed(t, closed)
 }
 
@@ -228,10 +247,38 @@ func TestTLSDialerBoundsStalledHandshake(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "TLS handshake") {
 		t.Fatalf("Dial error = %v, want a TLS handshake failure", err)
 	}
-	if elapsed := time.Since(start); elapsed > testCloseWithin {
-		t.Errorf("Dial took %s, want it bounded by the %s dial timeout", elapsed, testDialTimeout)
-	}
+	requireBoundedByTimeout(t, time.Since(start))
 	requireClosed(t, closed)
+}
+
+// Nothing listening is the commonest real failure. It must come back at once,
+// wrapped, with the cause still matchable -- not after waiting out the timeout.
+func TestTLSDialerReportsARefusedConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("splitting listener address: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing listener: %v", err)
+	}
+
+	start := time.Now()
+	_, err = newTLSDialer(host, port, newTestPKI(t).clientDir, testDialTimeout).Dial()
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "connecting to") {
+		t.Fatalf("Dial error = %v, want a connect failure", err)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Errorf("Dial error = %v, want it to wrap ECONNREFUSED", err)
+	}
+	if elapsed >= testDialTimeout {
+		t.Errorf("Dial took %s against a closed port, want it to fail at once rather than wait out the %s timeout", elapsed, testDialTimeout)
+	}
 }
 
 func TestTLSDialerConnectsAndClearsTheDeadline(t *testing.T) {
@@ -312,6 +359,15 @@ func TestTLSDialerReportsMissingOrBrokenPKI(t *testing.T) {
 			wantErr: "clientcert.pem",
 		},
 		{
+			// What a libvirt-pki Secret without a clientkey.pem key produces.
+			name: "client certificate but no key",
+			setup: func(t *testing.T, dir string) {
+				copyFile(t, dir, "clientcert.pem")
+				copyFile(t, dir, "cacert.pem")
+			},
+			wantErr: "clientkey.pem",
+		},
+		{
 			name: "no CA certificate",
 			setup: func(t *testing.T, dir string) {
 				copyFile(t, dir, "clientcert.pem")
@@ -358,18 +414,79 @@ func TestNewTLSDialerSearchPaths(t *testing.T) {
 		t.Errorf("port = %q, want libvirtd's default %q", d.port, defaultTLSPort)
 	}
 	if len(d.certDirs) != 1 || d.certDirs[0] != (tlsCertDir{certPath: testPKIPath, keyPath: testPKIPath}) {
-		t.Errorf("certDirs = %v, want only /pki for both certificate and key", d.certDirs)
+		t.Errorf("certDirs = %v, want only %s for both certificate and key", d.certDirs, testPKIPath)
 	}
 	if len(d.caDirs) != 1 || d.caDirs[0] != testPKIPath {
-		t.Errorf("caDirs = %v, want only /pki", d.caDirs)
+		t.Errorf("caDirs = %v, want only %s", d.caDirs, testPKIPath)
 	}
+}
 
-	// Without a PKI path, libvirt's system locations come last, key under private/.
-	d = newTLSDialer(testHost, testTLSPort, "", time.Second)
-	if last := d.certDirs[len(d.certDirs)-1]; last != (tlsCertDir{certPath: "/etc/pki/libvirt/", keyPath: "/etc/pki/libvirt/private/"}) {
-		t.Errorf("last cert dir = %v, want libvirt's system location", last)
+// Without a PKI path the user lookup decides the search order. Stubbed, so the
+// result does not depend on who runs the tests -- a root CI container would
+// otherwise never take the home-directory branch.
+func TestNewTLSDialerHomeDirectoryLookup(t *testing.T) {
+	system := []tlsCertDir{{certPath: "/etc/pki/libvirt/", keyPath: "/etc/pki/libvirt/private/"}}
+	systemCA := []string{"/etc/pki/CA/"}
+	home := filepath.Join("/home/hydra", ".pki", "libvirt")
+
+	for _, tc := range []struct {
+		name       string
+		lookup     func() (*user.User, error)
+		wantCerts  []tlsCertDir
+		wantCADirs []string
+	}{
+		{
+			name:       "non-root user searches its home first",
+			lookup:     func() (*user.User, error) { return &user.User{Uid: "1001", HomeDir: "/home/hydra"}, nil },
+			wantCerts:  append([]tlsCertDir{{certPath: home, keyPath: home}}, system...),
+			wantCADirs: append([]string{home}, systemCA...),
+		},
+		{
+			name:       "root uses only the system locations",
+			lookup:     func() (*user.User, error) { return &user.User{Uid: "0", HomeDir: "/root"}, nil },
+			wantCerts:  system,
+			wantCADirs: systemCA,
+		},
+		{
+			// go-libvirt dereferences a nil user here; skipping the home
+			// directory is this dialer's one deliberate difference.
+			name:       "a failed lookup falls back to the system locations",
+			lookup:     func() (*user.User, error) { return nil, errors.New("no passwd entry") },
+			wantCerts:  system,
+			wantCADirs: systemCA,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saved := currentUser
+			currentUser = tc.lookup
+			t.Cleanup(func() { currentUser = saved })
+
+			d := newTLSDialer(testHost, testTLSPort, "", time.Second)
+			if !slices.Equal(d.certDirs, tc.wantCerts) {
+				t.Errorf("certDirs = %v, want %v", d.certDirs, tc.wantCerts)
+			}
+			if !slices.Equal(d.caDirs, tc.wantCADirs) {
+				t.Errorf("caDirs = %v, want %v", d.caDirs, tc.wantCADirs)
+			}
+		})
 	}
-	if last := d.caDirs[len(d.caDirs)-1]; last != "/etc/pki/CA/" {
-		t.Errorf("last CA dir = %q, want /etc/pki/CA/", last)
+}
+
+// With several search directories, an incomplete one is skipped for the next.
+func TestTLSDialerFallsThroughToTheNextSearchDirectory(t *testing.T) {
+	empty, full := t.TempDir(), newTestPKI(t).clientDir
+	d := &tlsDialer{
+		host: testHost, port: testTLSPort, timeout: time.Second,
+		certDirs: []tlsCertDir{{certPath: empty, keyPath: empty}, {certPath: full, keyPath: full}},
+		caDirs:   []string{empty, full},
+	}
+	if _, err := d.config(); err != nil {
+		t.Fatalf("config() = %v, want the second directory's PKI to be used", err)
+	}
+}
+
+func TestNewTLSDialerDefaultsTheTimeout(t *testing.T) {
+	if got := newTLSDialer(testHost, testTLSPort, testPKIPath, 0).timeout; got != defaultConnectTimeout {
+		t.Errorf("timeout = %s, want the %s connect default that New also applies", got, defaultConnectTimeout)
 	}
 }

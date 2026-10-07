@@ -65,11 +65,19 @@ type tlsCertDir struct {
 	certPath, keyPath string
 }
 
+// currentUser is user.Current, swappable so tests can pin the home-directory
+// search path regardless of which user runs them.
+var currentUser = user.Current
+
 // newTLSDialer returns a dialer for host:port. An empty port means libvirtd's
-// default; an empty pkiPath means libvirt's standard locations.
+// default, a zero timeout means defaultConnectTimeout, and an empty pkiPath
+// means libvirt's standard locations.
 func newTLSDialer(host, port, pkiPath string, timeout time.Duration) *tlsDialer {
 	if port == "" {
 		port = defaultTLSPort
+	}
+	if timeout <= 0 {
+		timeout = defaultConnectTimeout
 	}
 	d := &tlsDialer{host: host, port: port, timeout: timeout}
 
@@ -88,7 +96,7 @@ func newTLSDialer(host, port, pkiPath string, timeout time.Duration) *tlsDialer 
 	// A non-root user looks in ~/.pki/libvirt first, as libvirt's own client
 	// does. go-libvirt dereferences a nil user when the lookup fails; skipping
 	// the home directory is the only difference from it.
-	if u, err := user.Current(); err == nil && u.Uid != "0" && u.HomeDir != "" {
+	if u, err := currentUser(); err == nil && u.Uid != "0" && u.HomeDir != "" {
 		home := filepath.Join(u.HomeDir, ".pki", "libvirt")
 		d.certDirs = append([]tlsCertDir{{certPath: home, keyPath: home}}, d.certDirs...)
 		d.caDirs = append([]string{home}, d.caDirs...)
@@ -103,11 +111,7 @@ func (d *tlsDialer) Dial() (net.Conn, error) {
 		return nil, err
 	}
 
-	timeout := d.timeout
-	if timeout <= 0 {
-		timeout = defaultDialTimeout
-	}
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(d.timeout)
 	addr := net.JoinHostPort(d.host, d.port)
 
 	raw, err := (&net.Dialer{Deadline: deadline}).Dial("tcp", addr)
