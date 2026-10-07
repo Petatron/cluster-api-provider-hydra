@@ -50,6 +50,11 @@ import (
 // reconcile worker until manager shutdown.
 const defaultRPCTimeout = 30 * time.Second
 
+// defaultConnectTimeout is DialTimeout when none was configured. It is the one
+// connect default: New applies it, and tlsDialer falls back to it, so the two
+// zero-value paths cannot disagree.
+const defaultConnectTimeout = 10 * time.Second
+
 // call runs a libvirt RPC under the caller's context.
 //
 // go-libvirt's generated API is context-free: DomainCreate and friends take no
@@ -132,9 +137,9 @@ type Config struct {
 	// BaseImage is the volume name of the backing image machines are cloned from.
 	BaseImage string
 
-	// DialTimeout bounds connection establishment. Defaults to 10s. TLS
-	// connections use go-libvirt's own dial timeout; this applies to the local
-	// socket and to Insecure TCP.
+	// DialTimeout bounds connection establishment on every transport. Defaults
+	// to 10s. For TLS it covers the connect, the handshake and libvirtd's
+	// certificate-verification reply together.
 	DialTimeout time.Duration
 
 	// RPCTimeout bounds each exported provider call when the caller did not
@@ -169,7 +174,7 @@ var _ providers.MachineProvider = (*Provider)(nil)
 // The caller owns the connection and must call Close.
 func New(ctx context.Context, cfg Config) (*Provider, error) {
 	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = 10 * time.Second
+		cfg.DialTimeout = defaultConnectTimeout
 	}
 	if cfg.RPCTimeout == 0 {
 		cfg.RPCTimeout = defaultRPCTimeout

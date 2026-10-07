@@ -51,18 +51,19 @@ func newTrackingDialer(inner socket.Dialer, timeout time.Duration) *trackingDial
 // Dial implements socket.Dialer, bounded so a stalled peer cannot block the
 // caller indefinitely.
 //
-// The bound is needed because the TLS dialer completes its handshake and then
-// performs an unbounded read of libvirt's verification byte before returning the
-// connection. Until it returns there is no net.Conn here, so forceClose has
-// nothing to close and a peer that finishes TLS but never sends that byte would
-// otherwise hang Dial forever.
+// Every inner dialer newDialer builds now bounds itself by DialTimeout: the
+// local and plain-TCP dialers through their connect timeout, and tlsDialer with
+// one deadline over its connect, handshake and verification read (PET-36).
+// That deadline is what closes the socket of a peer that stalls mid-dial;
+// before it, go-libvirt's TLS dialer read the verification byte with no
+// deadline, and each retry against such a peer leaked a socket and a goroutine.
 //
-// Known limitation: timing out unblocks the caller but cannot abort the dial
-// itself, so that socket and goroutine stay alive until the peer acts or the OS
-// gives up. On the TLS path specifically this leaks one of each per retry. A
-// real fix needs a TLS dialer that applies a deadline to the verification read,
-// which this dependency revision does not offer -- tracked as follow-up work
-// rather than papered over here.
+// So this timeout -- DialTimeout plus RPCTimeout, as New passes it -- is a
+// backstop that a correct inner dialer never reaches. It is kept because the
+// dialer is an interface: if one ever fails to bound itself, the caller is still
+// released, and a connection that arrives late is closed rather than kept. What
+// it cannot do is abort the inner dial, so a dialer that relies on it alone
+// would hold a socket and a goroutine until the peer acts.
 func (d *trackingDialer) Dial() (net.Conn, error) {
 	type result struct {
 		conn net.Conn

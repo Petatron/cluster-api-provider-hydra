@@ -29,6 +29,7 @@ const (
 	testTLSPort = "16514"
 	testIPv4    = "10.0.0.8"
 	testIPv6    = "2001:db8::a"
+	testPKIPath = "/pki"
 )
 
 func TestSplitRemoteAddr(t *testing.T) {
@@ -67,12 +68,35 @@ func TestSplitRemoteAddr(t *testing.T) {
 }
 
 func TestNewDialerSelectsTLSByDefault(t *testing.T) {
-	d, err := newDialer(Config{RemoteAddr: testHost + ":" + testTLSPort})
+	d, err := newDialer(Config{
+		RemoteAddr:  testHost + ":" + testTLSPort,
+		PKIPath:     testPKIPath,
+		DialTimeout: 3 * time.Second,
+	})
 	if err != nil {
 		t.Fatalf("newDialer: %v", err)
 	}
-	if _, ok := d.(*dialers.TLS); !ok {
-		t.Fatalf("newDialer() = %T, want *dialers.TLS for a remote address", d)
+	tlsD, ok := d.(*tlsDialer)
+	if !ok {
+		t.Fatalf("newDialer() = %T, want *tlsDialer for a remote address", d)
+	}
+	// DialTimeout reaches the TLS dialer. go-libvirt's TLS dialer had no way to
+	// take it, so the handshake used to run on its own 20s default.
+	if tlsD.host != testHost || tlsD.port != testTLSPort || tlsD.timeout != 3*time.Second {
+		t.Errorf("tlsDialer = %s:%s timeout %s, want %s:%s timeout 3s", tlsD.host, tlsD.port, tlsD.timeout, testHost, testTLSPort)
+	}
+	if tlsD.caDirs[0] != testPKIPath {
+		t.Errorf("caDirs = %v, want the configured PKI path", tlsD.caDirs)
+	}
+}
+
+func TestNewDialerTLSDefaultsThePort(t *testing.T) {
+	d, err := newDialer(Config{RemoteAddr: testHost})
+	if err != nil {
+		t.Fatalf("newDialer: %v", err)
+	}
+	if got := d.(*tlsDialer).port; got != defaultTLSPort {
+		t.Errorf("port = %q, want %q when the address names none", got, defaultTLSPort)
 	}
 }
 

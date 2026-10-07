@@ -33,11 +33,10 @@ import (
 // untrusted network in the clear. Plaintext TCP is available via Config.Insecure
 // for a trusted tunnel (SSH, WireGuard) and nowhere else.
 //
-// NewRemote and NewTLS both treat their first argument as a hostname and append
-// their own default port, so a documented "host:port" value such as
-// hypervisor:16509 would otherwise be joined as [hypervisor:16509]:16509 and
-// never connect. The address is split here and the port is passed with UsePort
-// / UseTLSPort.
+// NewRemote treats its first argument as a hostname and appends its own default
+// port, so a documented "host:port" value such as hypervisor:16509 would
+// otherwise be joined as [hypervisor:16509]:16509 and never connect. The address
+// is split here, and the port is passed with UsePort or to newTLSDialer.
 func newDialer(cfg Config) (socket.Dialer, error) {
 	if cfg.RemoteAddr == "" {
 		return dialers.NewLocal(dialers.WithLocalTimeout(cfg.DialTimeout)), nil
@@ -56,14 +55,10 @@ func newDialer(cfg Config) (socket.Dialer, error) {
 		return dialers.NewRemote(host, opts...), nil
 	}
 
-	var opts []dialers.TLSOption
-	if port != "" {
-		opts = append(opts, dialers.UseTLSPort(port))
-	}
-	if cfg.PKIPath != "" {
-		opts = append(opts, dialers.UsePKIPath(cfg.PKIPath))
-	}
-	return dialers.NewTLS(host, opts...), nil
+	// Not go-libvirt's dialers.NewTLS: it reads libvirtd's post-handshake
+	// verification byte with no deadline, and offers no way to pass DialTimeout,
+	// so its handshake ran on its own 20s default. See tlsDialer.
+	return newTLSDialer(host, port, cfg.PKIPath, cfg.DialTimeout), nil
 }
 
 // splitRemoteAddr accepts "host", "host:port", IPv6 literals, and "[IPv6]:port".
