@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"strconv"
 	"strings"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -84,10 +85,24 @@ type bootDef struct {
 }
 
 type devices struct {
-	Disks      []diskDef      `xml:"disk"`
-	Interfaces []interfaceDef `xml:"interface"`
-	Console    consoleDef     `xml:"console"`
-	Channels   []channelDef   `xml:"channel"`
+	Controllers []controllerDef `xml:"controller"`
+	Disks       []diskDef       `xml:"disk"`
+	Interfaces  []interfaceDef  `xml:"interface"`
+	Console     consoleDef      `xml:"console"`
+	Channels    []channelDef    `xml:"channel"`
+}
+
+// controllerDef is a PCI controller. The only one this provider declares is a
+// pcie-root-port with hotplug turned off; see rootPorts for why.
+type controllerDef struct {
+	Type   string               `xml:"type,attr"`
+	Index  string               `xml:"index,attr,omitempty"`
+	Model  string               `xml:"model,attr,omitempty"`
+	Target *controllerTargetDef `xml:"target,omitempty"`
+}
+
+type controllerTargetDef struct {
+	Hotplug string `xml:"hotplug,attr,omitempty"`
 }
 
 type diskDef struct {
@@ -355,6 +370,9 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 		})
 	}
 
+	// Last, because it counts the devices above.
+	d.Devices.Controllers = rootPorts(pcieDeviceCount(d.Devices) + spareRootPorts)
+
 	out, err := xml.Marshal(d)
 	if err != nil {
 		// Marshalling a struct of strings and ints cannot fail; if it somehow does,
@@ -363,6 +381,108 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 		return ""
 	}
 	return string(out)
+}
+
+// A q35 domain puts every PCIe device behind a pcie-root-port, one device per
+// port. This provider declares those ports itself, each with hotplug turned off,
+// rather than leaving libvirt to add them.
+//
+// The ports libvirt adds have hotplug on, and on some host and guest
+// combinations that leaves the guest with no disk at all. Seen on 2026-10-05,
+// when the hypervisor moved to libvirt 12.0.0 and QEMU 10.2.1 (Ubuntu 26.04):
+// the guest's pciehp driver reported every slot as "Card not present", the
+// virtio disk and NIC stayed powered down, and the guest stopped in its
+// initramfs with "LABEL=cloudimg-rootfs does not exist". Turning hotplug off
+// on every port was the fix (PET-55); a newer machine type was not.
+//
+// Nothing is lost. Hotplug is the one thing this provider never does: a
+// machine's devices are fixed when its domain is defined, and a NIC hot-plugged
+// into a running node loses its guest agent anyway.
+//
+// The ports must cover every PCIe device. When the declared ones run out,
+// libvirt adds more, with hotplug on -- so a short count does not fail, it
+// silently brings the original fault back for whichever device lands there.
+// startVerified is the check that turns that into a refusal.
+const (
+	// libvirtDefaultPCIeDevices counts the PCIe devices libvirt adds to every
+	// q35 domain without being asked: a qemu-xhci USB controller and a virtio
+	// memory balloon.
+	libvirtDefaultPCIeDevices = 2
+
+	// spareRootPorts is headroom for a PCIe device some libvirt version adds
+	// that is not counted above. An empty port costs nothing.
+	spareRootPorts = 2
+
+	pciControllerType   = "pci"
+	pcieRootModel       = "pcie-root"
+	pcieRootPortModel   = "pcie-root-port"
+	pcieRootPortHotplug = "off"
+)
+
+// pcieDeviceCount is how many pcie-root-ports a domain's devices occupy:
+// everything this provider puts on a PCIe bus, plus what libvirt adds itself.
+// A SATA CD-ROM is not counted, because it sits on the chipset's built-in AHCI
+// controller.
+func pcieDeviceCount(dv devices) int {
+	n := len(dv.Interfaces) + libvirtDefaultPCIeDevices
+	for _, d := range dv.Disks {
+		if d.Target.Bus == diskBusVirtio {
+			n++
+		}
+	}
+	for _, c := range dv.Channels {
+		// Every virtio channel rides one virtio-serial controller, which is the
+		// device that takes the port. Other channel types take none.
+		if c.Target.Type == modelVirtio {
+			n++
+			break
+		}
+	}
+	return n
+}
+
+// rootPorts renders the q35 PCIe root complex followed by n pcie-root-ports
+// with hotplug off.
+//
+// Both carry explicit indexes. libvirt numbers an unindexed PCI controller from
+// 0, and index 0 must be the pcie-root on q35, so a port declared without one is
+// refused with "The PCI controller with index='0' must be model='pcie-root'".
+// Chassis, port numbers and addresses are left for libvirt to assign, as it does
+// for the ports it adds itself.
+func rootPorts(n int) []controllerDef {
+	ctrls := make([]controllerDef, 0, n+1)
+	ctrls = append(ctrls, controllerDef{Type: pciControllerType, Index: "0", Model: pcieRootModel})
+	for i := 1; i <= n; i++ {
+		ctrls = append(ctrls, controllerDef{
+			Type:   pciControllerType,
+			Index:  strconv.Itoa(i),
+			Model:  pcieRootPortModel,
+			Target: &controllerTargetDef{Hotplug: pcieRootPortHotplug},
+		})
+	}
+	return ctrls
+}
+
+// hotplugRootPorts returns the index of every pcie-root-port in a domain's
+// XML that does not have hotplug turned off. Empty means the domain is safe to
+// start.
+func hotplugRootPorts(desc string) ([]string, error) {
+	var parsed struct {
+		Controllers []controllerDef `xml:"devices>controller"`
+	}
+	if err := xml.Unmarshal([]byte(desc), &parsed); err != nil {
+		return nil, fmt.Errorf("parsing domain XML: %w", err)
+	}
+	var bad []string
+	for _, c := range parsed.Controllers {
+		if c.Type != pciControllerType || c.Model != pcieRootPortModel {
+			continue
+		}
+		if c.Target == nil || c.Target.Hotplug != pcieRootPortHotplug {
+			bad = append(bad, c.Index)
+		}
+	}
+	return bad, nil
 }
 
 // volumeXML renders a qcow2 volume backed by the base image, so machines are
