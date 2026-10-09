@@ -461,6 +461,19 @@ func (f *fakeLibvirt) StoragePoolIsActive(pool golibvirt.StoragePool) (int32, er
 	return 0, nil
 }
 
+// StoragePoolGetXMLDesc answers for a stopped pool too, as libvirt does.
+func (f *fakeLibvirt) StoragePoolGetXMLDesc(pool golibvirt.StoragePool, _ golibvirt.StorageXMLFlags) (string, error) {
+	defer f.mu.Unlock()
+	if err := f.enter("StoragePoolGetXMLDesc", pool.Name); err != nil {
+		return "", err
+	}
+	p, err := f.pool(pool.Name)
+	if err != nil {
+		return "", err
+	}
+	return "<pool type='dir'><name>" + p.name + "</name><target><path>" + p.dir + "</path></target></pool>", nil
+}
+
 func (f *fakeLibvirt) StorageVolCreateXML(pool golibvirt.StoragePool, desc string, _ golibvirt.StorageVolCreateFlags) (golibvirt.StorageVol, error) {
 	var def volumeDef
 	if err := xml.Unmarshal([]byte(desc), &def); err != nil {

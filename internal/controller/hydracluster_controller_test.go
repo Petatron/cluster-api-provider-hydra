@@ -262,10 +262,12 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			r := build(owningCluster(nil))
 			r.Provider = nil
 
-			// Only the condition is pinned. Whether this is also returned as a
-			// reconcile error is inconsistent with the terminal policy below and
-			// is PET-58's to settle.
-			_, _ = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			// Terminal, so handled like a terminal infrastructure failure: the
+			// condition says an operator must act, and the reconcile requeues
+			// slowly instead of retrying with backoff forever.
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueClusterHealthy))
 			failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
 			Expect(failed).NotTo(BeNil())
 			Expect(failed.Status).To(Equal(metav1.ConditionTrue))

@@ -196,6 +196,17 @@ type volBackingDef struct {
 	Format volFormatDef `xml:"format"`
 }
 
+// poolDef is the part of a storage pool's definition teardown reads: the
+// directory its volumes live in.
+type poolDef struct {
+	XMLName xml.Name      `xml:"pool"`
+	Target  poolTargetDef `xml:"target"`
+}
+
+type poolTargetDef struct {
+	Path string `xml:"path"`
+}
+
 // networkDef is a libvirt network Hydra creates and owns.
 type networkDef struct {
 	XMLName xml.Name      `xml:"network"`

@@ -331,6 +331,29 @@ func TestCreateRollsBackItsVolumesWhenALaterStepFails(t *testing.T) {
 	}
 }
 
+// Creating the managed network is the cluster check's job, and machine creation
+// is gated on it. A network gone by machine time is an error the next cluster
+// check repairs, not something Create papers over by defining one itself.
+func TestCreateDoesNotDefineAMissingManagedNetwork(t *testing.T) {
+	p, f := newFakeProvider(t)
+	spec := testSpec()
+	spec.ManagedNetwork = &testManagedNetwork
+
+	_, err := p.Create(t.Context(), spec)
+	if err == nil || !strings.Contains(err.Error(), testManagedNetwork.Name) {
+		t.Fatalf("Create = %v; want a failure naming the missing network", err)
+	}
+	if errors.Is(err, providers.ErrTerminal) {
+		t.Errorf("Create = %v; the cluster check recreates the network, so this is not terminal", err)
+	}
+	if n := f.called("NetworkDefineXML"); n != 0 {
+		t.Errorf("Create defined the network %d time(s)", n)
+	}
+	if f.hasVol(testPool, rootVolumeName(spec.Name)) || f.hasVol(testPool, cidataVolumeName(spec.Name)) {
+		t.Error("the volumes were not rolled back")
+	}
+}
+
 func TestCreateRollsBackWhenTheManagedNetworkIsTheWrongKind(t *testing.T) {
 	p, f := newFakeProvider(t)
 	def := matchingNetworkDef()

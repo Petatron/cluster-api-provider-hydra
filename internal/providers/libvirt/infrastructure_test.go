@@ -23,6 +23,8 @@ import (
 	"strings"
 	"testing"
 
+	golibvirt "github.com/digitalocean/go-libvirt"
+
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
@@ -308,7 +310,6 @@ func TestEnsureInfrastructureReportsManagedNetworkFaults(t *testing.T) {
 // Something else starts the network between the liveness check and
 // NetworkCreate. Running is the state being asked for.
 func TestEnsureInfrastructureToleratesANetworkStartedConcurrently(t *testing.T) {
-	t.Skip("PET-58: bringUp tolerates ErrNetworkExist, but libvirt reports an already-active network as operation-invalid")
 	p, f := newFakeProvider(t)
 	n := f.addNetwork(testManagedNetwork.Name, matchingNetworkDef(), false)
 	f.hook = func(method string) {
@@ -326,5 +327,21 @@ func TestEnsureInfrastructureToleratesANetworkStartedConcurrently(t *testing.T) 
 	}
 	if !n.autostart {
 		t.Error("autostart was skipped after the tolerated start")
+	}
+}
+
+// The re-check after a failed start must not excuse a start that really failed.
+func TestEnsureInfrastructureReportsANetworkThatWillNotStart(t *testing.T) {
+	p, f := newFakeProvider(t)
+	n := f.addNetwork(testManagedNetwork.Name, matchingNetworkDef(), false)
+	f.errs["NetworkCreate"] = lvErr(golibvirt.ErrOperationInvalid)
+	spec := clusterSpec()
+	spec.ManagedNetwork = &testManagedNetwork
+
+	if err := p.EnsureInfrastructure(t.Context(), spec); err == nil {
+		t.Fatal("EnsureInfrastructure succeeded with a network that never started")
+	}
+	if n.active {
+		t.Error("the network is running; the test setup is wrong")
 	}
 }

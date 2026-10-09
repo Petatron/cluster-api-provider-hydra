@@ -152,6 +152,12 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
+		// No backend configured is terminal, and handled like a terminal
+		// infrastructure failure below: the condition says an operator has to
+		// act, so requeue slowly rather than retry with backoff forever.
+		if errors.Is(err, providers.ErrTerminal) {
+			return ctrl.Result{RequeueAfter: requeueClusterHealthy}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
