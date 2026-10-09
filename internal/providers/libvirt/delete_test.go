@@ -405,10 +405,67 @@ func TestDeleteByNameSkipsAPoolUndefinedMidSweep(t *testing.T) {
 	}
 }
 
-// The stopped pools are listed separately after the sweep. If that list
-// fails, the machine's own pool cannot be ruled out.
-func TestDeleteByNameFailsWhenStoppedPoolsCannotBeListed(t *testing.T) {
+// The machine's pool can be started after the running pools were listed --
+// exactly what an operator does on reading the "start it" error -- and then it
+// is neither swept nor stopped any more. It must not escape: the call fails,
+// and the retry finds it running.
+func TestDeleteByNameCatchesItsPoolStartingMidSweep(t *testing.T) {
 	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+	f.pools[testPool].active = false
+	f.addPool("other")
+	f.hook = func(method string) {
+		// The sweep of the running pool is under way: the list is taken.
+		if method == "StorageVolLookupByName" {
+			f.mu.Lock()
+			f.pools[testPool].active = true
+			f.mu.Unlock()
+		}
+	}
+
+	err := p.DeleteByName(t.Context(), "worker-1", testPool)
+	if err == nil || !strings.Contains(err.Error(), testPool) {
+		t.Fatalf("DeleteByName = %v; want a failure naming the pool that escaped the sweep", err)
+	}
+	if !f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Fatal("the test setup is wrong: the leftover was swept on the first pass")
+	}
+
+	f.hook = nil
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); err != nil {
+		t.Fatalf("DeleteByName on the retry = %v", err)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the retry did not sweep the pool once it ran")
+	}
+}
+
+// A machine's pool that has been undefined holds nothing libvirt can reach, so
+// it is no reason to keep the finalizer.
+func TestDeleteByNameLetsGoOfAnUndefinedOwnPool(t *testing.T) {
+	p, _ := newFakeProvider(t)
+	if err := p.DeleteByName(t.Context(), "worker-1", "long-gone"); err != nil {
+		t.Fatalf("DeleteByName = %v, want success", err)
+	}
+}
+
+// Whether the unswept pool still exists decides between failing and letting go.
+// Not knowing is not proof it is gone.
+func TestDeleteByNameFailsWhenItsUnsweptPoolCannotBeLookedUp(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].active = false
+	f.errs["StoragePoolLookupByName:"+testPool] = errInjected
+
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); !errors.Is(err, errInjected) {
+		t.Fatalf("DeleteByName = %v, want the injected failure", err)
+	}
+}
+
+// The stopped-pool list only names pools in a log line, so failing to take it
+// is no reason to fail -- as long as the machine's own pool was swept.
+func TestDeleteByNameOnlyLogsAFailedStoppedPoolList(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
 	lists := 0
 	f.hook = func(method string) {
 		if method != listPools {
@@ -416,13 +473,23 @@ func TestDeleteByNameFailsWhenStoppedPoolsCannotBeListed(t *testing.T) {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if lists++; lists == 2 {
+		// The second list is the stopped one, after the root volume's sweep.
+		switch lists++; lists {
+		case 2:
 			f.errs[listPools] = errInjected
+		case 3:
+			delete(f.errs, listPools)
 		}
 	}
 
-	if err := p.DeleteByName(t.Context(), "worker-1", ""); !errors.Is(err, errInjected) {
-		t.Fatalf("DeleteByName = %v, want the injected failure", err)
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); err != nil {
+		t.Fatalf("DeleteByName = %v, want success", err)
+	}
+	if lists < 3 {
+		t.Fatalf("%d pool listings; the injected failure never reached the stopped-pool list", lists)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the leftover was not swept")
 	}
 }
 

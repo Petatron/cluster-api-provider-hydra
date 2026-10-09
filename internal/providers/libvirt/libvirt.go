@@ -1197,11 +1197,20 @@ func (p *Provider) DeleteByName(ctx context.Context, name, storagePool string) e
 // finalizer over a disk nobody can find again -- so the call fails, naming it,
 // and the next attempt finishes once an operator starts it.
 //
+// What decides that is whether ownPool was actually swept, not whether it
+// shows up as stopped. Running and stopped pools come from two separate list
+// calls, and a pool started between them is in neither -- which is exactly
+// what an operator does on reading that error. So an own pool missing from the
+// sweep fails the call whatever its state now; the retry finds it running.
+// Only a pool that no longer exists at all is let go.
+//
 // Any other stopped pool is skipped and logged. The controller sweeps after
 // every deletion, so failing on those would hold every machine on the host in
 // Deleting -- stalling scale-down and cluster deletion -- over a pool that may
 // have nothing to do with Hydra, to guard against a leftover that could only
-// be there if the pool configuration changed between Create and a crash.
+// be there if the pool configuration changed between Create and a crash. The
+// stopped-pool list feeds only that log line, so a failure to list is logged
+// too, not returned.
 func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool string) error {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
 		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsActive)
@@ -1215,7 +1224,11 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		return fmt.Errorf("libvirt: listing storage pools to find %q: %w", volName, err)
 	}
 
+	ownSwept := false
 	for _, pool := range pools {
+		if pool.Name == ownPool {
+			ownSwept = true
+		}
 		vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
 			return p.lv.StorageVolLookupByName(pool, volName)
 		})
@@ -1233,16 +1246,31 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		}
 	}
 
+	if ownPool != "" && !ownSwept {
+		_, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
+			return p.lv.StoragePoolLookupByName(ownPool)
+		})
+		switch {
+		case err == nil:
+			return fmt.Errorf("libvirt: storage pool %q, where %q would be, was not running when it was swept; "+
+				"start it so teardown can finish", ownPool, volName)
+		case !isNotFound(err):
+			return fmt.Errorf("libvirt: looking up storage pool %q to find %q: %w", ownPool, volName, err)
+		}
+		// Undefined: nothing can reach what it held, as with any pool that goes.
+	}
+
 	stopped, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
 		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
-		return fmt.Errorf("libvirt: listing stopped storage pools while looking for %q: %w", volName, err)
+		logf.FromContext(ctx).Error(err, "Failed to list stopped storage pools for the leftover sweep log",
+			"volume", volName)
+		return nil
 	}
 	for _, pool := range stopped {
-		if ownPool != "" && pool.Name == ownPool {
-			return fmt.Errorf("libvirt: storage pool %q, where %q would be, is not running; "+
-				"start it so teardown can finish", pool.Name, volName)
+		if pool.Name == ownPool {
+			continue
 		}
 		logf.FromContext(ctx).Info("Skipping a stopped storage pool in the leftover sweep",
 			"pool", pool.Name, "volume", volName, "machinePool", ownPool)
