@@ -402,6 +402,15 @@ func (p *Provider) recycle() {
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "libvirt" }
 
+// StoragePoolFor implements providers.MachineProvider, resolving the pool the
+// way lookupPoolNamed does for Create.
+func (p *Provider) StoragePoolFor(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return p.cfg.StoragePool
+}
+
 // rootVolumeName and cidataVolumeName derive a machine's volume names from its
 // backend name, which is already globally unique. Both are pure functions of the
 // name so that teardown can find them without a domain to consult -- the whole
@@ -1253,7 +1262,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		switch {
 		case err == nil:
 			return fmt.Errorf("libvirt: storage pool %q, where %q would be, was not running when it was swept; "+
-				"start it so teardown can finish", ownPool, volName)
+				"start it so teardown can finish, or undefine it to abandon what it holds", ownPool, volName)
 		case !isNotFound(err):
 			return fmt.Errorf("libvirt: looking up storage pool %q to find %q: %w", ownPool, volName, err)
 		}
@@ -1264,7 +1273,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to list stopped storage pools for the leftover sweep log",
+		logf.FromContext(ctx).Error(err, "Failed to list stopped storage pools; skipped pools will not be logged",
 			"volume", volName)
 		return nil
 	}
@@ -1384,14 +1393,31 @@ func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]d
 // created before --libvirt-storage-pool changed is still reclaimed from the pool
 // it was really built in.
 func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
-	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolLookupByPath(path)
-	})
+	lookup := func() (golibvirt.StorageVol, error) {
+		return call(ctx, p, func() (golibvirt.StorageVol, error) {
+			return p.lv.StorageVolLookupByPath(path)
+		})
+	}
+	vol, err := lookup()
 	if err != nil {
-		if isNotFound(err) {
-			return p.confirmReclaimed(ctx, path)
+		if !isNotFound(err) {
+			return fmt.Errorf("libvirt: looking up volume at %q: %w", path, err)
 		}
-		return fmt.Errorf("libvirt: looking up volume at %q: %w", path, err)
+		if err := p.confirmReclaimed(ctx, path); err != nil {
+			return err
+		}
+		// Look again before believing it. The miss and the stopped-pool list are
+		// two snapshots, and a pool started between them -- what an operator
+		// does on reading confirmReclaimed's error -- is in neither: not running
+		// for the lookup, not stopped for the list. Started, it now resolves.
+		// Fooling this would take the pool stopping, starting and stopping again
+		// across three calls.
+		if vol, err = lookup(); err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("looking up volume at %q again: %w", path, err)
+		}
 	}
 	if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
 		!isNotFound(err) {

@@ -235,6 +235,19 @@ type HydraMachineStatus struct {
 // the base image, configures nothing, and joins no cluster.
 const StandaloneAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/standalone"
 
+// StoragePoolAnnotation records the storage pool a machine's volumes were
+// created in. The controller writes it before the first Create and never
+// changes it; teardown reads it.
+//
+// Teardown cannot work this out again. The HydraCluster that named the pool can
+// be gone by the time its machines are deleted, and the manager's default pool
+// can change in between, so re-resolving would ask the wrong pool -- and the
+// leftover sweep must not give up on the one pool a crash could have left disks
+// in. An annotation rather than a status field because it has to outlive what
+// status may not: Cluster API expects status to be rebuildable from the world,
+// and this cannot be.
+const StoragePoolAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/storage-pool"
+
 const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady
 	// condition by Cluster API.

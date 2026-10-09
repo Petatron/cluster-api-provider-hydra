@@ -124,9 +124,11 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
 		},
 	}
-	// Name is a constant, not a backend operation.
+	// Name is a constant and StoragePoolFor reads configuration; neither is a
+	// backend operation, and neither touches the hypervisor.
+	local := map[string]bool{"Name": true, "StoragePoolFor": true}
 	for m := range reflect.TypeFor[MachineProvider]().Methods() {
-		if m.Name != "Name" && ops[m.Name] == nil {
+		if !local[m.Name] && ops[m.Name] == nil {
 			t.Errorf("MachineProvider.%s is not checked here", m.Name)
 		}
 	}
@@ -177,6 +179,8 @@ type recordingProvider struct {
 }
 
 func (p *recordingProvider) Name() string { return "recording" }
+
+func (p *recordingProvider) StoragePoolFor(requested string) string { return requested }
 
 func (p *recordingProvider) Create(_ context.Context, spec MachineSpec) (*MachineState, error) {
 	p.lastOp, p.lastSpec = "Create", spec

@@ -66,6 +66,9 @@ type Provider struct {
 	FindErr           error
 	DeleteErr         error
 
+	// DefaultStoragePool is what StoragePoolFor answers for an empty request.
+	DefaultStoragePool string
+
 	// ReadyOnCreate controls whether machines report Ready immediately. Real
 	// backends usually do not, so the default of false is the honest one.
 	ReadyOnCreate bool
@@ -89,6 +92,14 @@ var _ providers.MachineProvider = (*Provider)(nil)
 
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "fake" }
+
+// StoragePoolFor implements providers.MachineProvider.
+func (p *Provider) StoragePoolFor(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return p.DefaultStoragePool
+}
 
 // Create implements providers.MachineProvider, including its idempotency
 // requirement on spec.Name.

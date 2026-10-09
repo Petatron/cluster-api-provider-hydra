@@ -66,6 +66,22 @@ func seedMachine(t *testing.T, f *fakeLibvirt, pool string, extraDisks ...string
 // listPools is the RPC the sweep and the stopped-pool check both start with.
 const listPools = "ConnectListAllStoragePools"
 
+// StoragePoolFor must answer as Create resolves the pool, or the recorded pool
+// would send teardown somewhere Create never built.
+func TestStoragePoolForResolvesAsCreateDoes(t *testing.T) {
+	p, _ := newFakeProvider(t)
+	if got := p.StoragePoolFor("named-pool"); got != "named-pool" {
+		t.Errorf("StoragePoolFor(named-pool) = %q", got)
+	}
+	if got := p.StoragePoolFor(""); got != testPool {
+		t.Errorf("StoragePoolFor(\"\") = %q, want the configured %q", got, testPool)
+	}
+	p.cfg.StoragePool = ""
+	if got := p.StoragePoolFor(""); got != "" {
+		t.Errorf("StoragePoolFor(\"\") with no default = %q, want empty", got)
+	}
+}
+
 // machineGone reports whether the machine seedMachine builds is fully reclaimed.
 func machineGone(f *fakeLibvirt, pool string) bool {
 	name := testSpec().Name
@@ -179,6 +195,56 @@ func TestDeleteKeepsTheDomainWhenItsPoolIsStopped(t *testing.T) {
 	}
 	if !machineGone(f, testPool) || !f.hasVol(testPool, testImage) {
 		t.Error("the retry did not reclaim exactly the machine")
+	}
+}
+
+// The path miss and the stopped-pool list are two snapshots. A pool started
+// between them -- what an operator does on reading the "not running" error --
+// is in neither, and the disk must still be reclaimed rather than abandoned
+// when the domain is undefined.
+func TestDeleteReclaimsADiskWhosePoolStartsDuringTheCheck(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	f.pools[testPool].active = false
+	f.hook = func(method string) {
+		if method == listPools {
+			f.mu.Lock()
+			f.pools[testPool].active = true
+			f.mu.Unlock()
+		}
+	}
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
+		t.Fatalf("Delete = %v", err)
+	}
+	if !machineGone(f, testPool) || !f.hasVol(testPool, testImage) {
+		t.Error("the domain was undefined over disks that became reachable mid-check")
+	}
+}
+
+// The second look is part of the proof, so a failure there is not a miss.
+func TestDeleteKeepsTheDomainWhenTheSecondLookFails(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+	rootPath := f.pools[testPool].dir + "/" + rootVolumeName("worker-1")
+	looks := 0
+	f.hook = func(method string) {
+		if method != "StorageVolLookupByPath" {
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if looks++; looks == 2 {
+			f.errs["StorageVolLookupByPath:"+rootPath] = errInjected
+		}
+	}
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); !errors.Is(err, errInjected) {
+		t.Fatalf("Delete = %v, want the injected failure", err)
+	}
+	if _, ok := f.domains["worker-1"]; !ok {
+		t.Error("the domain was undefined without proof its disk was gone")
 	}
 }
 

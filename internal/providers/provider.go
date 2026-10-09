@@ -262,6 +262,14 @@ type MachineProvider interface {
 	// providerID: hydra://<name>/<id>.
 	Name() string
 
+	// StoragePoolFor returns the pool Create would build in when given
+	// MachineSpec.StoragePool = requested: requested itself, or the backend's
+	// default when it is empty. Empty when the backend has no default either.
+	//
+	// The caller records it before Create, so teardown knows where the volumes
+	// went even after the object that named the pool, or the default, has gone.
+	StoragePoolFor(requested string) string
+
 	// Create makes a machine, and MUST be idempotent on spec.Name.
 	//
 	// This is not a nicety. A reconcile can be interrupted between creating a
