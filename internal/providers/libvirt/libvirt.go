@@ -31,6 +31,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"strings"
@@ -148,10 +149,50 @@ type Config struct {
 	RPCTimeout time.Duration
 }
 
+// client is the part of go-libvirt's API this provider calls. *golibvirt.Libvirt
+// is the only production implementation; the interface exists so the failure
+// paths of Create and teardown can be driven without a hypervisor, which is the
+// only way to produce most of them on demand.
+type client interface {
+	ConnectToURI(uri golibvirt.ConnectURI) error
+	Disconnect() error
+	IsConnected() bool
+
+	DomainLookupByName(name string) (golibvirt.Domain, error)
+	DomainLookupByUUID(uuid golibvirt.UUID) (golibvirt.Domain, error)
+	DomainDefineXML(desc string) (golibvirt.Domain, error)
+	DomainIsActive(dom golibvirt.Domain) (int32, error)
+	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
+	DomainCreate(dom golibvirt.Domain) error
+	DomainDestroy(dom golibvirt.Domain) error
+	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
+	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
+	DomainInterfaceAddresses(dom golibvirt.Domain, source, flags uint32) ([]golibvirt.DomainInterface, error)
+
+	ConnectListAllStoragePools(needResults int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error)
+	StoragePoolLookupByName(name string) (golibvirt.StoragePool, error)
+	StoragePoolIsActive(pool golibvirt.StoragePool) (int32, error)
+	StorageVolCreateXML(pool golibvirt.StoragePool, desc string, flags golibvirt.StorageVolCreateFlags) (golibvirt.StorageVol, error)
+	StorageVolLookupByName(pool golibvirt.StoragePool, name string) (golibvirt.StorageVol, error)
+	StorageVolLookupByPath(path string) (golibvirt.StorageVol, error)
+	StorageVolGetPath(vol golibvirt.StorageVol) (string, error)
+	StorageVolUpload(vol golibvirt.StorageVol, r io.Reader, offset, length uint64, flags golibvirt.StorageVolUploadFlags) error
+	StorageVolDelete(vol golibvirt.StorageVol, flags golibvirt.StorageVolDeleteFlags) error
+
+	NetworkLookupByName(name string) (golibvirt.Network, error)
+	NetworkDefineXML(desc string) (golibvirt.Network, error)
+	NetworkIsActive(n golibvirt.Network) (int32, error)
+	NetworkCreate(n golibvirt.Network) error
+	NetworkSetAutostart(n golibvirt.Network, autostart int32) error
+	NetworkGetXMLDesc(n golibvirt.Network, flags uint32) (string, error)
+}
+
+var _ client = (*golibvirt.Libvirt)(nil)
+
 // Provider implements providers.MachineProvider against libvirt.
 type Provider struct {
 	cfg Config
-	lv  *golibvirt.Libvirt
+	lv  client
 	uri golibvirt.ConnectURI
 
 	// mu guards the connection state below.

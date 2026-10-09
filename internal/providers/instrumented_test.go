@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -104,6 +105,62 @@ func TestObserveDialRecordsASample(t *testing.T) {
 	}
 }
 
+// Every method is timed under its own name. A method that fell through to the
+// embedded provider untimed would still compile and still work -- and leave a
+// gap in the dashboard exactly where nobody would think to look.
+func TestInstrumentedTimesEveryOperation(t *testing.T) {
+	backend := &recordingProvider{err: fmt.Errorf("%w: gone", ErrNotFound)}
+	p := NewInstrumented(backend)
+
+	ops := map[string]func() error{
+		"Create":     func() error { _, err := p.Create(t.Context(), MachineSpec{}); return err },
+		"Get":        func() error { _, err := p.Get(t.Context(), "abc"); return err },
+		"FindByName": func() error { _, err := p.FindByName(t.Context(), "worker-1"); return err },
+		"Delete":     func() error { return p.Delete(t.Context(), "abc") },
+		"DeleteByName": func() error {
+			return p.DeleteByName(t.Context(), "worker-1")
+		},
+		"EnsureInfrastructure": func() error {
+			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
+		},
+	}
+	// Name is a constant, not a backend operation.
+	for m := range reflect.TypeFor[MachineProvider]().Methods() {
+		if m.Name != "Name" && ops[m.Name] == nil {
+			t.Errorf("MachineProvider.%s is not checked here", m.Name)
+		}
+	}
+
+	for op, run := range ops {
+		t.Run(op, func(t *testing.T) {
+			obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues(op, outcomeNotFound)
+			if err != nil {
+				t.Fatalf("no %s/%s series: %v", op, outcomeNotFound, err)
+			}
+			before := sampleCount(t, obs.(prometheus.Metric))
+
+			if err := run(); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("%s() = %v, want the backend's error unchanged", op, err)
+			}
+			if backend.lastOp != op {
+				t.Errorf("backend saw %q, want %q", backend.lastOp, op)
+			}
+			if after := sampleCount(t, obs.(prometheus.Metric)); after != before+1 {
+				t.Errorf("%s/%s samples %d -> %d, want one more", op, outcomeNotFound, before, after)
+			}
+		})
+	}
+}
+
+func sampleCount(t *testing.T, m prometheus.Metric) uint64 {
+	t.Helper()
+	var out dto.Metric
+	if err := m.Write(&out); err != nil {
+		t.Fatalf("reading the histogram: %v", err)
+	}
+	return out.GetHistogram().GetSampleCount()
+}
+
 func TestNewInstrumentedTolerantOfNil(t *testing.T) {
 	// The factory in main can fail before a provider exists; wrapping nil must
 	// not turn that into a nil-pointer dereference two layers away.
@@ -113,19 +170,40 @@ func TestNewInstrumentedTolerantOfNil(t *testing.T) {
 }
 
 type recordingProvider struct {
-	MachineProvider
 	state    *MachineState
 	err      error
 	lastSpec MachineSpec
+	lastOp   string
 }
 
 func (p *recordingProvider) Name() string { return "recording" }
 
 func (p *recordingProvider) Create(_ context.Context, spec MachineSpec) (*MachineState, error) {
-	p.lastSpec = spec
+	p.lastOp, p.lastSpec = "Create", spec
 	return p.state, p.err
 }
 
 func (p *recordingProvider) Get(_ context.Context, _ string) (*MachineState, error) {
+	p.lastOp = "Get"
 	return p.state, p.err
+}
+
+func (p *recordingProvider) FindByName(_ context.Context, _ string) (*MachineState, error) {
+	p.lastOp = "FindByName"
+	return p.state, p.err
+}
+
+func (p *recordingProvider) Delete(_ context.Context, _ string) error {
+	p.lastOp = "Delete"
+	return p.err
+}
+
+func (p *recordingProvider) DeleteByName(_ context.Context, _ string) error {
+	p.lastOp = "DeleteByName"
+	return p.err
+}
+
+func (p *recordingProvider) EnsureInfrastructure(_ context.Context, _ InfrastructureSpec) error {
+	p.lastOp = "EnsureInfrastructure"
+	return p.err
 }
