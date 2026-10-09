@@ -390,3 +390,138 @@ func TestSubnetParts(t *testing.T) {
 		}
 	}
 }
+
+// Every pcie-root-port has to have hotplug off, and there have to be enough of
+// them. With hotplug on, a guest on libvirt 12 / QEMU 10.2 saw no disk and
+// stopped in its initramfs (PET-55). With too few ports, libvirt adds its own,
+// hotplug on, and brings that back for whichever device lands on one.
+//
+// The wanted device counts are written out rather than computed with
+// pcieDeviceCount, so this cannot pass by agreeing with itself. They match what
+// libvirt 12.0.0 actually placed on root ports when these exact documents were
+// defined on the reference hypervisor on 2026-10-08: virtio disk, one per NIC,
+// virtio-serial, qemu-xhci and memballoon.
+func TestDomainXMLDeclaresEnoughRootPortsAllWithHotplugOff(t *testing.T) {
+	twoNICs := testSpec()
+	twoNICs.Networks = append(twoNICs.Networks, providers.Network{Name: "hydra-net"})
+	noNIC := testSpec()
+	noNIC.Networks = nil
+
+	const cidata = "/var/lib/libvirt/k8s-workers/worker-1-cidata.iso"
+	cases := []struct {
+		name        string
+		spec        providers.MachineSpec
+		cidata      string
+		pcieDevices int
+	}{
+		{"one NIC with cloud-init", testSpec(), cidata, 5},
+		// The SATA CD-ROM sits on the chipset's AHCI controller, not a root port.
+		{"one NIC without cloud-init", testSpec(), "", 5},
+		{"two NICs", twoNICs, cidata, 6},
+		{"no NIC", noNIC, "", 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := domainXML(tc.spec, "/var/lib/libvirt/k8s-workers/worker-1.qcow2", tc.cidata)
+			var parsed domainDef
+			if err := xml.Unmarshal([]byte(out), &parsed); err != nil {
+				t.Fatalf("generated domain XML does not parse: %v\n%s", err, out)
+			}
+
+			ctrls := parsed.Devices.Controllers
+			// libvirt refuses a q35 domain whose PCI controller 0 is anything
+			// but the pcie-root.
+			if len(ctrls) == 0 || ctrls[0].Model != pcieRootModel || ctrls[0].Index != "0" {
+				t.Fatalf("first controller = %+v, want the pcie-root at index 0", ctrls)
+			}
+
+			ports := 0
+			seen := map[string]bool{"0": true}
+			for _, c := range ctrls[1:] {
+				if c.Type != pciControllerType || c.Model != pcieRootPortModel {
+					t.Errorf("unexpected controller %+v", c)
+					continue
+				}
+				ports++
+				if c.Target == nil || c.Target.Hotplug != "off" {
+					t.Errorf("root port index %q has hotplug %+v, want off", c.Index, c.Target)
+				}
+				// libvirt numbers an unindexed controller from 0 and refuses it.
+				if c.Index == "" || seen[c.Index] {
+					t.Errorf("root port index %q is missing or repeated", c.Index)
+				}
+				seen[c.Index] = true
+			}
+			if ports < tc.pcieDevices {
+				t.Errorf("%d root ports for %d PCIe devices: libvirt would add the rest with hotplug on",
+					ports, tc.pcieDevices)
+			}
+			if ports != tc.pcieDevices+spareRootPorts {
+				t.Errorf("%d root ports, want %d devices + %d spare", ports, tc.pcieDevices, spareRootPorts)
+			}
+		})
+	}
+}
+
+// What libvirt 12.0.0 stored on 2026-10-08 for a domain declaring three
+// hotplug-off ports and needing five: it added ports 4 and 5 itself, with
+// hotplug on. Trimmed to the controllers, which is all the check reads.
+const libvirtShortOfRootPorts = `<domain type='kvm'>
+  <name>pet55-probe-short</name>
+  <devices>
+    <controller type='usb' index='0' model='qemu-xhci'>
+      <address type='pci' domain='0x0000' bus='0x02' slot='0x00' function='0x0'/>
+    </controller>
+    <controller type='sata' index='0'/>
+    <controller type='pci' index='0' model='pcie-root'/>
+    <controller type='pci' index='1' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='1' port='0x8' hotplug='off'/>
+    </controller>
+    <controller type='pci' index='2' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='2' port='0x9' hotplug='off'/>
+    </controller>
+    <controller type='pci' index='3' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='3' port='0xa' hotplug='off'/>
+    </controller>
+    <controller type='pci' index='4' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='4' port='0xb'/>
+    </controller>
+    <controller type='pci' index='5' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='5' port='0xc'/>
+    </controller>
+    <controller type='virtio-serial' index='0'/>
+  </devices>
+</domain>`
+
+func TestHotplugRootPortsFindsThePortsLibvirtAdded(t *testing.T) {
+	bad, err := hotplugRootPorts(libvirtShortOfRootPorts)
+	if err != nil {
+		t.Fatalf("hotplugRootPorts: %v", err)
+	}
+	if strings.Join(bad, ",") != "4,5" {
+		t.Errorf("hotplug-on root ports = %v, want [4 5]", bad)
+	}
+}
+
+func TestHotplugRootPortsAcceptsWhatDomainXMLDeclares(t *testing.T) {
+	// A root port with no <target> at all has hotplug on by default, so it has
+	// to be reported, not skipped.
+	noTarget := `<domain><devices><controller type='pci' index='1' model='pcie-root-port'/></devices></domain>`
+	if bad, err := hotplugRootPorts(noTarget); err != nil || len(bad) != 1 {
+		t.Errorf("root port without a target: got %v, %v; want it reported", bad, err)
+	}
+
+	bad, err := hotplugRootPorts(domainXML(testSpec(), "/var/lib/libvirt/k8s-workers/worker-1.qcow2", ""))
+	if err != nil || len(bad) != 0 {
+		t.Errorf("domainXML's own ports: got %v, %v; want none reported", bad, err)
+	}
+
+	if _, err := hotplugRootPorts("<domain><devices>"); err == nil {
+		t.Error("truncated XML was accepted; a domain that cannot be read must not be passed as safe")
+	}
+}

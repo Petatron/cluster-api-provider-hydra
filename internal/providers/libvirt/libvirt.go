@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -497,10 +498,52 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
+	// Before the first start, while undefining still loses nothing.
+	if err := p.verifyRootPorts(ctx, dom); err != nil {
+		const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
+		if uErr := callVoid(ctx, p, func() error { return p.lv.DomainUndefineFlags(dom, flags) }); uErr != nil {
+			logf.FromContext(ctx).Error(uErr, "Failed to undefine a domain that failed its root-port check",
+				"domain", spec.Name)
+		}
+		rollback()
+		return nil, err
+	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
 		return nil, err
 	}
 	return p.stateOf(ctx, dom)
+}
+
+// verifyRootPorts refuses a freshly defined domain that libvirt gave a
+// pcie-root-port with hotplug on.
+//
+// domainXML declares enough ports for every device it knows about. But when
+// they run out, libvirt does not fail: it quietly adds ports of its own, with
+// hotplug on, and the device behind one can come up missing in the guest (see
+// rootPorts). That happens only if some libvirt version adds a PCIe device
+// pcieDeviceCount does not count, beyond the spares. A machine that will never
+// boot is worse than one that is never created, so this reads back what libvirt
+// actually stored and refuses it.
+//
+// Terminal: the same spec renders the same XML, so a retry would build the same
+// domain.
+func (p *Provider) verifyRootPorts(ctx context.Context, dom golibvirt.Domain) error {
+	desc, err := call(ctx, p, func() (string, error) {
+		return p.lv.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	})
+	if err != nil {
+		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", dom.Name, err)
+	}
+	bad, err := hotplugRootPorts(desc)
+	if err != nil {
+		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", dom.Name, err)
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("%w: libvirt: domain %q has %d pcie-root-port(s) with hotplug on (index %s): "+
+			"libvirt added ports beyond the ones declared, so it attaches a PCIe device this provider does not count",
+			providers.ErrTerminal, dom.Name, len(bad), strings.Join(bad, ", "))
+	}
+	return nil
 }
 
 // ensureCloudInitVolume renders the machine's bootstrap data into a NoCloud
