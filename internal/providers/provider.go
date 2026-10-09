@@ -333,10 +333,14 @@ type MachineProvider interface {
 	// the domain; FindByName would then report not-found and deletion would
 	// release the finalizer, permanently leaving the qcow2 behind.
 	//
-	// storagePool is the pool the machine's volumes were created in -- the same
-	// value Create was given in MachineSpec.StoragePool, empty for the backend's
-	// default. A leftover can only be there, so that is the one place deletion
-	// must not report success while it cannot be searched. Elsewhere a backend
+	// storagePool is the effective pool the machine's volumes were created in:
+	// what StoragePoolFor resolved, a backend default included, as recorded when
+	// the machine was first created -- not the value requested, and not whatever
+	// the default is now. Empty only when nothing was recorded, for a machine
+	// created before the record existed or adopted rather than created; a
+	// backend then falls back to resolving it as Create would. A leftover can
+	// only be in that pool, so that is the one place deletion must not report
+	// success while it cannot be searched. Elsewhere a backend
 	// may skip what it cannot see: holding every deletion on an unrelated,
 	// unsearchable store would stall scale-down and cluster deletion over a
 	// leftover that could not exist there.

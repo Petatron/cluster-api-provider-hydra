@@ -318,8 +318,16 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		// Before Create, not after: a crash between Create allocating volumes
 		// and defining the domain is exactly the leftover teardown has to find,
 		// and it can only look in the right pool if this was already recorded.
-		if err := r.recordStoragePool(ctx, machine, prov.StoragePoolFor(spec.StoragePool)); err != nil {
+		//
+		// And Create then builds in the recorded pool, whatever resolves now. A
+		// retry after the manager's default changed would otherwise put volumes
+		// in the new default while teardown protects only the recorded one.
+		pool, err := r.recordStoragePool(ctx, machine, prov.StoragePoolFor(spec.StoragePool))
+		if err != nil {
 			return nil, err
+		}
+		if pool != "" {
+			spec.StoragePool = pool
 		}
 	default:
 		return nil, fmt.Errorf("searching for an existing machine: %w", findErr)
@@ -796,18 +804,20 @@ func resolveNetworks(machine *infrav1.HydraMachine, link *linkage) []providers.N
 }
 
 // recordStoragePool writes the pool Create is about to build in onto the
-// machine, if nothing is recorded yet.
+// machine, if nothing is recorded yet, and returns the recorded pool -- the one
+// Create must use.
 //
-// An existing value is kept. It was written before an earlier Create that may
-// have left volumes in it, and a later attempt resolving a different pool --
-// the cluster's changed, or the default -- must not erase the only record of
-// where those went.
-func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine *infrav1.HydraMachine, pool string) error {
-	if pool == "" {
-		return nil
+// An existing value is kept, and wins. It was written before an earlier Create
+// that may have left volumes in it, and a later attempt resolving a different
+// pool -- the manager's default changed -- must neither erase that record nor
+// build somewhere else, or the machine's volumes would be split across two
+// pools with teardown watching only one.
+func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine *infrav1.HydraMachine, pool string) (string, error) {
+	if recorded := machine.Annotations[infrav1.StoragePoolAnnotation]; recorded != "" {
+		return recorded, nil
 	}
-	if _, ok := machine.Annotations[infrav1.StoragePoolAnnotation]; ok {
-		return nil
+	if pool == "" {
+		return "", nil
 	}
 	patch := client.MergeFrom(machine.DeepCopy())
 	if machine.Annotations == nil {
@@ -815,9 +825,9 @@ func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine 
 	}
 	machine.Annotations[infrav1.StoragePoolAnnotation] = pool
 	if err := r.Patch(ctx, machine, patch); err != nil {
-		return fmt.Errorf("recording storage pool %q: %w", pool, err)
+		return "", fmt.Errorf("recording storage pool %q: %w", pool, err)
 	}
-	return nil
+	return pool, nil
 }
 
 // storagePoolOf is the pool a machine's volumes were created in, for teardown.

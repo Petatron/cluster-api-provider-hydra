@@ -476,6 +476,9 @@ var _ = Describe("Cluster API linkage", func() {
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(reload(r).Annotations).To(HaveKeyWithValue(infrav1.StoragePoolAnnotation, "manager-default"))
+			// Create is pinned to it, so a later change of default cannot move
+			// a retry somewhere teardown does not look.
+			Expect(provider.LastSpec.StoragePool).To(Equal("manager-default"))
 		})
 
 		It("keeps a pool already recorded", func() {
@@ -494,6 +497,9 @@ var _ = Describe("Cluster API linkage", func() {
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(reload(r).Annotations).To(HaveKeyWithValue(infrav1.StoragePoolAnnotation, "first-attempt"))
+			// And builds there: volumes split across two pools would leave
+			// teardown watching only one of them.
+			Expect(provider.LastSpec.StoragePool).To(Equal("first-attempt"))
 		})
 
 		It("sweeps for leftovers in the recorded pool on deletion, not the cluster's current one", func() {
