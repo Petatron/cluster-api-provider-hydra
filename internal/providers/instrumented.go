@@ -132,9 +132,9 @@ func (p *Instrumented) FindByName(ctx context.Context, name string) (*MachineSta
 	return state, err
 }
 
-func (p *Instrumented) DeleteByName(ctx context.Context, name string) error {
+func (p *Instrumented) DeleteByName(ctx context.Context, name, storagePool string) error {
 	start := time.Now()
-	err := p.MachineProvider.DeleteByName(ctx, name)
+	err := p.MachineProvider.DeleteByName(ctx, name, storagePool)
 	observe("DeleteByName", start, err)
 	return err
 }

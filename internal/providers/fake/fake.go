@@ -42,6 +42,8 @@ type Provider struct {
 	// can assert that a repeated reconcile did not create a second machine.
 	CreateCalls int
 	DeleteCalls int
+	// DeleteByNamePools records the storagePool of every DeleteByName call.
+	DeleteByNamePools []string
 
 	// LastSpec is the spec of the most recent Create, recorded so a test can
 	// assert what actually reached the backend. Bootstrap data in particular is
@@ -174,11 +176,12 @@ func (p *Provider) Delete(_ context.Context, id string) error {
 }
 
 // DeleteByName implements providers.MachineProvider.
-func (p *Provider) DeleteByName(_ context.Context, name string) error {
+func (p *Provider) DeleteByName(_ context.Context, name, storagePool string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.DeleteCalls++
+	p.DeleteByNamePools = append(p.DeleteByNamePools, storagePool)
 	if p.DeleteErr != nil {
 		return p.DeleteErr
 	}

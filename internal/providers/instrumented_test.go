@@ -118,7 +118,7 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		"FindByName": func() error { _, err := p.FindByName(t.Context(), "worker-1"); return err },
 		"Delete":     func() error { return p.Delete(t.Context(), "abc") },
 		"DeleteByName": func() error {
-			return p.DeleteByName(t.Context(), "worker-1")
+			return p.DeleteByName(t.Context(), "worker-1", "")
 		},
 		"EnsureInfrastructure": func() error {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
@@ -198,7 +198,7 @@ func (p *recordingProvider) Delete(_ context.Context, _ string) error {
 	return p.err
 }
 
-func (p *recordingProvider) DeleteByName(_ context.Context, _ string) error {
+func (p *recordingProvider) DeleteByName(_ context.Context, _, _ string) error {
 	p.lastOp = "DeleteByName"
 	return p.err
 }

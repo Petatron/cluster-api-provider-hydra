@@ -397,13 +397,20 @@ func (f *fakeLibvirt) DomainInterfaceAddresses(dom golibvirt.Domain, source, _ u
 	return ifaces, nil
 }
 
-func (f *fakeLibvirt) ConnectListAllStoragePools(int32, golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error) {
+// ConnectListAllStoragePools honours the active and inactive filters the way
+// libvirt does: either one alone narrows the list, neither or both list all.
+func (f *fakeLibvirt) ConnectListAllStoragePools(_ int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("ConnectListAllStoragePools", ""); err != nil {
 		return nil, 0, err
 	}
+	wantActive := flags&golibvirt.ConnectListStoragePoolsActive != 0
+	wantInactive := flags&golibvirt.ConnectListStoragePoolsInactive != 0
 	names := make([]string, 0, len(f.pools))
-	for n := range f.pools {
+	for n, p := range f.pools {
+		if wantActive != wantInactive && p.active != wantActive {
+			continue
+		}
 		names = append(names, n)
 	}
 	slices.Sort(names)

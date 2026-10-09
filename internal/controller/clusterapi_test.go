@@ -441,6 +441,24 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.LastSpec.StoragePool).To(Equal(linkPool))
 		})
 
+		It("sweeps for leftovers in the cluster's storage pool on deletion", func() {
+			// The sweep fails closed only for the machine's own pool, so it has to
+			// be told which that is -- resolved exactly as Create resolved it.
+			hm.Finalizers = []string{MachineFinalizer}
+			now := metav1.Now()
+			hm.DeletionTimestamp = &now
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.DeleteByNamePools).To(Equal([]string{linkPool}))
+		})
+
 		It("lets the machine override the cluster's image and networks", func() {
 			hm.Spec.Image = &infrav1.HydraImage{Name: "machine-specific.img"}
 			hm.Spec.Networks = []infrav1.HydraNetworkAttachment{{Name: "br-machine"}}

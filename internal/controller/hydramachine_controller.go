@@ -183,7 +183,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if !machine.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, prov, machine)
+		return r.reconcileDelete(ctx, prov, machine, link)
 	}
 	log.V(1).Info("Reconciling machine", "name", machine.Name)
 	return r.reconcileNormal(ctx, prov, machine, link)
@@ -339,7 +339,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	return state, nil
 }
 
-func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(machine, MachineFinalizer) {
 		return ctrl.Result{}, nil
 	}
@@ -367,7 +367,11 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 	// Releasing the finalizer at that point would orphan the disk with nothing
 	// left referencing it. DeleteByName is idempotent, so the common case where
 	// everything was already removed costs one no-op lookup.
-	if err := prov.DeleteByName(ctx, backendName(machine)); err != nil {
+	//
+	// The machine's pool goes with it, resolved the way Create resolved it. It
+	// is the one pool the sweep must not give up on, and the only one: a stopped
+	// pool elsewhere on the host must not hold every deletion hostage.
+	if err := prov.DeleteByName(ctx, backendName(machine), resolveStoragePool(link)); err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}

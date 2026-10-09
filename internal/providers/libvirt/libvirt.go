@@ -847,21 +847,7 @@ func subnetParts(cidr string) (gateway, netmask string, err error) {
 //
 // Returns the bridge name, which is what machines are actually attached to.
 func (p *Provider) ensureNetwork(ctx context.Context, spec providers.ManagedNetwork) (string, error) {
-	gateway, netmask, err := subnetParts(spec.Subnet)
-	if err != nil {
-		return "", err
-	}
-
-	existing, err := call(ctx, p, func() (golibvirt.Network, error) {
-		return p.lv.NetworkLookupByName(spec.Name)
-	})
-	if err != nil {
-		if !isNotFound(err) {
-			return "", fmt.Errorf("libvirt: looking up network %q: %w", spec.Name, err)
-		}
-		return p.createNetwork(ctx, spec, gateway, netmask)
-	}
-	return p.verifyNetwork(ctx, existing, spec, gateway, netmask)
+	return p.attachableNetwork(ctx, spec, true)
 }
 
 // resolveNetwork is ensureNetwork for machine creation: it verifies and starts
@@ -873,6 +859,12 @@ func (p *Provider) ensureNetwork(ctx context.Context, spec providers.ManagedNetw
 // next cluster check repairs, not a second creation path that bypasses the gate.
 // Transient rather than terminal for the same reason.
 func (p *Provider) resolveNetwork(ctx context.Context, spec providers.ManagedNetwork) (string, error) {
+	return p.attachableNetwork(ctx, spec, false)
+}
+
+// attachableNetwork is ensureNetwork and resolveNetwork, which differ only in
+// whether an absent network is defined or reported.
+func (p *Provider) attachableNetwork(ctx context.Context, spec providers.ManagedNetwork, define bool) (string, error) {
 	gateway, netmask, err := subnetParts(spec.Subnet)
 	if err != nil {
 		return "", err
@@ -881,11 +873,14 @@ func (p *Provider) resolveNetwork(ctx context.Context, spec providers.ManagedNet
 		return p.lv.NetworkLookupByName(spec.Name)
 	})
 	if err != nil {
-		if isNotFound(err) {
+		if !isNotFound(err) {
+			return "", fmt.Errorf("libvirt: looking up network %q: %w", spec.Name, err)
+		}
+		if !define {
 			return "", fmt.Errorf("libvirt: managed network %q does not exist; "+
 				"the HydraCluster check creates it, and this machine waits for that", spec.Name)
 		}
-		return "", fmt.Errorf("libvirt: looking up network %q: %w", spec.Name, err)
+		return p.createNetwork(ctx, spec, gateway, netmask)
 	}
 	return p.verifyNetwork(ctx, existing, spec, gateway, netmask)
 }
@@ -1144,7 +1139,7 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 }
 
 // DeleteByName implements providers.MachineProvider.
-func (p *Provider) DeleteByName(ctx context.Context, name string) error {
+func (p *Provider) DeleteByName(ctx context.Context, name, storagePool string) error {
 	ctx, cancel, err := p.begin(ctx)
 	if err != nil {
 		return err
@@ -1176,27 +1171,40 @@ func (p *Provider) DeleteByName(ctx context.Context, name string) error {
 	// cloud-init image between the two, so a crash in that window leaves exactly
 	// the ISO behind -- and a sweep that only knew about the qcow2 would report
 	// success and orphan it.
+	//
+	// The machine's own pool is the one a leftover could be in. When the caller
+	// does not know it, the pool Create would have used is the configured one.
+	if storagePool == "" {
+		storagePool = p.cfg.StoragePool
+	}
 	for _, volName := range []string{rootVolumeName(name), cidataVolumeName(name)} {
-		if err := p.deleteVolumeAnyPool(ctx, volName); err != nil {
+		if err := p.deleteVolumeAnyPool(ctx, volName, storagePool); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// deleteVolumeAnyPool removes a volume from whichever pool holds it.
+// deleteVolumeAnyPool removes a volume from whichever running pool holds it.
 //
 // Used for domain-less leftovers, where the domain XML that would normally name
 // the pool no longer exists.
 //
-// A stopped pool cannot be searched: libvirt refuses volume calls against it.
-// Its contents are unknowable, so it could hold the leftover, and skipping it
-// silently would release the finalizer over a disk nobody can find again. So
-// every running pool is swept first, and then a stopped pool fails the call by
-// name: the operator starts or undefines it and the next attempt finishes.
-func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) error {
+// A stopped pool cannot be searched: libvirt refuses volume calls against it,
+// and its contents are unknowable. Only one stopped pool matters, though: the
+// machine's own, ownPool, where Create put its volumes. If that one is stopped
+// the leftover could be in it, and reporting success would release the
+// finalizer over a disk nobody can find again -- so the call fails, naming it,
+// and the next attempt finishes once an operator starts it.
+//
+// Any other stopped pool is skipped and logged. The controller sweeps after
+// every deletion, so failing on those would hold every machine on the host in
+// Deleting -- stalling scale-down and cluster deletion -- over a pool that may
+// have nothing to do with Hydra, to guard against a leftover that could only
+// be there if the pool configuration changed between Create and a crash.
+func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool string) error {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, 0)
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsActive)
 	})
 	if err != nil {
 		// Do not fall back to the configured pool. A domain-less partial can be in
@@ -1207,25 +1215,13 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) erro
 		return fmt.Errorf("libvirt: listing storage pools to find %q: %w", volName, err)
 	}
 
-	var stopped []string
 	for _, pool := range pools {
-		active, err := call(ctx, p, func() (int32, error) { return p.lv.StoragePoolIsActive(pool) })
-		if err != nil {
-			if isNotFound(err) {
-				// Undefined since the list was taken, and with it any way to
-				// reach what it held.
-				continue
-			}
-			return fmt.Errorf("libvirt: checking whether storage pool %q is running: %w", pool.Name, err)
-		}
-		if active != 1 {
-			stopped = append(stopped, pool.Name)
-			continue
-		}
 		vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
 			return p.lv.StorageVolLookupByName(pool, volName)
 		})
 		if err != nil {
+			// Not found covers the pool too: one undefined since the list was
+			// taken has taken any way of reaching its volumes with it.
 			if isNotFound(err) {
 				continue
 			}
@@ -1236,9 +1232,20 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) erro
 			return fmt.Errorf("libvirt: deleting volume %q from pool %q: %w", volName, pool.Name, err)
 		}
 	}
-	if len(stopped) > 0 {
-		return fmt.Errorf("libvirt: cannot rule out a leftover %q in stopped storage pool(s) %s; "+
-			"start or undefine them so teardown can finish", volName, strings.Join(stopped, ", "))
+
+	stopped, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
+	})
+	if err != nil {
+		return fmt.Errorf("libvirt: listing stopped storage pools while looking for %q: %w", volName, err)
+	}
+	for _, pool := range stopped {
+		if ownPool != "" && pool.Name == ownPool {
+			return fmt.Errorf("libvirt: storage pool %q, where %q would be, is not running; "+
+				"start it so teardown can finish", pool.Name, volName)
+		}
+		logf.FromContext(ctx).Info("Skipping a stopped storage pool in the leftover sweep",
+			"pool", pool.Name, "volume", volName, "machinePool", ownPool)
 	}
 	return nil
 }
@@ -1406,23 +1413,13 @@ type stoppedPool struct {
 // when its volumes are not.
 func (p *Provider) stoppedPools(ctx context.Context) ([]stoppedPool, error) {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, 0)
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("listing storage pools: %w", err)
+		return nil, fmt.Errorf("listing stopped storage pools: %w", err)
 	}
 	var out []stoppedPool
 	for _, pool := range pools {
-		active, err := call(ctx, p, func() (int32, error) { return p.lv.StoragePoolIsActive(pool) })
-		if err != nil {
-			if isNotFound(err) {
-				continue
-			}
-			return nil, fmt.Errorf("checking whether storage pool %q is running: %w", pool.Name, err)
-		}
-		if active == 1 {
-			continue
-		}
 		desc, err := call(ctx, p, func() (string, error) { return p.lv.StoragePoolGetXMLDesc(pool, 0) })
 		if err != nil {
 			if isNotFound(err) {

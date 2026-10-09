@@ -325,8 +325,16 @@ type MachineProvider interface {
 	// the domain; FindByName would then report not-found and deletion would
 	// release the finalizer, permanently leaving the qcow2 behind.
 	//
+	// storagePool is the pool the machine's volumes were created in -- the same
+	// value Create was given in MachineSpec.StoragePool, empty for the backend's
+	// default. A leftover can only be there, so that is the one place deletion
+	// must not report success while it cannot be searched. Elsewhere a backend
+	// may skip what it cannot see: holding every deletion on an unrelated,
+	// unsearchable store would stall scale-down and cluster deletion over a
+	// leftover that could not exist there.
+	//
 	// As with Delete, removing nothing succeeds.
-	DeleteByName(ctx context.Context, name string) error
+	DeleteByName(ctx context.Context, name, storagePool string) error
 }
 
 // ProviderID renders the Cluster API providerID for a machine.
