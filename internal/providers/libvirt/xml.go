@@ -402,7 +402,7 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 // The ports must cover every PCIe device. When the declared ones run out,
 // libvirt adds more, with hotplug on -- so a short count does not fail, it
 // silently brings the original fault back for whichever device lands there.
-// verifyRootPorts is the check that turns that into an error.
+// startVerified is the check that turns that into a refusal.
 const (
 	// libvirtDefaultPCIeDevices counts the PCIe devices libvirt adds to every
 	// q35 domain without being asked: a qemu-xhci USB controller and a virtio
@@ -430,10 +430,13 @@ func pcieDeviceCount(dv devices) int {
 			n++
 		}
 	}
-	if len(dv.Channels) > 0 {
-		// Each virtio channel rides one virtio-serial controller, which is the
-		// device that takes the port.
-		n++
+	for _, c := range dv.Channels {
+		// Every virtio channel rides one virtio-serial controller, which is the
+		// device that takes the port. Other channel types take none.
+		if c.Target.Type == modelVirtio {
+			n++
+			break
+		}
 	}
 	return n
 }

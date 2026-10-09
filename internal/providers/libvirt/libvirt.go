@@ -401,7 +401,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// a different partial state, and each one has to be recoverable:
 	//
 	//   volume created, domain not defined  -> adopt the volume
-	//   domain defined, never started       -> start it
+	//   domain defined, never started       -> check its root ports, start it
 	//   domain started                      -> return it
 	//
 	// The middle case is the subtle one: a defined-but-inactive domain adopted
@@ -498,52 +498,10 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
 	}
-	// Before the first start, while undefining still loses nothing.
-	if err := p.verifyRootPorts(ctx, dom); err != nil {
-		const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
-		if uErr := callVoid(ctx, p, func() error { return p.lv.DomainUndefineFlags(dom, flags) }); uErr != nil {
-			logf.FromContext(ctx).Error(uErr, "Failed to undefine a domain that failed its root-port check",
-				"domain", spec.Name)
-		}
-		rollback()
-		return nil, err
-	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
 		return nil, err
 	}
 	return p.stateOf(ctx, dom)
-}
-
-// verifyRootPorts refuses a freshly defined domain that libvirt gave a
-// pcie-root-port with hotplug on.
-//
-// domainXML declares enough ports for every device it knows about. But when
-// they run out, libvirt does not fail: it quietly adds ports of its own, with
-// hotplug on, and the device behind one can come up missing in the guest (see
-// rootPorts). That happens only if some libvirt version adds a PCIe device
-// pcieDeviceCount does not count, beyond the spares. A machine that will never
-// boot is worse than one that is never created, so this reads back what libvirt
-// actually stored and refuses it.
-//
-// Terminal: the same spec renders the same XML, so a retry would build the same
-// domain.
-func (p *Provider) verifyRootPorts(ctx context.Context, dom golibvirt.Domain) error {
-	desc, err := call(ctx, p, func() (string, error) {
-		return p.lv.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
-	})
-	if err != nil {
-		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", dom.Name, err)
-	}
-	bad, err := hotplugRootPorts(desc)
-	if err != nil {
-		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", dom.Name, err)
-	}
-	if len(bad) > 0 {
-		return fmt.Errorf("%w: libvirt: domain %q has %d pcie-root-port(s) with hotplug on (index %s): "+
-			"libvirt added ports beyond the ones declared, so it attaches a PCIe device this provider does not count",
-			providers.ErrTerminal, dom.Name, len(bad), strings.Join(bad, ", "))
-	}
-	return nil
 }
 
 // ensureCloudInitVolume renders the machine's bootstrap data into a NoCloud
@@ -626,17 +584,77 @@ func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 	return vol, nil
 }
 
-// ensureRunning starts a domain that is defined but not active.
+// ensureRunning starts a domain that is defined but not active, once its
+// root ports pass startVerified's check.
 func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) error {
-	active, err := call(ctx, p, func() (int32, error) { return p.lv.DomainIsActive(dom) })
+	return startVerified(dom.Name, startSteps{
+		isActive: func() (bool, error) {
+			active, err := call(ctx, p, func() (int32, error) { return p.lv.DomainIsActive(dom) })
+			return active == 1, err
+		},
+		readXML: func() (string, error) {
+			return call(ctx, p, func() (string, error) {
+				return p.lv.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+			})
+		},
+		start: func() error { return callVoid(ctx, p, func() error { return p.lv.DomainCreate(dom) }) },
+	})
+}
+
+// startSteps are the three RPCs starting a domain takes. They are funcs so the
+// order of check and start can be tested without a libvirt.
+type startSteps struct {
+	isActive func() (bool, error)
+	readXML  func() (string, error)
+	start    func() error
+}
+
+// startVerified starts a domain that is not running, but only after reading
+// back what libvirt stored and finding no pcie-root-port with hotplug on.
+//
+// domainXML declares enough ports for every device it knows about. But when
+// they run out, libvirt does not fail: it quietly adds ports of its own, with
+// hotplug on, and the device behind one can come up missing in the guest (see
+// rootPorts). That happens only if some libvirt version adds a PCIe device
+// pcieDeviceCount does not count, beyond the spares.
+//
+// Both of Create's paths come through here, and the adopt path matters as much
+// as the fresh one: an attempt that defined the domain and then lost the
+// connection during the read-back leaves a domain nobody has checked, and the
+// next reconcile adopts it.
+//
+// A refused domain is left exactly as it is, defined and never started, with
+// its volumes. Nothing here undefines or deletes. Reclaiming it is Delete's job,
+// which finds it by name, and a cleanup on this path would need its own
+// ordering and its own context to be safe on the very failures that bring it
+// here.
+//
+// Hotplug-on ports are terminal: the same spec renders the same XML, so a retry
+// would read back the same domain. A failed read-back is not, and fails closed.
+// An already-running domain is left alone; there is nothing left to prevent.
+func startVerified(name string, s startSteps) error {
+	active, err := s.isActive()
 	if err != nil {
-		return fmt.Errorf("libvirt: checking whether domain %q is active: %w", dom.Name, err)
+		return fmt.Errorf("libvirt: checking whether domain %q is active: %w", name, err)
 	}
-	if active == 1 {
+	if active {
 		return nil
 	}
-	if err := callVoid(ctx, p, func() error { return p.lv.DomainCreate(dom) }); err != nil {
-		return fmt.Errorf("libvirt: starting domain %q: %w", dom.Name, err)
+	desc, err := s.readXML()
+	if err != nil {
+		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", name, err)
+	}
+	bad, err := hotplugRootPorts(desc)
+	if err != nil {
+		return fmt.Errorf("libvirt: reading back domain XML for %q: %w", name, err)
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("%w: libvirt: not starting domain %q: %d pcie-root-port(s) have hotplug on (index %s), "+
+			"so libvirt attached a PCIe device beyond the ports declared for it",
+			providers.ErrTerminal, name, len(bad), strings.Join(bad, ", "))
+	}
+	if err := s.start(); err != nil {
+		return fmt.Errorf("libvirt: starting domain %q: %w", name, err)
 	}
 	return nil
 }

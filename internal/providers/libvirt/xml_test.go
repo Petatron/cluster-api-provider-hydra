@@ -525,3 +525,18 @@ func TestHotplugRootPortsAcceptsWhatDomainXMLDeclares(t *testing.T) {
 		t.Error("truncated XML was accepted; a domain that cannot be read must not be passed as safe")
 	}
 }
+
+// Only a virtio channel needs the virtio-serial controller, and one controller
+// carries all of them.
+func TestPCIeDeviceCountCountsOneVirtioSerialForAnyNumberOfVirtioChannels(t *testing.T) {
+	virtio := channelDef{Type: "unix", Target: channelTargetDef{Type: modelVirtio, Name: "a"}}
+	other := channelDef{Type: "spicevmc", Target: channelTargetDef{Type: "spiceport", Name: "b"}}
+
+	base := pcieDeviceCount(devices{})
+	if got := pcieDeviceCount(devices{Channels: []channelDef{other}}); got != base {
+		t.Errorf("non-virtio channel only: %d ports, want %d (no virtio-serial)", got, base)
+	}
+	if got := pcieDeviceCount(devices{Channels: []channelDef{virtio, virtio, other}}); got != base+1 {
+		t.Errorf("two virtio channels: %d ports, want %d (one virtio-serial)", got, base+1)
+	}
+}
