@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -290,8 +291,9 @@ func TestCreateReportsAFailureToReplaceALeftoverCloudInitVolume(t *testing.T) {
 	}
 }
 
-// Every failure after the root volume exists must take that volume, and the
-// cloud-init image, back out -- and never the shared base image underneath.
+// Every failure after the root volume exists and before the domain is defined
+// must take that volume, and the cloud-init image, back out -- and never the
+// shared base image underneath. After the domain is defined, Delete owns them.
 func TestCreateRollsBackItsVolumesWhenALaterStepFails(t *testing.T) {
 	root, cidata := rootVolumeName("worker-1"), cidataVolumeName("worker-1")
 	for name, failing := range map[string]string{
@@ -303,6 +305,7 @@ func TestCreateRollsBackItsVolumesWhenALaterStepFails(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			p, f := newFakeProvider(t)
+			f.addNetwork(testManagedNetwork.Name, matchingNetworkDef(), true)
 			f.errs[failing] = errInjected
 			spec := bootstrapSpec()
 			spec.ManagedNetwork = &testManagedNetwork
@@ -475,7 +478,22 @@ func TestCreateReturnsCancellationUnwrapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := p.Create(ctx, testSpec()); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Create = %v, want context.DeadlineExceeded", err)
+	if _, err := p.Create(ctx, testSpec()); err != context.DeadlineExceeded {
+		t.Fatalf("Create = %v, want context.DeadlineExceeded itself", err)
+	}
+}
+
+// Staging the image needs a writable temporary directory. A full or missing one
+// fails now and works later, so it must not raise a terminal condition.
+func TestCreateTreatsAnUnwritableStagingDirectoryAsTransient(t *testing.T) {
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	p, f := newFakeProvider(t)
+
+	_, err := p.Create(t.Context(), bootstrapSpec())
+	if err == nil || errors.Is(err, providers.ErrTerminal) {
+		t.Fatalf("Create = %v, want a transient failure", err)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) || len(f.domains) != 0 {
+		t.Error("a failed Create left a root volume or a domain behind")
 	}
 }

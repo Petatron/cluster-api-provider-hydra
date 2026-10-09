@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -111,7 +112,7 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 	backend := &recordingProvider{err: fmt.Errorf("%w: gone", ErrNotFound)}
 	p := NewInstrumented(backend)
 
-	for op, run := range map[string]func() error{
+	ops := map[string]func() error{
 		"Create":     func() error { _, err := p.Create(t.Context(), MachineSpec{}); return err },
 		"Get":        func() error { _, err := p.Get(t.Context(), "abc"); return err },
 		"FindByName": func() error { _, err := p.FindByName(t.Context(), "worker-1"); return err },
@@ -122,7 +123,15 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		"EnsureInfrastructure": func() error {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
 		},
-	} {
+	}
+	// Name is a constant, not a backend operation.
+	for m := range reflect.TypeFor[MachineProvider]().Methods() {
+		if m.Name != "Name" && ops[m.Name] == nil {
+			t.Errorf("MachineProvider.%s is not checked here", m.Name)
+		}
+	}
+
+	for op, run := range ops {
 		t.Run(op, func(t *testing.T) {
 			obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues(op, outcomeNotFound)
 			if err != nil {

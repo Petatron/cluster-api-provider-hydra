@@ -21,6 +21,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,15 @@ func seedMachine(t *testing.T, f *fakeLibvirt, pool string, extraDisks ...string
 	if err != nil {
 		t.Fatal(err)
 	}
-	return f.addDomain(spec.Name, string(out), true)
+	// Live XML nests the clone's backing chain inside its disk. The base image
+	// appears there as a <source> too, one level down.
+	backing := `<backingStore type="file"><source file="` + f.pools[testPool].dir + "/" + testImage +
+		`"></source></backingStore><target dev="vda"`
+	desc := strings.Replace(string(out), `<target dev="vda"`, backing, 1)
+	if desc == string(out) {
+		t.Fatal("no root disk to attach a backing store to")
+	}
+	return f.addDomain(spec.Name, desc, true)
 }
 
 func machineGone(f *fakeLibvirt, pool, name string) bool {
@@ -130,6 +139,23 @@ func TestDeleteReclaimsAMachineFromAPoolNoLongerConfigured(t *testing.T) {
 	}
 	if !machineGone(f, "old-pool", "worker-1") {
 		t.Error("the machine's volumes in the previously configured pool survived")
+	}
+}
+
+// A stopped pool hides its volumes: the path lookup reports not-found, which is
+// indistinguishable from already reclaimed. Undefining the domain then throws
+// away the only handle a retry had on both disks.
+func TestDeleteKeepsTheDomainWhenItsPoolIsStopped(t *testing.T) {
+	t.Skip("PET-58: Delete takes a stopped pool's volumes for reclaimed and orphans them")
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	f.pools[testPool].active = false
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err == nil {
+		t.Error("Delete reported success while the machine's disks were unreachable")
+	}
+	if _, ok := f.domains["worker-1"]; !ok {
+		t.Error("the domain was undefined while its disks could not be reclaimed")
 	}
 }
 
@@ -272,7 +298,7 @@ func TestDeleteByNameReturnsCancellationUnwrapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	if err := p.DeleteByName(ctx, "worker-1"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("DeleteByName = %v, want context.DeadlineExceeded", err)
+	if err := p.DeleteByName(ctx, "worker-1"); err != context.DeadlineExceeded {
+		t.Fatalf("DeleteByName = %v, want context.DeadlineExceeded itself", err)
 	}
 }

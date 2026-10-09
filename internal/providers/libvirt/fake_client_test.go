@@ -57,6 +57,12 @@ type fakeLibvirt struct {
 
 	connected  bool
 	connectErr error
+	// dial, when set, runs inside ConnectToURI outside the lock, standing in for
+	// the socket go-libvirt dials; its error fails the connect.
+	dial func() error
+	// isConnectedCalls counts IsConnected, which every provider call makes
+	// before it decides whether to dial.
+	isConnectedCalls int
 
 	pools    map[string]*fakePool
 	domains  map[string]*fakeDomain
@@ -171,6 +177,12 @@ func (f *fakeLibvirt) stall(t *testing.T, method string) {
 	}
 }
 
+func (f *fakeLibvirt) connectedChecks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isConnectedCalls
+}
+
 func (f *fakeLibvirt) called(method string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -198,10 +210,19 @@ func (f *fakeLibvirt) enter(method, arg string) error {
 }
 
 func (f *fakeLibvirt) ConnectToURI(golibvirt.ConnectURI) error {
-	defer f.mu.Unlock()
-	if err := f.enter("ConnectToURI", ""); err != nil {
+	err := f.enter("ConnectToURI", "")
+	dial := f.dial
+	f.mu.Unlock()
+	if err != nil {
 		return err
 	}
+	if dial != nil {
+		if err := dial(); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.connectErr != nil {
 		return f.connectErr
 	}
@@ -209,16 +230,21 @@ func (f *fakeLibvirt) ConnectToURI(golibvirt.ConnectURI) error {
 	return nil
 }
 
+// Disconnect stays connected when it fails, as go-libvirt does: a failed close
+// RPC returns before the socket is closed.
 func (f *fakeLibvirt) Disconnect() error {
 	defer f.mu.Unlock()
-	err := f.enter("Disconnect", "")
+	if err := f.enter("Disconnect", ""); err != nil {
+		return err
+	}
 	f.connected = false
-	return err
+	return nil
 }
 
 func (f *fakeLibvirt) IsConnected() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.isConnectedCalls++
 	return f.connected
 }
 
@@ -256,9 +282,10 @@ func (f *fakeLibvirt) DomainDefineXML(desc string) (golibvirt.Domain, error) {
 	if err := f.enter("DomainDefineXML", def.Name); err != nil {
 		return golibvirt.Domain{}, err
 	}
-	if d, ok := f.domains[def.Name]; ok {
-		d.xml = desc
-		return d.dom, nil
+	// domainXML carries no <uuid>, so libvirt generates one and refuses the name
+	// as already taken by a domain with another.
+	if _, ok := f.domains[def.Name]; ok {
+		return golibvirt.Domain{}, lvErr(golibvirt.ErrOperationFailed)
 	}
 	return f.addDomain(def.Name, desc, false).dom, nil
 }
@@ -406,6 +433,19 @@ func (f *fakeLibvirt) pool(name string) (*fakePool, error) {
 	return p, nil
 }
 
+// activePool is pool for the volume calls, which libvirt refuses against a
+// pool that is not running.
+func (f *fakeLibvirt) activePool(name string) (*fakePool, error) {
+	p, err := f.pool(name)
+	if err != nil {
+		return nil, err
+	}
+	if !p.active {
+		return nil, lvErr(golibvirt.ErrOperationInvalid)
+	}
+	return p, nil
+}
+
 func (f *fakeLibvirt) StoragePoolIsActive(pool golibvirt.StoragePool) (int32, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("StoragePoolIsActive", pool.Name); err != nil {
@@ -430,7 +470,7 @@ func (f *fakeLibvirt) StorageVolCreateXML(pool golibvirt.StoragePool, desc strin
 	if err := f.enter("StorageVolCreateXML", def.Name); err != nil {
 		return golibvirt.StorageVol{}, err
 	}
-	p, err := f.pool(pool.Name)
+	p, err := f.activePool(pool.Name)
 	if err != nil {
 		return golibvirt.StorageVol{}, err
 	}
@@ -446,7 +486,7 @@ func (f *fakeLibvirt) StorageVolLookupByName(pool golibvirt.StoragePool, name st
 	if err := f.enter("StorageVolLookupByName", name); err != nil {
 		return golibvirt.StorageVol{}, err
 	}
-	p, err := f.pool(pool.Name)
+	p, err := f.activePool(pool.Name)
 	if err != nil {
 		return golibvirt.StorageVol{}, err
 	}
@@ -461,8 +501,9 @@ func (f *fakeLibvirt) StorageVolLookupByPath(volPath string) (golibvirt.StorageV
 	if err := f.enter("StorageVolLookupByPath", volPath); err != nil {
 		return golibvirt.StorageVol{}, err
 	}
+	// Only running pools are searched; a volume in a stopped one is not found.
 	for _, p := range f.pools {
-		if path.Dir(volPath) != p.dir {
+		if !p.active || path.Dir(volPath) != p.dir {
 			continue
 		}
 		if _, ok := p.vols[path.Base(volPath)]; ok {
@@ -477,7 +518,7 @@ func (f *fakeLibvirt) StorageVolGetPath(vol golibvirt.StorageVol) (string, error
 	if err := f.enter("StorageVolGetPath", vol.Name); err != nil {
 		return "", err
 	}
-	p, err := f.pool(vol.Pool)
+	p, err := f.activePool(vol.Pool)
 	if err != nil {
 		return "", err
 	}
@@ -493,7 +534,7 @@ func (f *fakeLibvirt) StorageVolUpload(vol golibvirt.StorageVol, r io.Reader, _,
 	if readErr != nil {
 		return readErr
 	}
-	p, err := f.pool(vol.Pool)
+	p, err := f.activePool(vol.Pool)
 	if err != nil {
 		return err
 	}
@@ -510,7 +551,7 @@ func (f *fakeLibvirt) StorageVolDelete(vol golibvirt.StorageVol, _ golibvirt.Sto
 	if err := f.enter("StorageVolDelete", vol.Name); err != nil {
 		return err
 	}
-	p, err := f.pool(vol.Pool)
+	p, err := f.activePool(vol.Pool)
 	if err != nil {
 		return err
 	}
@@ -543,6 +584,9 @@ func (f *fakeLibvirt) NetworkDefineXML(desc string) (golibvirt.Network, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("NetworkDefineXML", def.Name); err != nil {
 		return golibvirt.Network{}, err
+	}
+	if _, ok := f.networks[def.Name]; ok {
+		return golibvirt.Network{}, lvErr(golibvirt.ErrOperationFailed)
 	}
 	if def.Bridge.Name == "" {
 		def.Bridge.Name = "virbr-" + def.Name
@@ -581,6 +625,10 @@ func (f *fakeLibvirt) NetworkCreate(n golibvirt.Network) error {
 	got, err := f.network(n)
 	if err != nil {
 		return err
+	}
+	// "network is already active", not ErrNetworkExist.
+	if got.active {
+		return lvErr(golibvirt.ErrOperationInvalid)
 	}
 	got.active = true
 	return nil

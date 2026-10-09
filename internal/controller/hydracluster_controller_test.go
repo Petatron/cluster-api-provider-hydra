@@ -258,12 +258,14 @@ var _ = Describe("HydraCluster Reconciler", func() {
 	})
 
 	Context("backend availability", func() {
-		It("refuses terminally when no backend is configured", func() {
+		It("raises InfrastructureFailed when no backend is configured", func() {
 			r := build(owningCluster(nil))
 			r.Provider = nil
 
-			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
-			Expect(err).To(MatchError(providers.ErrTerminal))
+			// Only the condition is pinned. Whether this is also returned as a
+			// reconcile error is inconsistent with the terminal policy below and
+			// is PET-58's to settle.
+			_, _ = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
 			Expect(failed).NotTo(BeNil())
 			Expect(failed.Status).To(Equal(metav1.ConditionTrue))

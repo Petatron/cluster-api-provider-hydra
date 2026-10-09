@@ -23,6 +23,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,7 +80,15 @@ func TestConcurrentCallersShareOneReconnect(t *testing.T) {
 			errs <- err
 		})
 	}
-	time.Sleep(50 * time.Millisecond)
+	// Hold the dial until every caller has found the connection down, so all of
+	// them are either dialing or waiting on the dial.
+	deadline := time.Now().Add(5 * time.Second)
+	for f.connectedChecks() < callers {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d callers reached the connection check", f.connectedChecks(), callers)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	close(release)
 	wg.Wait()
 	close(errs)
@@ -98,63 +107,95 @@ func TestConcurrentCallersShareOneReconnect(t *testing.T) {
 // forever, or every later call would join an attempt that never ends.
 func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 	p, f := newFakeProvider(t)
-	p.dialer = newTrackingDialer(stubDialer{addr: "127.0.0.1:1"}, time.Second)
+	p.cfg.RPCTimeout = time.Second
+	p.dialer = newTrackingDialer(stubDialer{addr: silentListener(t)}, time.Second)
 	f.connected = false
-	release := make(chan struct{})
-	var once sync.Once
-	f.hook = func(method string) {
-		if method == "ConnectToURI" {
-			once.Do(func() { <-release })
+	var dials atomic.Int32
+	f.dial = func() error {
+		if dials.Add(1) > 1 {
+			return nil
 		}
+		// The first dial waits on a peer that never answers. Only forceClose
+		// can release it.
+		conn, err := p.dialer.Dial()
+		if err != nil {
+			return err
+		}
+		_, _ = io.ReadAll(conn)
+		return errors.New("connection closed")
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 	_, err := p.FindByName(ctx, "worker-1")
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "connecting") {
 		t.Fatalf("FindByName = %v, want the reconnect to time out", err)
 	}
 
-	close(release)
 	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
 		t.Fatalf("FindByName after the stalled dial = %v, want an ordinary lookup", err)
 	}
+	if n := dials.Load(); n != 2 {
+		t.Errorf("%d dials, want the stalled one and a fresh one", n)
+	}
 }
 
-func TestCloseDisconnectsGracefully(t *testing.T) {
+func TestCloseReturnsDisconnectsResult(t *testing.T) {
 	p, f := newFakeProvider(t)
-	f.errs["Disconnect"] = errInjected
+	if err := p.Close(); err != nil || f.IsConnected() {
+		t.Fatalf("Close = %v, connected = %v; want a clean disconnect", err, f.IsConnected())
+	}
 
+	p, f = newFakeProvider(t)
+	f.errs["Disconnect"] = errInjected
 	if err := p.Close(); !errors.Is(err, errInjected) {
 		t.Fatalf("Close = %v, want Disconnect's own result", err)
 	}
-	if f.IsConnected() {
-		t.Error("still connected after Close")
-	}
 }
 
-// New's handshake carries its own deadline: a daemon that accepts the socket
-// and never answers would otherwise hang manager startup with no reconcile
-// loop yet running to time it out.
-func TestNewGivesUpOnASilentDaemon(t *testing.T) {
+// silentListener accepts connections and never writes to them, the way a
+// daemon that has stopped answering behaves. It returns the address.
+func silentListener(t *testing.T) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			t.Cleanup(func() { _ = c.Close() })
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
 		}
 	}()
+	return ln.Addr().String()
+}
+
+// New's handshake carries its own deadline: a daemon that accepts the socket
+// and never answers would otherwise hang manager startup with no reconcile
+// loop yet running to time it out.
+func TestNewGivesUpOnASilentDaemon(t *testing.T) {
+	addr := silentListener(t)
 
 	start := time.Now()
-	_, err = New(t.Context(), Config{
-		RemoteAddr:  ln.Addr().String(),
+	_, err := New(t.Context(), Config{
+		RemoteAddr:  addr,
 		Insecure:    true,
 		DialTimeout: 100 * time.Millisecond,
 		RPCTimeout:  100 * time.Millisecond,

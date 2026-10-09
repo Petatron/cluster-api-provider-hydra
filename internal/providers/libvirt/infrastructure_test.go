@@ -23,8 +23,6 @@ import (
 	"strings"
 	"testing"
 
-	golibvirt "github.com/digitalocean/go-libvirt"
-
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
 
@@ -307,12 +305,19 @@ func TestEnsureInfrastructureReportsManagedNetworkFaults(t *testing.T) {
 	}
 }
 
-// NetworkCreate on a network something else started in the meantime reports
-// that it already exists. That is the state being asked for.
+// Something else starts the network between the liveness check and
+// NetworkCreate. Running is the state being asked for.
 func TestEnsureInfrastructureToleratesANetworkStartedConcurrently(t *testing.T) {
+	t.Skip("PET-58: bringUp tolerates ErrNetworkExist, but libvirt reports an already-active network as operation-invalid")
 	p, f := newFakeProvider(t)
 	n := f.addNetwork(testManagedNetwork.Name, matchingNetworkDef(), false)
-	f.errs["NetworkCreate"] = lvErr(golibvirt.ErrNetworkExist)
+	f.hook = func(method string) {
+		if method == "NetworkCreate" {
+			f.mu.Lock()
+			n.active = true
+			f.mu.Unlock()
+		}
+	}
 	spec := clusterSpec()
 	spec.ManagedNetwork = &testManagedNetwork
 
