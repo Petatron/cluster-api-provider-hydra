@@ -24,3 +24,4 @@ ignore:
   - "api/**/groupversion_info.go" # scheme registration boilerplate
   - "cmd/main.go"                 # manager wiring; exercised by e2e, not envtest
   - "test/**"                     # e2e suite and test helpers
+  - "internal/providers/fake/**"  # test double; its callers' coverage is not credited to it
