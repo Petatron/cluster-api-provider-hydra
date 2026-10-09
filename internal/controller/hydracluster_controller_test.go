@@ -217,6 +217,85 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			}
 			Expect(provider.InfrastructureChecks).To(Equal(3))
 		})
+
+		It("hands the declared managed network to the backend", func() {
+			hc = hydraCluster(func(c *infrav1.HydraCluster) {
+				c.Spec.ControlPlaneEndpoint.Host = "192.168.60.10"
+				c.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
+					Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
+				}
+			})
+			key = client.ObjectKeyFromObject(hc)
+			r := build(owningCluster(nil))
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.LastInfrastructure.ManagedNetwork).To(Equal(&providers.ManagedNetwork{
+				Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
+			}))
+		})
+
+		It("refuses an endpoint the managed network would hand out, before asking the backend", func() {
+			// The backend would otherwise create the network for a cluster that
+			// can never work on it.
+			hc = hydraCluster(func(c *infrav1.HydraCluster) {
+				c.Spec.ControlPlaneEndpoint.Host = "192.168.60.150"
+				c.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
+					Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
+				}
+			})
+			key = client.ObjectKeyFromObject(hc)
+			r := build(owningCluster(nil))
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(requeueClusterUnverified))
+			Expect(provider.InfrastructureChecks).To(BeZero())
+			failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
+			Expect(failed).NotTo(BeNil())
+			Expect(failed.Message).To(ContainSubstring("DHCP range"))
+		})
+	})
+
+	Context("backend availability", func() {
+		It("refuses terminally when no backend is configured", func() {
+			r := build(owningCluster(nil))
+			r.Provider = nil
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(MatchError(providers.ErrTerminal))
+			failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
+			Expect(failed).NotTo(BeNil())
+			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("reports a backend that cannot be built, retries, and keeps the one it built", func() {
+			attempts := 0
+			r := build(owningCluster(nil))
+			r.Provider = nil
+			r.NewProvider = func(context.Context) (providers.MachineProvider, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, errors.New("hypervisor unreachable")
+				}
+				return provider, nil
+			}
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			ready := condition(r, infrav1.ClusterReadyCondition)
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Message).To(ContainSubstring("hypervisor unreachable"))
+			Expect(condition(r, infrav1.ClusterInfrastructureFailedCondition)).To(BeNil(),
+				"an unreachable hypervisor is not a configuration error")
+
+			for range 2 {
+				_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(attempts).To(Equal(2), "a backend that was built is kept, not rebuilt per reconcile")
+			Expect(provider.InfrastructureChecks).To(Equal(2))
+		})
 	})
 
 	Context("failures", func() {
