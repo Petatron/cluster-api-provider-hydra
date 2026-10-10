@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/Petatron/cluster-api-provider-hydra/internal/metrics"
@@ -82,26 +81,28 @@ func TestInstrumentedPassesResultsThrough(t *testing.T) {
 // consumes the whole timeout -- and it happens inside the constructor, before
 // there is a provider to wrap. Without this it would be the only operation
 // producing no sample at all, which is exactly the case the metric exists for.
+//
+// The histogram is a package-level collector, so earlier runs in the same
+// process (-count=N) have already left samples and series behind. Everything
+// is therefore asserted as a delta, never as an absolute.
 func TestObserveDialRecordsASample(t *testing.T) {
-	before := testutil.CollectAndCount(metrics.ProviderOperationDuration)
-
-	ObserveDial(time.Now(), errors.New("dial unix: connection refused"))
-
-	if after := testutil.CollectAndCount(metrics.ProviderOperationDuration); after <= before {
-		t.Fatalf("series count %d -> %d; the dial recorded nothing", before, after)
-	}
 	// Labelled as a failed reach, not as a refusal: an unreachable hypervisor is
 	// the thing an operator waits out, not the thing they go and fix.
 	obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues("Dial", outcomeError)
 	if err != nil {
 		t.Fatalf("no Dial/%s series: %v", outcomeError, err)
 	}
-	var m dto.Metric
-	if err := obs.(prometheus.Metric).Write(&m); err != nil {
-		t.Fatalf("reading the histogram: %v", err)
+	dialBefore := sampleCount(t, obs.(prometheus.Metric))
+	totalBefore := totalSampleCount(t, metrics.ProviderOperationDuration)
+
+	ObserveDial(time.Now(), errors.New("dial unix: connection refused"))
+
+	if after := sampleCount(t, obs.(prometheus.Metric)); after != dialBefore+1 {
+		t.Errorf("Dial/%s samples %d -> %d, want one more", outcomeError, dialBefore, after)
 	}
-	if got := m.GetHistogram().GetSampleCount(); got != 1 {
-		t.Errorf("Dial/%s sample count = %d, want 1", outcomeError, got)
+	// Exactly one sample anywhere: not also recorded under a second label set.
+	if after := totalSampleCount(t, metrics.ProviderOperationDuration); after != totalBefore+1 {
+		t.Errorf("samples across all series %d -> %d, want one more", totalBefore, after)
 	}
 }
 
@@ -161,6 +162,17 @@ func sampleCount(t *testing.T, m prometheus.Metric) uint64 {
 		t.Fatalf("reading the histogram: %v", err)
 	}
 	return out.GetHistogram().GetSampleCount()
+}
+
+func totalSampleCount(t *testing.T, c prometheus.Collector) uint64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric)
+	go func() { c.Collect(ch); close(ch) }()
+	var total uint64
+	for m := range ch {
+		total += sampleCount(t, m)
+	}
+	return total
 }
 
 func TestNewInstrumentedTolerantOfNil(t *testing.T) {
