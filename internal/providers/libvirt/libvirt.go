@@ -1447,7 +1447,7 @@ func (p *Provider) confirmReclaimed(ctx context.Context, volPath string) error {
 	}
 	dir := filepath.Dir(volPath)
 	for _, sp := range stopped {
-		if sp.dir != "" && filepath.Clean(sp.dir) == dir {
+		if filepath.Clean(sp.dir) == dir {
 			return fmt.Errorf("libvirt: storage pool %q, which holds %q, is not running; "+
 				"keeping the domain until it is so its disks can be reclaimed", sp.name, volPath)
 		}
@@ -1485,9 +1485,32 @@ func (p *Provider) stoppedPools(ctx context.Context) ([]stoppedPool, error) {
 		if err := xml.Unmarshal([]byte(desc), &def); err != nil {
 			return nil, fmt.Errorf("parsing storage pool %q: %w", pool.Name, err)
 		}
+		if def.Target.Path == "" {
+			if networkPoolTypes[def.Type] {
+				// Its volumes are never host paths, so no disk a domain names by
+				// file can be in it. Failing on it would hold up every deletion
+				// that misses a path, over a pool that cannot be involved.
+				continue
+			}
+			// Any other pool without a directory cannot be matched against the
+			// path, and so cannot be ruled out. Not knowing is not proof.
+			return nil, fmt.Errorf("storage pool %q (type %q) defines no target path, so it cannot be ruled out",
+				pool.Name, def.Type)
+		}
 		out = append(out, stoppedPool{name: pool.Name, dir: def.Target.Path})
 	}
 	return out, nil
+}
+
+// networkPoolTypes are the libvirt pool types whose volumes live on a remote
+// service and are addressed by protocol, never by a path on the host. A disk
+// this provider created is a file the domain names by path -- a qcow2 clone
+// with a backing file, or a raw ISO -- so it cannot be in one of these.
+var networkPoolTypes = map[string]bool{
+	"rbd":          true,
+	"sheepdog":     true,
+	"gluster":      true,
+	"iscsi-direct": true,
 }
 
 func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) error {

@@ -85,6 +85,9 @@ type fakePool struct {
 	dir    string
 	active bool
 	vols   map[string]*fakeVol
+	// xml, when set, is what StoragePoolGetXMLDesc returns instead of a dir
+	// pool rooted at dir.
+	xml string
 }
 
 type fakeVol struct {
@@ -477,6 +480,9 @@ func (f *fakeLibvirt) StoragePoolGetXMLDesc(pool golibvirt.StoragePool, _ golibv
 	p, err := f.pool(pool.Name)
 	if err != nil {
 		return "", err
+	}
+	if p.xml != "" {
+		return p.xml, nil
 	}
 	return "<pool type='dir'><name>" + p.name + "</name><target><path>" + p.dir + "</path></target></pool>", nil
 }

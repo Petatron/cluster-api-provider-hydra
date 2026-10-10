@@ -200,6 +200,7 @@ type volBackingDef struct {
 // directory its volumes live in.
 type poolDef struct {
 	XMLName xml.Name      `xml:"pool"`
+	Type    string        `xml:"type,attr"`
 	Target  poolTargetDef `xml:"target"`
 }
 

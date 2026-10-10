@@ -222,6 +222,39 @@ func TestDeleteReclaimsADiskWhosePoolStartsDuringTheCheck(t *testing.T) {
 	}
 }
 
+// A stopped pool whose definition names no directory cannot be matched against
+// the missing path, so it cannot be ruled out -- unless its volumes are never
+// host paths at all, in which case it cannot hold a disk a domain names by file.
+func TestDeleteTreatsAStoppedPoolWithNoTargetPathByType(t *testing.T) {
+	for name, tc := range map[string]struct {
+		xml  string
+		keep bool
+	}{
+		"dir pool with no path":       {`<pool type='dir'><name>odd</name></pool>`, true},
+		"unrecognised type":           {`<pool type='newfangled'><name>odd</name></pool>`, true},
+		"rbd, volumes never on host":  {`<pool type='rbd'><name>odd</name></pool>`, false},
+		"gluster, volumes never host": {`<pool type='gluster'><name>odd</name></pool>`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+			odd := f.addPool("odd")
+			odd.active = false
+			odd.xml = tc.xml
+
+			err := p.Delete(t.Context(), formatUUID(d.dom.UUID))
+			_, kept := f.domains["worker-1"]
+			if tc.keep && (err == nil || !kept) {
+				t.Errorf("Delete = %v, domain kept = %v; a pool that cannot be ruled out must keep it", err, kept)
+			}
+			if !tc.keep && (err != nil || kept) {
+				t.Errorf("Delete = %v, domain kept = %v; this pool cannot hold the disk", err, kept)
+			}
+		})
+	}
+}
+
 // The second look is part of the proof, so a failure there is not a miss.
 func TestDeleteKeepsTheDomainWhenTheSecondLookFails(t *testing.T) {
 	p, f := newFakeProvider(t)
