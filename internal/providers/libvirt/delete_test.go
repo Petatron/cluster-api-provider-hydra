@@ -67,6 +67,9 @@ func seedMachine(t *testing.T, f *fakeLibvirt, pool string, extraDisks ...string
 // listPools is the RPC the sweep and the stopped-pool check both start with.
 const listPools = "ConnectListAllStoragePools"
 
+// lookupVolByName is the RPC the sweep asks each running pool with.
+const lookupVolByName = "StorageVolLookupByName"
+
 // StoragePoolFor must answer as Create resolves the pool, or the recorded pool
 // would send teardown somewhere Create never built.
 func TestStoragePoolForResolvesAsCreateDoes(t *testing.T) {
@@ -251,6 +254,53 @@ func TestDeleteTreatsAStoppedPoolWithNoTargetPathByType(t *testing.T) {
 			}
 			if !tc.keep && (err != nil || kept) {
 				t.Errorf("Delete = %v, domain kept = %v; this pool cannot hold the disk", err, kept)
+			}
+		})
+	}
+}
+
+// The rows of confirmReclaimed's table that a mutation once showed nothing
+// pinned. Each must keep the domain.
+func TestDeleteKeepsTheDomainWhenAStoppedPoolCannotBeRuledOut(t *testing.T) {
+	for name, setup := range map[string]func(f *fakeLibvirt){
+		// Undefine-then-define is an ordinary edit; the pool may be back with
+		// the disk in a moment, so vanishing mid-check is not proof.
+		"pool undefined before its XML is read": func(f *fakeLibvirt) {
+			f.addPool("editing").active = false
+			f.hook = func(method string) {
+				if method == "StoragePoolGetXMLDesc" {
+					f.mu.Lock()
+					delete(f.pools, "editing")
+					f.mu.Unlock()
+				}
+			}
+		},
+		"pool XML that does not parse": func(f *fakeLibvirt) {
+			odd := f.addPool("odd")
+			odd.active = false
+			odd.xml = "<pool"
+		},
+		// The disk's own pool, stopped, with its target spelled with a
+		// trailing slash. The same directory, so it must still match.
+		"own pool's target with a trailing slash": func(f *fakeLibvirt) {
+			own := f.pools[testPool]
+			own.active = false
+			own.xml = "<pool type='dir'><name>" + testPool + "</name><target><path>" + own.dir + "/</path></target></pool>"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			if name != "own pool's target with a trailing slash" {
+				delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+			}
+			setup(f)
+
+			if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err == nil {
+				t.Error("Delete succeeded although a stopped pool could not be ruled out")
+			}
+			if _, ok := f.domains["worker-1"]; !ok {
+				t.Error("the domain was undefined without proof its disk was gone")
 			}
 		})
 	}
@@ -494,14 +544,38 @@ func TestDeleteByNameTakesTheConfiguredPoolAsTheMachinesOwn(t *testing.T) {
 	}
 }
 
-// Not-found covers a pool undefined between the list and the lookup, which has
-// taken any way of reaching its volumes with it.
+// A pool undefined between the list and the volume lookup has taken any way of
+// reaching its volumes with it. An unrelated one is skipped; the machine's own
+// is settled by looking it up, and gone means let go.
 func TestDeleteByNameSkipsAPoolUndefinedMidSweep(t *testing.T) {
-	p, f := newFakeProvider(t)
-	f.errs["StorageVolLookupByName:"+rootVolumeName("worker-1")] = lvErr(golibvirt.ErrNoStoragePool)
+	for name, own := range map[string]string{
+		"someone else's pool": testPool,
+		"the machine's pool":  "going",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+			// Sorts before testPool, so it is the first pool looked into.
+			f.addPool("going")
+			looks := 0
+			f.hook = func(method string) {
+				if method != lookupVolByName {
+					return
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if looks++; looks == 1 {
+					delete(f.pools, "going")
+				}
+			}
 
-	if err := p.DeleteByName(t.Context(), "worker-1", ""); err != nil {
-		t.Fatalf("DeleteByName = %v, want success", err)
+			if err := p.DeleteByName(t.Context(), "worker-1", own); err != nil {
+				t.Fatalf("DeleteByName = %v, want success", err)
+			}
+			if f.hasVol(testPool, rootVolumeName("worker-1")) {
+				t.Error("the running pool was not swept")
+			}
+		})
 	}
 }
 
@@ -516,7 +590,7 @@ func TestDeleteByNameCatchesItsPoolStartingMidSweep(t *testing.T) {
 	f.addPool("other")
 	f.hook = func(method string) {
 		// The sweep of the running pool is under way: the list is taken.
-		if method == "StorageVolLookupByName" {
+		if method == lookupVolByName {
 			f.mu.Lock()
 			f.pools[testPool].active = true
 			f.mu.Unlock()
@@ -558,6 +632,32 @@ func TestDeleteByNameFailsWhenItsUnsweptPoolCannotBeLookedUp(t *testing.T) {
 
 	if err := p.DeleteByName(t.Context(), "worker-1", testPool); !errors.Is(err, errInjected) {
 		t.Fatalf("DeleteByName = %v, want the injected failure", err)
+	}
+}
+
+// Vanishing mid-sweep says nothing about the machine's pool's contents, so it
+// does not count as swept. Re-defined by the time it is checked -- an edit in
+// progress -- it may hold the leftover, and the call must not let it go.
+func TestDeleteByNameDoesNotCountAVanishedOwnPoolAsSwept(t *testing.T) {
+	p, f := newFakeProvider(t)
+	own := f.addPool("going", rootVolumeName("worker-1"))
+	f.hook = func(method string) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch method {
+		case lookupVolByName:
+			delete(f.pools, "going")
+		case "StoragePoolLookupByName":
+			own.active = false
+			f.pools["going"] = own
+		}
+	}
+
+	// The root volume's own check must refuse. A later volume's pass happening
+	// to notice the pool is back is luck, not the rule.
+	err := p.DeleteByName(t.Context(), "worker-1", "going")
+	if err == nil || !strings.Contains(err.Error(), rootVolumeName("worker-1")) {
+		t.Fatalf("DeleteByName = %v; want the root volume's check to refuse the pool that is back", err)
 	}
 }
 

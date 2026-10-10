@@ -285,6 +285,9 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// that would have rediscovered it. The providerID could never be recorded,
 	// for a machine that is running perfectly well.
 	var spec providers.MachineSpec
+	// recordedNote explains a Create failure when the machine is pinned to a
+	// recorded pool other than the one that resolves now.
+	var recordedNote string
 	switch _, findErr := prov.FindByName(ctx, backendName(machine)); {
 	case findErr == nil:
 		// Already exists. Create adopts it below -- including starting it if a
@@ -322,12 +325,23 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		// And Create then builds in the recorded pool, whatever resolves now. A
 		// retry after the manager's default changed would otherwise put volumes
 		// in the new default while teardown protects only the recorded one.
-		pool, err := r.recordStoragePool(ctx, machine, prov.StoragePoolFor(spec.StoragePool))
+		resolved := prov.StoragePoolFor(spec.StoragePool)
+		pool, err := r.recordStoragePool(ctx, machine, resolved)
 		if err != nil {
 			return nil, err
 		}
 		if pool != "" {
 			spec.StoragePool = pool
+		}
+		if pool != resolved {
+			// The record wins, which is right while volumes may be there -- but
+			// if that pool has since been removed, every Create fails with an
+			// error about a pool nobody configured any more. Say where it came
+			// from, so the way out (the annotation) is visible.
+			recordedNote = fmt.Sprintf(" (building in storage pool %q recorded in annotation %s; "+
+				"the cluster now resolves %q -- if no volumes of this machine exist in %q, "+
+				"removing the annotation lets it build there)",
+				pool, infrav1.StoragePoolAnnotation, resolved, pool)
 		}
 	default:
 		return nil, fmt.Errorf("searching for an existing machine: %w", findErr)
@@ -338,7 +352,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// this call returns that same machine rather than creating a second one.
 	state, err := prov.Create(ctx, spec)
 	if err != nil {
-		return nil, fmt.Errorf("creating machine: %w", err)
+		return nil, fmt.Errorf("creating machine%s: %w", recordedNote, err)
 	}
 
 	providerID := providers.ProviderID(prov.Name(), state.ID)
@@ -819,7 +833,9 @@ func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine 
 	if pool == "" {
 		return "", nil
 	}
-	patch := client.MergeFrom(machine.DeepCopy())
+	// Optimistic: a stale cached copy must not overwrite a record another
+	// reconcile has just written.
+	patch := client.MergeFromWithOptions(machine.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	if machine.Annotations == nil {
 		machine.Annotations = map[string]string{}
 	}

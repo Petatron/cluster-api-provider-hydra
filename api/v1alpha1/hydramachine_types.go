@@ -246,6 +246,11 @@ const StandaloneAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/stand
 // in. An annotation rather than a status field because it has to outlive what
 // status may not: Cluster API expects status to be rebuildable from the world,
 // and this cannot be.
+//
+// It is honoured wherever it came from. Set by hand, or copied from a
+// HydraMachineTemplate's metadata, it names the pool Create builds in, and the
+// HydraCluster's pool check does not cover that pool. Leave it to the
+// controller.
 const StoragePoolAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/storage-pool"
 
 const (

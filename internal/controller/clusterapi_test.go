@@ -502,6 +502,27 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.LastSpec.StoragePool).To(Equal("first-attempt"))
 		})
 
+		It("names the recorded pool when building there fails", func() {
+			// If the recorded pool has since been removed, every Create fails
+			// about a pool nobody configures any more. The error has to point at
+			// the annotation, or the way out is invisible.
+			bare()
+			hm.Annotations = map[string]string{infrav1.StoragePoolAnnotation: "removed-pool"}
+			provider.CreateErr = errors.New(`storage pool "removed-pool" does not exist`)
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(infrav1.StoragePoolAnnotation))
+			Expect(err.Error()).To(ContainSubstring(linkPool))
+		})
+
 		It("sweeps for leftovers in the recorded pool on deletion, not the cluster's current one", func() {
 			hm.Finalizers = []string{MachineFinalizer}
 			hm.Annotations = map[string]string{infrav1.StoragePoolAnnotation: "recorded-pool"}

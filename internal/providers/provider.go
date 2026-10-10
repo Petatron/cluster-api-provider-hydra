@@ -336,16 +336,19 @@ type MachineProvider interface {
 	// storagePool is the effective pool the machine's volumes were created in:
 	// what StoragePoolFor resolved, a backend default included, as recorded when
 	// the machine was first created -- not the value requested, and not whatever
-	// the default is now. Empty only when nothing was recorded, for a machine
-	// created before the record existed or adopted rather than created; a
+	// the default is now. When nothing was recorded -- a machine created before
+	// the record existed, or adopted rather than created -- the caller passes its
+	// best re-resolution (the cluster's current pool), which may be empty; a
 	// backend then falls back to resolving it as Create would. A leftover can
 	// only be in that pool, so that is the one place deletion must not report
-	// success while it cannot be searched. Elsewhere a backend
-	// may skip what it cannot see: holding every deletion on an unrelated,
-	// unsearchable store would stall scale-down and cluster deletion over a
-	// leftover that could not exist there.
+	// success while it cannot be searched. Elsewhere a backend may skip what it
+	// cannot see: holding every deletion on an unrelated, unsearchable store
+	// would stall scale-down and cluster deletion over a leftover that could not
+	// exist there.
 	//
-	// As with Delete, removing nothing succeeds.
+	// As with Delete, removing nothing succeeds -- with that one exception: when
+	// the machine's own pool cannot be searched, nothing found is not proof, and
+	// deletion fails until it can be.
 	DeleteByName(ctx context.Context, name, storagePool string) error
 }
 
