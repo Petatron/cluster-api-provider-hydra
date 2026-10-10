@@ -22,6 +22,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -621,6 +622,30 @@ func TestDeleteByNameReportsBackendFaults(t *testing.T) {
 				t.Error("the volume was deleted despite the failure")
 			}
 		})
+	}
+}
+
+// The stopped-pool list only feeds a log line, but running out of time while
+// taking it still ends the call: it did not finish, so it must not report
+// success and let the controller release the finalizer.
+func TestDeleteByNameReturnsCancellationDuringTheStoppedPoolList(t *testing.T) {
+	p, f := newFakeProvider(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var lists atomic.Int32
+	f.hook = func(method string) {
+		if method == listPools && lists.Add(1) == 2 {
+			<-release
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := p.DeleteByName(ctx, "worker-1", ""); err != context.DeadlineExceeded {
+		t.Fatalf("DeleteByName = %v, want context.DeadlineExceeded itself", err)
+	}
+	if n := lists.Load(); n != 2 {
+		t.Fatalf("%d pool listings; the deadline was meant to expire during the second", n)
 	}
 }
 

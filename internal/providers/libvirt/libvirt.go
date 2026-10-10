@@ -1273,6 +1273,12 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
+		// A cancelled or expired context ends the call, as everywhere else in
+		// teardown, and unwrapped: the caller asked to stop, and reporting
+		// success would release the finalizer on a call that did not finish.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 		logf.FromContext(ctx).Error(err, "Failed to list stopped storage pools; skipped pools will not be logged",
 			"volume", volName)
 		return nil
