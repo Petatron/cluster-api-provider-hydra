@@ -262,6 +262,14 @@ type MachineProvider interface {
 	// providerID: hydra://<name>/<id>.
 	Name() string
 
+	// StoragePoolFor returns the pool Create would build in when given
+	// MachineSpec.StoragePool = requested: requested itself, or the backend's
+	// default when it is empty. Empty when the backend has no default either.
+	//
+	// The caller records it before Create, so teardown knows where the volumes
+	// went even after the object that named the pool, or the default, has gone.
+	StoragePoolFor(requested string) string
+
 	// Create makes a machine, and MUST be idempotent on spec.Name.
 	//
 	// This is not a nicety. A reconcile can be interrupted between creating a
@@ -325,8 +333,23 @@ type MachineProvider interface {
 	// the domain; FindByName would then report not-found and deletion would
 	// release the finalizer, permanently leaving the qcow2 behind.
 	//
-	// As with Delete, removing nothing succeeds.
-	DeleteByName(ctx context.Context, name string) error
+	// storagePool is the effective pool the machine's volumes were created in:
+	// what StoragePoolFor resolved, a backend default included, as recorded when
+	// the machine was first created -- not the value requested, and not whatever
+	// the default is now. When nothing was recorded -- a machine created before
+	// the record existed, or adopted rather than created -- the caller passes its
+	// best re-resolution (the cluster's current pool), which may be empty; a
+	// backend then falls back to resolving it as Create would. A leftover can
+	// only be in that pool, so that is the one place deletion must not report
+	// success while it cannot be searched. Elsewhere a backend may skip what it
+	// cannot see: holding every deletion on an unrelated, unsearchable store
+	// would stall scale-down and cluster deletion over a leftover that could not
+	// exist there.
+	//
+	// As with Delete, removing nothing succeeds -- with that one exception: when
+	// the machine's own pool cannot be searched, nothing found is not proof, and
+	// deletion fails until it can be.
+	DeleteByName(ctx context.Context, name, storagePool string) error
 }
 
 // ProviderID renders the Cluster API providerID for a machine.

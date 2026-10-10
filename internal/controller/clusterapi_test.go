@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -439,6 +440,122 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.LastSpec.Networks).To(HaveLen(1))
 			Expect(provider.LastSpec.Networks[0].Name).To(Equal(testNetwork))
 			Expect(provider.LastSpec.StoragePool).To(Equal(linkPool))
+		})
+
+		It("records the pool on the machine before Create runs", func() {
+			// Before, not after: a Create that fails after allocating volumes is
+			// the leftover teardown must find, so the record has to exist already.
+			bare()
+			provider.CreateErr = errors.New("crashed after allocating volumes")
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(reload(r).Annotations).To(HaveKeyWithValue(infrav1.StoragePoolAnnotation, linkPool))
+		})
+
+		It("records the backend's default when the cluster names no pool", func() {
+			// Otherwise a later change to the manager's default would send
+			// teardown to the wrong pool.
+			bare()
+			provider.DefaultStoragePool = "manager-default"
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(func(hc *infrav1.HydraCluster) { hc.Spec.StoragePool = "" }),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reload(r).Annotations).To(HaveKeyWithValue(infrav1.StoragePoolAnnotation, "manager-default"))
+			// Create is pinned to it, so a later change of default cannot move
+			// a retry somewhere teardown does not look.
+			Expect(provider.LastSpec.StoragePool).To(Equal("manager-default"))
+		})
+
+		It("keeps a pool already recorded", func() {
+			// It may be where an earlier attempt left volumes. A retry resolving
+			// another pool must not erase the only record of that.
+			bare()
+			hm.Annotations = map[string]string{infrav1.StoragePoolAnnotation: "first-attempt"}
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(reload(r).Annotations).To(HaveKeyWithValue(infrav1.StoragePoolAnnotation, "first-attempt"))
+			// And builds there: volumes split across two pools would leave
+			// teardown watching only one of them.
+			Expect(provider.LastSpec.StoragePool).To(Equal("first-attempt"))
+		})
+
+		It("names the recorded pool when building there fails", func() {
+			// If the recorded pool has since been removed, every Create fails
+			// about a pool nobody configures any more. The error has to point at
+			// the annotation, or the way out is invisible.
+			bare()
+			hm.Annotations = map[string]string{infrav1.StoragePoolAnnotation: "removed-pool"}
+			provider.CreateErr = errors.New(`storage pool "removed-pool" does not exist`)
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(infrav1.StoragePoolAnnotation))
+			Expect(err.Error()).To(ContainSubstring(linkPool))
+		})
+
+		It("sweeps for leftovers in the recorded pool on deletion, not the cluster's current one", func() {
+			hm.Finalizers = []string{MachineFinalizer}
+			hm.Annotations = map[string]string{infrav1.StoragePoolAnnotation: "recorded-pool"}
+			now := metav1.Now()
+			hm.DeletionTimestamp = &now
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.DeleteByNamePools).To(Equal([]string{"recorded-pool"}))
+		})
+
+		It("sweeps for leftovers in the cluster's storage pool on deletion", func() {
+			// A machine with nothing recorded -- created before the annotation
+			// existed -- falls back to resolving the pool as Create did.
+			hm.Finalizers = []string{MachineFinalizer}
+			now := metav1.Now()
+			hm.DeletionTimestamp = &now
+			secretName := linkSecretName
+			r := buildWithoutCluster(
+				ownerMachine(&secretName),
+				owningCluster(nil),
+				verifiedHydraCluster(nil),
+			)
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(provider.DeleteByNamePools).To(Equal([]string{linkPool}))
 		})
 
 		It("lets the machine override the cluster's image and networks", func() {

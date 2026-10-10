@@ -118,15 +118,17 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		"FindByName": func() error { _, err := p.FindByName(t.Context(), "worker-1"); return err },
 		"Delete":     func() error { return p.Delete(t.Context(), "abc") },
 		"DeleteByName": func() error {
-			return p.DeleteByName(t.Context(), "worker-1")
+			return p.DeleteByName(t.Context(), "worker-1", "")
 		},
 		"EnsureInfrastructure": func() error {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
 		},
 	}
-	// Name is a constant, not a backend operation.
+	// Name is a constant and StoragePoolFor reads configuration; neither is a
+	// backend operation, and neither touches the hypervisor.
+	local := map[string]bool{"Name": true, "StoragePoolFor": true}
 	for m := range reflect.TypeFor[MachineProvider]().Methods() {
-		if m.Name != "Name" && ops[m.Name] == nil {
+		if !local[m.Name] && ops[m.Name] == nil {
 			t.Errorf("MachineProvider.%s is not checked here", m.Name)
 		}
 	}
@@ -178,6 +180,8 @@ type recordingProvider struct {
 
 func (p *recordingProvider) Name() string { return "recording" }
 
+func (p *recordingProvider) StoragePoolFor(requested string) string { return requested }
+
 func (p *recordingProvider) Create(_ context.Context, spec MachineSpec) (*MachineState, error) {
 	p.lastOp, p.lastSpec = "Create", spec
 	return p.state, p.err
@@ -198,7 +202,7 @@ func (p *recordingProvider) Delete(_ context.Context, _ string) error {
 	return p.err
 }
 
-func (p *recordingProvider) DeleteByName(_ context.Context, _ string) error {
+func (p *recordingProvider) DeleteByName(_ context.Context, _, _ string) error {
 	p.lastOp = "DeleteByName"
 	return p.err
 }

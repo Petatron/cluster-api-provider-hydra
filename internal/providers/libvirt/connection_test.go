@@ -153,6 +153,26 @@ func TestCloseReturnsDisconnectsResult(t *testing.T) {
 	}
 }
 
+// go-libvirt's Disconnect returns before closing its socket when the close RPC
+// fails, so Close has to close it.
+func TestCloseClosesTheSocketWhenDisconnectFails(t *testing.T) {
+	p, f := newFakeProvider(t)
+	p.dialer = newTrackingDialer(stubDialer{addr: silentListener(t)}, time.Second)
+	conn, err := p.dialer.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	f.errs["Disconnect"] = errInjected
+
+	if err := p.Close(); !errors.Is(err, errInjected) {
+		t.Fatalf("Close = %v, want Disconnect's own result", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("read after Close = %v; want the socket closed", err)
+	}
+}
+
 // silentListener accepts connections and never writes to them, the way a
 // daemon that has stopped answering behaves. It returns the address.
 func silentListener(t *testing.T) string {

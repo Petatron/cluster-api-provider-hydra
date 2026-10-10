@@ -22,6 +22,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,7 +64,31 @@ func seedMachine(t *testing.T, f *fakeLibvirt, pool string, extraDisks ...string
 	return f.addDomain(spec.Name, desc, true)
 }
 
-func machineGone(f *fakeLibvirt, pool, name string) bool {
+// listPools is the RPC the sweep and the stopped-pool check both start with.
+const listPools = "ConnectListAllStoragePools"
+
+// lookupVolByName is the RPC the sweep asks each running pool with.
+const lookupVolByName = "StorageVolLookupByName"
+
+// StoragePoolFor must answer as Create resolves the pool, or the recorded pool
+// would send teardown somewhere Create never built.
+func TestStoragePoolForResolvesAsCreateDoes(t *testing.T) {
+	p, _ := newFakeProvider(t)
+	if got := p.StoragePoolFor("named-pool"); got != "named-pool" {
+		t.Errorf("StoragePoolFor(named-pool) = %q", got)
+	}
+	if got := p.StoragePoolFor(""); got != testPool {
+		t.Errorf("StoragePoolFor(\"\") = %q, want the configured %q", got, testPool)
+	}
+	p.cfg.StoragePool = ""
+	if got := p.StoragePoolFor(""); got != "" {
+		t.Errorf("StoragePoolFor(\"\") with no default = %q, want empty", got)
+	}
+}
+
+// machineGone reports whether the machine seedMachine builds is fully reclaimed.
+func machineGone(f *fakeLibvirt, pool string) bool {
+	name := testSpec().Name
 	_, defined := f.domains[name]
 	return !defined && !f.hasVol(pool, rootVolumeName(name)) && !f.hasVol(pool, cidataVolumeName(name))
 }
@@ -78,7 +103,7 @@ func TestDeleteReclaimsExactlyWhatCreateMade(t *testing.T) {
 	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if !machineGone(f, testPool, "worker-1") {
+	if !machineGone(f, testPool) {
 		t.Error("the machine's domain or volumes survived")
 	}
 	if !f.hasVol(testPool, operatorVolume) {
@@ -137,7 +162,7 @@ func TestDeleteReclaimsAMachineFromAPoolNoLongerConfigured(t *testing.T) {
 	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if !machineGone(f, "old-pool", "worker-1") {
+	if !machineGone(f, "old-pool") {
 		t.Error("the machine's volumes in the previously configured pool survived")
 	}
 }
@@ -146,16 +171,203 @@ func TestDeleteReclaimsAMachineFromAPoolNoLongerConfigured(t *testing.T) {
 // indistinguishable from already reclaimed. Undefining the domain then throws
 // away the only handle a retry had on both disks.
 func TestDeleteKeepsTheDomainWhenItsPoolIsStopped(t *testing.T) {
-	t.Skip("PET-58: Delete takes a stopped pool's volumes for reclaimed and orphans them")
 	p, f := newFakeProvider(t)
 	d := seedMachine(t, f, testPool)
 	f.pools[testPool].active = false
 
-	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err == nil {
-		t.Error("Delete reported success while the machine's disks were unreachable")
+	err := p.Delete(t.Context(), formatUUID(d.dom.UUID))
+	if err == nil {
+		t.Fatal("Delete reported success while the machine's disks were unreachable")
+	}
+	if !strings.Contains(err.Error(), testPool) {
+		t.Errorf("Delete = %v; want it to name the stopped pool an operator has to start", err)
+	}
+	if errors.Is(err, providers.ErrTerminal) {
+		t.Errorf("Delete = %v; a stopped pool is fixed by starting it, so this is not terminal", err)
 	}
 	if _, ok := f.domains["worker-1"]; !ok {
 		t.Error("the domain was undefined while its disks could not be reclaimed")
+	}
+	if !f.hasVol(testPool, rootVolumeName("worker-1")) || !f.hasVol(testPool, cidataVolumeName("worker-1")) {
+		t.Error("a volume vanished from a pool that was not running")
+	}
+
+	// Once the pool runs again, the retry finishes the job.
+	f.pools[testPool].active = true
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
+		t.Fatalf("Delete after the pool started = %v", err)
+	}
+	if !machineGone(f, testPool) || !f.hasVol(testPool, testImage) {
+		t.Error("the retry did not reclaim exactly the machine")
+	}
+}
+
+// The path miss and the stopped-pool list are two snapshots. A pool started
+// between them -- what an operator does on reading the "not running" error --
+// is in neither, and the disk must still be reclaimed rather than abandoned
+// when the domain is undefined.
+func TestDeleteReclaimsADiskWhosePoolStartsDuringTheCheck(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	f.pools[testPool].active = false
+	f.hook = func(method string) {
+		if method == listPools {
+			f.mu.Lock()
+			f.pools[testPool].active = true
+			f.mu.Unlock()
+		}
+	}
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
+		t.Fatalf("Delete = %v", err)
+	}
+	if !machineGone(f, testPool) || !f.hasVol(testPool, testImage) {
+		t.Error("the domain was undefined over disks that became reachable mid-check")
+	}
+}
+
+// A stopped pool whose definition names no directory cannot be matched against
+// the missing path, so it cannot be ruled out -- unless its volumes are never
+// host paths at all, in which case it cannot hold a disk a domain names by file.
+func TestDeleteTreatsAStoppedPoolWithNoTargetPathByType(t *testing.T) {
+	for name, tc := range map[string]struct {
+		xml  string
+		keep bool
+	}{
+		"dir pool with no path":       {`<pool type='dir'><name>odd</name></pool>`, true},
+		"unrecognised type":           {`<pool type='newfangled'><name>odd</name></pool>`, true},
+		"rbd, volumes never on host":  {`<pool type='rbd'><name>odd</name></pool>`, false},
+		"gluster, volumes never host": {`<pool type='gluster'><name>odd</name></pool>`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+			odd := f.addPool("odd")
+			odd.active = false
+			odd.xml = tc.xml
+
+			err := p.Delete(t.Context(), formatUUID(d.dom.UUID))
+			_, kept := f.domains["worker-1"]
+			if tc.keep && (err == nil || !kept) {
+				t.Errorf("Delete = %v, domain kept = %v; a pool that cannot be ruled out must keep it", err, kept)
+			}
+			if !tc.keep && (err != nil || kept) {
+				t.Errorf("Delete = %v, domain kept = %v; this pool cannot hold the disk", err, kept)
+			}
+		})
+	}
+}
+
+// The rows of confirmReclaimed's table that a mutation once showed nothing
+// pinned. Each must keep the domain.
+func TestDeleteKeepsTheDomainWhenAStoppedPoolCannotBeRuledOut(t *testing.T) {
+	for name, setup := range map[string]func(f *fakeLibvirt){
+		// Undefine-then-define is an ordinary edit; the pool may be back with
+		// the disk in a moment, so vanishing mid-check is not proof.
+		"pool undefined before its XML is read": func(f *fakeLibvirt) {
+			f.addPool("editing").active = false
+			f.hook = func(method string) {
+				if method == "StoragePoolGetXMLDesc" {
+					f.mu.Lock()
+					delete(f.pools, "editing")
+					f.mu.Unlock()
+				}
+			}
+		},
+		"pool XML that does not parse": func(f *fakeLibvirt) {
+			odd := f.addPool("odd")
+			odd.active = false
+			odd.xml = "<pool"
+		},
+		// The disk's own pool, stopped, with its target spelled with a
+		// trailing slash. The same directory, so it must still match.
+		"own pool's target with a trailing slash": func(f *fakeLibvirt) {
+			own := f.pools[testPool]
+			own.active = false
+			own.xml = "<pool type='dir'><name>" + testPool + "</name><target><path>" + own.dir + "/</path></target></pool>"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			if name != "own pool's target with a trailing slash" {
+				delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+			}
+			setup(f)
+
+			if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err == nil {
+				t.Error("Delete succeeded although a stopped pool could not be ruled out")
+			}
+			if _, ok := f.domains["worker-1"]; !ok {
+				t.Error("the domain was undefined without proof its disk was gone")
+			}
+		})
+	}
+}
+
+// The second look is part of the proof, so a failure there is not a miss.
+func TestDeleteKeepsTheDomainWhenTheSecondLookFails(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+	rootPath := f.pools[testPool].dir + "/" + rootVolumeName("worker-1")
+	looks := 0
+	f.hook = func(method string) {
+		if method != "StorageVolLookupByPath" {
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if looks++; looks == 2 {
+			f.errs["StorageVolLookupByPath:"+rootPath] = errInjected
+		}
+	}
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); !errors.Is(err, errInjected) {
+		t.Fatalf("Delete = %v, want the injected failure", err)
+	}
+	if _, ok := f.domains["worker-1"]; !ok {
+		t.Error("the domain was undefined without proof its disk was gone")
+	}
+}
+
+// Only a stopped pool that owns the disk's directory holds teardown up. One
+// elsewhere on the host is no reason to keep a machine whose disks are gone.
+func TestDeleteIgnoresAStoppedPoolThatDoesNotHoldTheDisk(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	delete(f.pools[testPool].vols, rootVolumeName("worker-1"))
+	f.addPool("unrelated").active = false
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); err != nil {
+		t.Fatalf("Delete = %v; an unrelated stopped pool must not block it", err)
+	}
+	if !machineGone(f, testPool) {
+		t.Error("the machine was not reclaimed")
+	}
+}
+
+// A miss that cannot be checked against the stopped pools is not proof of
+// reclamation. Keep the domain rather than guess.
+func TestDeleteKeepsTheDomainWhenStoppedPoolsCannotBeChecked(t *testing.T) {
+	for name, failing := range map[string]string{
+		"pool listing": listPools,
+		"pool XML":     "StoragePoolGetXMLDesc",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			f.pools[testPool].active = false
+			f.errs[failing] = errInjected
+
+			if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); !errors.Is(err, errInjected) {
+				t.Fatalf("Delete = %v, want the injected failure", err)
+			}
+			if _, ok := f.domains["worker-1"]; !ok {
+				t.Error("the domain was undefined without proof its disks were gone")
+			}
+		})
 	}
 }
 
@@ -234,10 +446,10 @@ func TestDeleteByNameReclaimsADefinedMachine(t *testing.T) {
 	p, f := newFakeProvider(t)
 	seedMachine(t, f, testPool)
 
-	if err := p.DeleteByName(t.Context(), "worker-1"); err != nil {
+	if err := p.DeleteByName(t.Context(), "worker-1", ""); err != nil {
 		t.Fatalf("DeleteByName: %v", err)
 	}
-	if !machineGone(f, testPool, "worker-1") {
+	if !machineGone(f, testPool) {
 		t.Error("the machine survived")
 	}
 }
@@ -249,7 +461,7 @@ func TestDeleteByNameSweepsDomainlessLeftoversFromEveryPool(t *testing.T) {
 	p, f := newFakeProvider(t)
 	old := f.addPool("old-pool", rootVolumeName("worker-1"), cidataVolumeName("worker-1"), rootVolumeName("worker-2"))
 
-	if err := p.DeleteByName(t.Context(), "worker-1"); err != nil {
+	if err := p.DeleteByName(t.Context(), "worker-1", ""); err != nil {
 		t.Fatalf("DeleteByName: %v", err)
 	}
 	if f.hasVol("old-pool", rootVolumeName("worker-1")) || f.hasVol("old-pool", cidataVolumeName("worker-1")) {
@@ -260,9 +472,230 @@ func TestDeleteByNameSweepsDomainlessLeftoversFromEveryPool(t *testing.T) {
 	}
 }
 
+// A stopped pool's contents cannot be listed. When it is the machine's own
+// pool, the leftover could be there, so the sweep finishes what it can see and
+// then fails naming it, rather than release the finalizer over a lost disk.
+func TestDeleteByNameWaitsForTheMachinesOwnStoppedPool(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+	// Sorts before testPool, so a sweep that tripped over it would never reach
+	// the running pool.
+	own := f.addPool("archive", cidataVolumeName("worker-1"))
+	own.active = false
+
+	err := p.DeleteByName(t.Context(), "worker-1", "archive")
+	if err == nil || !strings.Contains(err.Error(), "archive") {
+		t.Fatalf("DeleteByName = %v; want a failure naming the machine's stopped pool", err)
+	}
+	if errors.Is(err, providers.ErrTerminal) {
+		t.Errorf("DeleteByName = %v; starting the pool fixes this, so it is not terminal", err)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the leftover in the running pool was not swept")
+	}
+	if !f.hasVol("archive", cidataVolumeName("worker-1")) {
+		t.Error("a volume vanished from a pool that was not running")
+	}
+
+	own.active = true
+	if err := p.DeleteByName(t.Context(), "worker-1", "archive"); err != nil {
+		t.Fatalf("DeleteByName after the pool started = %v", err)
+	}
+	if f.hasVol("archive", cidataVolumeName("worker-1")) {
+		t.Error("the retry did not sweep the pool once it ran")
+	}
+}
+
+// The controller sweeps after every deletion. A stopped pool that is not the
+// machine's must not hold that up, or one idle pool anywhere on the host keeps
+// every machine in Deleting and stalls scale-down and cluster deletion.
+func TestDeleteByNameSkipsSomeoneElsesStoppedPool(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+	f.addPool("archive", "unrelated.qcow2").active = false
+
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); err != nil {
+		t.Fatalf("DeleteByName = %v; an unrelated stopped pool must not block it", err)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the leftover in the machine's pool was not swept")
+	}
+	if !f.hasVol("archive", "unrelated.qcow2") {
+		t.Error("the sweep touched a pool that was not running")
+	}
+}
+
+// A machine whose cluster named no pool was built in the configured one, so
+// that is the pool the sweep must not give up on.
+func TestDeleteByNameTakesTheConfiguredPoolAsTheMachinesOwn(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].active = false
+
+	err := p.DeleteByName(t.Context(), "worker-1", "")
+	if err == nil || !strings.Contains(err.Error(), testPool) {
+		t.Fatalf("DeleteByName = %v; want a failure naming the configured pool", err)
+	}
+
+	// With no pool known at all, nothing marks a stopped pool as the one that
+	// matters, and every one is skipped.
+	p.cfg.StoragePool = ""
+	if err := p.DeleteByName(t.Context(), "worker-1", ""); err != nil {
+		t.Fatalf("DeleteByName with no pool known = %v, want success", err)
+	}
+}
+
+// A pool undefined between the list and the volume lookup has taken any way of
+// reaching its volumes with it. An unrelated one is skipped; the machine's own
+// is settled by looking it up, and gone means let go.
+func TestDeleteByNameSkipsAPoolUndefinedMidSweep(t *testing.T) {
+	for name, own := range map[string]string{
+		"someone else's pool": testPool,
+		"the machine's pool":  "going",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+			// Sorts before testPool, so it is the first pool looked into.
+			f.addPool("going")
+			looks := 0
+			f.hook = func(method string) {
+				if method != lookupVolByName {
+					return
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if looks++; looks == 1 {
+					delete(f.pools, "going")
+				}
+			}
+
+			if err := p.DeleteByName(t.Context(), "worker-1", own); err != nil {
+				t.Fatalf("DeleteByName = %v, want success", err)
+			}
+			if f.hasVol(testPool, rootVolumeName("worker-1")) {
+				t.Error("the running pool was not swept")
+			}
+		})
+	}
+}
+
+// The machine's pool can be started after the running pools were listed --
+// exactly what an operator does on reading the "start it" error -- and then it
+// is neither swept nor stopped any more. It must not escape: the call fails,
+// and the retry finds it running.
+func TestDeleteByNameCatchesItsPoolStartingMidSweep(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+	f.pools[testPool].active = false
+	f.addPool("other")
+	f.hook = func(method string) {
+		// The sweep of the running pool is under way: the list is taken.
+		if method == lookupVolByName {
+			f.mu.Lock()
+			f.pools[testPool].active = true
+			f.mu.Unlock()
+		}
+	}
+
+	err := p.DeleteByName(t.Context(), "worker-1", testPool)
+	if err == nil || !strings.Contains(err.Error(), testPool) {
+		t.Fatalf("DeleteByName = %v; want a failure naming the pool that escaped the sweep", err)
+	}
+	if !f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Fatal("the test setup is wrong: the leftover was swept on the first pass")
+	}
+
+	f.hook = nil
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); err != nil {
+		t.Fatalf("DeleteByName on the retry = %v", err)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the retry did not sweep the pool once it ran")
+	}
+}
+
+// A machine's pool that has been undefined holds nothing libvirt can reach, so
+// it is no reason to keep the finalizer.
+func TestDeleteByNameLetsGoOfAnUndefinedOwnPool(t *testing.T) {
+	p, _ := newFakeProvider(t)
+	if err := p.DeleteByName(t.Context(), "worker-1", "long-gone"); err != nil {
+		t.Fatalf("DeleteByName = %v, want success", err)
+	}
+}
+
+// Whether the unswept pool still exists decides between failing and letting go.
+// Not knowing is not proof it is gone.
+func TestDeleteByNameFailsWhenItsUnsweptPoolCannotBeLookedUp(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].active = false
+	f.errs["StoragePoolLookupByName:"+testPool] = errInjected
+
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); !errors.Is(err, errInjected) {
+		t.Fatalf("DeleteByName = %v, want the injected failure", err)
+	}
+}
+
+// Vanishing mid-sweep says nothing about the machine's pool's contents, so it
+// does not count as swept. Re-defined by the time it is checked -- an edit in
+// progress -- it may hold the leftover, and the call must not let it go.
+func TestDeleteByNameDoesNotCountAVanishedOwnPoolAsSwept(t *testing.T) {
+	p, f := newFakeProvider(t)
+	own := f.addPool("going", rootVolumeName("worker-1"))
+	f.hook = func(method string) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch method {
+		case lookupVolByName:
+			delete(f.pools, "going")
+		case "StoragePoolLookupByName":
+			own.active = false
+			f.pools["going"] = own
+		}
+	}
+
+	// The root volume's own check must refuse. A later volume's pass happening
+	// to notice the pool is back is luck, not the rule.
+	err := p.DeleteByName(t.Context(), "worker-1", "going")
+	if err == nil || !strings.Contains(err.Error(), rootVolumeName("worker-1")) {
+		t.Fatalf("DeleteByName = %v; want the root volume's check to refuse the pool that is back", err)
+	}
+}
+
+// The stopped-pool list only names pools in a log line, so failing to take it
+// is no reason to fail -- as long as the machine's own pool was swept.
+func TestDeleteByNameOnlyLogsAFailedStoppedPoolList(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.pools[testPool].vols[rootVolumeName("worker-1")] = &fakeVol{}
+	lists := 0
+	f.hook = func(method string) {
+		if method != listPools {
+			return
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		// The second list is the stopped one, after the root volume's sweep.
+		switch lists++; lists {
+		case 2:
+			f.errs[listPools] = errInjected
+		case 3:
+			delete(f.errs, listPools)
+		}
+	}
+
+	if err := p.DeleteByName(t.Context(), "worker-1", testPool); err != nil {
+		t.Fatalf("DeleteByName = %v, want success", err)
+	}
+	if lists < 3 {
+		t.Fatalf("%d pool listings; the injected failure never reached the stopped-pool list", lists)
+	}
+	if f.hasVol(testPool, rootVolumeName("worker-1")) {
+		t.Error("the leftover was not swept")
+	}
+}
+
 func TestDeleteByNameOfNothingSucceeds(t *testing.T) {
 	p, _ := newFakeProvider(t)
-	if err := p.DeleteByName(t.Context(), "worker-1"); err != nil {
+	if err := p.DeleteByName(t.Context(), "worker-1", ""); err != nil {
 		t.Fatalf("DeleteByName = %v, want success", err)
 	}
 }
@@ -273,7 +706,7 @@ func TestDeleteByNameReportsBackendFaults(t *testing.T) {
 		"domain lookup": "DomainLookupByName",
 		// No fallback to the configured pool: a leftover elsewhere would be
 		// missed and the finalizer released over it.
-		"pool listing":  "ConnectListAllStoragePools",
+		"pool listing":  listPools,
 		"volume lookup": "StorageVolLookupByName:" + root,
 		"volume delete": "StorageVolDelete:" + root,
 	} {
@@ -282,7 +715,7 @@ func TestDeleteByNameReportsBackendFaults(t *testing.T) {
 			f.pools[testPool].vols[root] = &fakeVol{}
 			f.errs[failing] = errInjected
 
-			if err := p.DeleteByName(t.Context(), "worker-1"); !errors.Is(err, errInjected) {
+			if err := p.DeleteByName(t.Context(), "worker-1", ""); !errors.Is(err, errInjected) {
 				t.Fatalf("DeleteByName = %v, want the injected failure", err)
 			}
 			if !f.hasVol(testPool, root) {
@@ -292,13 +725,37 @@ func TestDeleteByNameReportsBackendFaults(t *testing.T) {
 	}
 }
 
+// The stopped-pool list only feeds a log line, but running out of time while
+// taking it still ends the call: it did not finish, so it must not report
+// success and let the controller release the finalizer.
+func TestDeleteByNameReturnsCancellationDuringTheStoppedPoolList(t *testing.T) {
+	p, f := newFakeProvider(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var lists atomic.Int32
+	f.hook = func(method string) {
+		if method == listPools && lists.Add(1) == 2 {
+			<-release
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := p.DeleteByName(ctx, "worker-1", ""); err != context.DeadlineExceeded {
+		t.Fatalf("DeleteByName = %v, want context.DeadlineExceeded itself", err)
+	}
+	if n := lists.Load(); n != 2 {
+		t.Fatalf("%d pool listings; the deadline was meant to expire during the second", n)
+	}
+}
+
 func TestDeleteByNameReturnsCancellationUnwrapped(t *testing.T) {
 	p, f := newFakeProvider(t)
 	f.stall(t, "DomainLookupByName")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	if err := p.DeleteByName(ctx, "worker-1"); err != context.DeadlineExceeded {
+	if err := p.DeleteByName(ctx, "worker-1", ""); err != context.DeadlineExceeded {
 		t.Fatalf("DeleteByName = %v, want context.DeadlineExceeded itself", err)
 	}
 }

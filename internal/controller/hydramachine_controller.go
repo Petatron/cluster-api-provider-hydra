@@ -183,7 +183,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if !machine.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, prov, machine)
+		return r.reconcileDelete(ctx, prov, machine, link)
 	}
 	log.V(1).Info("Reconciling machine", "name", machine.Name)
 	return r.reconcileNormal(ctx, prov, machine, link)
@@ -285,6 +285,9 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// that would have rediscovered it. The providerID could never be recorded,
 	// for a machine that is running perfectly well.
 	var spec providers.MachineSpec
+	// recordedNote explains a Create failure when the machine is pinned to a
+	// recorded pool other than the one that resolves now.
+	var recordedNote string
 	switch _, findErr := prov.FindByName(ctx, backendName(machine)); {
 	case findErr == nil:
 		// Already exists. Create adopts it below -- including starting it if a
@@ -315,6 +318,31 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		if spec, err = specFor(machine, link, bootstrapData); err != nil {
 			return nil, err
 		}
+		// Before Create, not after: a crash between Create allocating volumes
+		// and defining the domain is exactly the leftover teardown has to find,
+		// and it can only look in the right pool if this was already recorded.
+		//
+		// And Create then builds in the recorded pool, whatever resolves now. A
+		// retry after the manager's default changed would otherwise put volumes
+		// in the new default while teardown protects only the recorded one.
+		resolved := prov.StoragePoolFor(spec.StoragePool)
+		pool, err := r.recordStoragePool(ctx, machine, resolved)
+		if err != nil {
+			return nil, err
+		}
+		if pool != "" {
+			spec.StoragePool = pool
+		}
+		if pool != resolved {
+			// The record wins, which is right while volumes may be there -- but
+			// if that pool has since been removed, every Create fails with an
+			// error about a pool nobody configured any more. Say where it came
+			// from, so the way out (the annotation) is visible.
+			recordedNote = fmt.Sprintf(" (building in storage pool %q recorded in annotation %s; "+
+				"the cluster now resolves %q -- if no volumes of this machine exist in %q, "+
+				"removing the annotation lets it build there)",
+				pool, infrav1.StoragePoolAnnotation, resolved, pool)
+		}
 	default:
 		return nil, fmt.Errorf("searching for an existing machine: %w", findErr)
 	}
@@ -324,7 +352,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// this call returns that same machine rather than creating a second one.
 	state, err := prov.Create(ctx, spec)
 	if err != nil {
-		return nil, fmt.Errorf("creating machine: %w", err)
+		return nil, fmt.Errorf("creating machine%s: %w", recordedNote, err)
 	}
 
 	providerID := providers.ProviderID(prov.Name(), state.ID)
@@ -339,7 +367,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	return state, nil
 }
 
-func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(machine, MachineFinalizer) {
 		return ctrl.Result{}, nil
 	}
@@ -367,7 +395,11 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 	// Releasing the finalizer at that point would orphan the disk with nothing
 	// left referencing it. DeleteByName is idempotent, so the common case where
 	// everything was already removed costs one no-op lookup.
-	if err := prov.DeleteByName(ctx, backendName(machine)); err != nil {
+	//
+	// The machine's pool goes with it. It is the one pool the sweep must not
+	// give up on, and the only one: a stopped pool elsewhere on the host must not
+	// hold every deletion hostage. See storagePoolOf for where it comes from.
+	if err := prov.DeleteByName(ctx, backendName(machine), storagePoolOf(machine, link)); err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -783,6 +815,48 @@ func resolveNetworks(machine *infrav1.HydraMachine, link *linkage) []providers.N
 		out = append(out, providers.Network{Name: n.Name})
 	}
 	return out
+}
+
+// recordStoragePool writes the pool Create is about to build in onto the
+// machine, if nothing is recorded yet, and returns the recorded pool -- the one
+// Create must use.
+//
+// An existing value is kept, and wins. It was written before an earlier Create
+// that may have left volumes in it, and a later attempt resolving a different
+// pool -- the manager's default changed -- must neither erase that record nor
+// build somewhere else, or the machine's volumes would be split across two
+// pools with teardown watching only one.
+func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine *infrav1.HydraMachine, pool string) (string, error) {
+	if recorded := machine.Annotations[infrav1.StoragePoolAnnotation]; recorded != "" {
+		return recorded, nil
+	}
+	if pool == "" {
+		return "", nil
+	}
+	// Optimistic: a stale cached copy must not overwrite a record another
+	// reconcile has just written.
+	patch := client.MergeFromWithOptions(machine.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	if machine.Annotations == nil {
+		machine.Annotations = map[string]string{}
+	}
+	machine.Annotations[infrav1.StoragePoolAnnotation] = pool
+	if err := r.Patch(ctx, machine, patch); err != nil {
+		return "", fmt.Errorf("recording storage pool %q: %w", pool, err)
+	}
+	return pool, nil
+}
+
+// storagePoolOf is the pool a machine's volumes were created in, for teardown.
+//
+// The annotation recordStoragePool wrote is the answer. Without it -- a machine
+// created before it existed, or one adopted rather than created -- the pool is
+// resolved again from the cluster, which is what Create would have used unless
+// the HydraCluster is gone or its pool changed since.
+func storagePoolOf(machine *infrav1.HydraMachine, link *linkage) string {
+	if pool := machine.Annotations[infrav1.StoragePoolAnnotation]; pool != "" {
+		return pool
+	}
+	return resolveStoragePool(link)
 }
 
 // resolveStoragePool returns the cluster's pool, or empty for the backend's

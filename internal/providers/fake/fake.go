@@ -42,6 +42,8 @@ type Provider struct {
 	// can assert that a repeated reconcile did not create a second machine.
 	CreateCalls int
 	DeleteCalls int
+	// DeleteByNamePools records the storagePool of every DeleteByName call.
+	DeleteByNamePools []string
 
 	// LastSpec is the spec of the most recent Create, recorded so a test can
 	// assert what actually reached the backend. Bootstrap data in particular is
@@ -63,6 +65,9 @@ type Provider struct {
 	GetErr            error
 	FindErr           error
 	DeleteErr         error
+
+	// DefaultStoragePool is what StoragePoolFor answers for an empty request.
+	DefaultStoragePool string
 
 	// ReadyOnCreate controls whether machines report Ready immediately. Real
 	// backends usually do not, so the default of false is the honest one.
@@ -87,6 +92,14 @@ var _ providers.MachineProvider = (*Provider)(nil)
 
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "fake" }
+
+// StoragePoolFor implements providers.MachineProvider.
+func (p *Provider) StoragePoolFor(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return p.DefaultStoragePool
+}
 
 // Create implements providers.MachineProvider, including its idempotency
 // requirement on spec.Name.
@@ -174,11 +187,12 @@ func (p *Provider) Delete(_ context.Context, id string) error {
 }
 
 // DeleteByName implements providers.MachineProvider.
-func (p *Provider) DeleteByName(_ context.Context, name string) error {
+func (p *Provider) DeleteByName(_ context.Context, name, storagePool string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.DeleteCalls++
+	p.DeleteByNamePools = append(p.DeleteByNamePools, storagePool)
 	if p.DeleteErr != nil {
 		return p.DeleteErr
 	}

@@ -172,6 +172,7 @@ type client interface {
 	ConnectListAllStoragePools(needResults int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error)
 	StoragePoolLookupByName(name string) (golibvirt.StoragePool, error)
 	StoragePoolIsActive(pool golibvirt.StoragePool) (int32, error)
+	StoragePoolGetXMLDesc(pool golibvirt.StoragePool, flags golibvirt.StorageXMLFlags) (string, error)
 	StorageVolCreateXML(pool golibvirt.StoragePool, desc string, flags golibvirt.StorageVolCreateFlags) (golibvirt.StorageVol, error)
 	StorageVolLookupByName(pool golibvirt.StoragePool, name string) (golibvirt.StorageVol, error)
 	StorageVolLookupByPath(path string) (golibvirt.StorageVol, error)
@@ -287,6 +288,12 @@ func (p *Provider) Close() error {
 
 	select {
 	case err := <-done:
+		if err != nil {
+			// go-libvirt's Disconnect returns before closing its socket when the
+			// close RPC itself fails, so the socket is still open here. Close it;
+			// nothing else will.
+			p.recycle()
+		}
 		return err
 	case <-time.After(closeGracePeriod):
 		p.recycle()
@@ -394,6 +401,15 @@ func (p *Provider) recycle() {
 
 // Name implements providers.MachineProvider.
 func (p *Provider) Name() string { return "libvirt" }
+
+// StoragePoolFor implements providers.MachineProvider, resolving the pool the
+// way lookupPoolNamed does for Create.
+func (p *Provider) StoragePoolFor(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return p.cfg.StoragePool
+}
 
 // rootVolumeName and cidataVolumeName derive a machine's volume names from its
 // backend name, which is already globally unique. Both are pure functions of the
@@ -524,7 +540,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// passed -- so a machine that gets this far and finds no network has hit a
 	// real fault, not a race worth papering over by creating one here.
 	if spec.ManagedNetwork != nil {
-		bridge, nErr := p.ensureNetwork(ctx, *spec.ManagedNetwork)
+		bridge, nErr := p.resolveNetwork(ctx, *spec.ManagedNetwork)
 		if nErr != nil {
 			rollback()
 			return nil, nErr
@@ -840,17 +856,38 @@ func subnetParts(cidr string) (gateway, netmask string, err error) {
 //
 // Returns the bridge name, which is what machines are actually attached to.
 func (p *Provider) ensureNetwork(ctx context.Context, spec providers.ManagedNetwork) (string, error) {
+	return p.attachableNetwork(ctx, spec, true)
+}
+
+// resolveNetwork is ensureNetwork for machine creation: it verifies and starts
+// an existing network, but never defines one.
+//
+// Defining the network is the cluster-level check's job, and machine creation
+// is gated on that check having passed. A network missing by the time a machine
+// is created was removed after the check, so the right answer is an error the
+// next cluster check repairs, not a second creation path that bypasses the gate.
+// Transient rather than terminal for the same reason.
+func (p *Provider) resolveNetwork(ctx context.Context, spec providers.ManagedNetwork) (string, error) {
+	return p.attachableNetwork(ctx, spec, false)
+}
+
+// attachableNetwork is ensureNetwork and resolveNetwork, which differ only in
+// whether an absent network is defined or reported.
+func (p *Provider) attachableNetwork(ctx context.Context, spec providers.ManagedNetwork, define bool) (string, error) {
 	gateway, netmask, err := subnetParts(spec.Subnet)
 	if err != nil {
 		return "", err
 	}
-
 	existing, err := call(ctx, p, func() (golibvirt.Network, error) {
 		return p.lv.NetworkLookupByName(spec.Name)
 	})
 	if err != nil {
 		if !isNotFound(err) {
 			return "", fmt.Errorf("libvirt: looking up network %q: %w", spec.Name, err)
+		}
+		if !define {
+			return "", fmt.Errorf("libvirt: managed network %q does not exist; "+
+				"the HydraCluster check creates it, and this machine waits for that", spec.Name)
 		}
 		return p.createNetwork(ctx, spec, gateway, netmask)
 	}
@@ -899,9 +936,16 @@ func (p *Provider) bringUp(ctx context.Context, n golibvirt.Network, name string
 		return fmt.Errorf("libvirt: checking whether network %q is running: %w", name, err)
 	}
 	if active == 0 {
-		if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(n) }); err != nil &&
-			!isAlreadyExists(err) {
-			return fmt.Errorf("libvirt: starting network %q: %w", name, err)
+		if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(n) }); err != nil {
+			// Something else can start the network between the check above and
+			// this call. libvirt then reports operation-invalid ("network is
+			// already active"), not already-exists, and the same code covers
+			// faults that are real. So ask again rather than guess from the code:
+			// running is the state this was after.
+			again, aErr := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
+			if aErr != nil || again != 1 {
+				return fmt.Errorf("libvirt: starting network %q: %w", name, err)
+			}
 		}
 	}
 	if err := callVoid(ctx, p, func() error { return p.lv.NetworkSetAutostart(n, 1) }); err != nil {
@@ -1104,7 +1148,7 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 }
 
 // DeleteByName implements providers.MachineProvider.
-func (p *Provider) DeleteByName(ctx context.Context, name string) error {
+func (p *Provider) DeleteByName(ctx context.Context, name, storagePool string) error {
 	ctx, cancel, err := p.begin(ctx)
 	if err != nil {
 		return err
@@ -1136,22 +1180,49 @@ func (p *Provider) DeleteByName(ctx context.Context, name string) error {
 	// cloud-init image between the two, so a crash in that window leaves exactly
 	// the ISO behind -- and a sweep that only knew about the qcow2 would report
 	// success and orphan it.
+	//
+	// The machine's own pool is the one a leftover could be in. When the caller
+	// does not know it, the pool Create would have used is the configured one.
+	if storagePool == "" {
+		storagePool = p.cfg.StoragePool
+	}
 	for _, volName := range []string{rootVolumeName(name), cidataVolumeName(name)} {
-		if err := p.deleteVolumeAnyPool(ctx, volName); err != nil {
+		if err := p.deleteVolumeAnyPool(ctx, volName, storagePool); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// deleteVolumeAnyPool removes a volume from whichever pool holds it.
+// deleteVolumeAnyPool removes a volume from whichever running pool holds it.
 //
 // Used for domain-less leftovers, where the domain XML that would normally name
-// the pool no longer exists. Falls back to the configured pool if pools cannot
-// be listed, which is still better than not looking at all.
-func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) error {
+// the pool no longer exists.
+//
+// A stopped pool cannot be searched: libvirt refuses volume calls against it,
+// and its contents are unknowable. Only one stopped pool matters, though: the
+// machine's own, ownPool, where Create put its volumes. If that one is stopped
+// the leftover could be in it, and reporting success would release the
+// finalizer over a disk nobody can find again -- so the call fails, naming it,
+// and the next attempt finishes once an operator starts it.
+//
+// What decides that is whether ownPool was actually swept, not whether it
+// shows up as stopped. Running and stopped pools come from two separate list
+// calls, and a pool started between them is in neither -- which is exactly
+// what an operator does on reading that error. So an own pool missing from the
+// sweep fails the call whatever its state now; the retry finds it running.
+// Only a pool that no longer exists at all is let go.
+//
+// Any other stopped pool is skipped and logged. The controller sweeps after
+// every deletion, so failing on those would hold every machine on the host in
+// Deleting -- stalling scale-down and cluster deletion -- over a pool that may
+// have nothing to do with Hydra, to guard against a leftover that could only
+// be there if the pool configuration changed between Create and a crash. The
+// stopped-pool list feeds only that log line, so a failure to list is logged
+// too, not returned.
+func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool string) error {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, 0)
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsActive)
 	})
 	if err != nil {
 		// Do not fall back to the configured pool. A domain-less partial can be in
@@ -1159,23 +1230,79 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName string) erro
 		// would find nothing, report success, and let the controller release the
 		// finalizer -- orphaning that qcow2 permanently. Propagating keeps the
 		// finalizer until an exhaustive sweep is actually possible.
+		if isContextErr(err) {
+			return err
+		}
 		return fmt.Errorf("libvirt: listing storage pools to find %q: %w", volName, err)
 	}
 
+	ownSwept := false
 	for _, pool := range pools {
 		vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
 			return p.lv.StorageVolLookupByName(pool, volName)
 		})
-		if err != nil {
-			if isNotFound(err) {
-				continue
+		// The own pool counts as swept only once libvirt has answered for its
+		// contents. A pool that vanished between the list and this lookup has
+		// told nothing, and is settled by the own-pool check below.
+		switch {
+		case err == nil, isNoStorageVol(err):
+			if pool.Name == ownPool {
+				ownSwept = true
 			}
+		case isNotFound(err):
+			// The pool itself is gone since the list was taken.
+			continue
+		default:
 			return fmt.Errorf("libvirt: looking up volume %q in pool %q: %w", volName, pool.Name, err)
+		}
+		if err != nil {
+			continue
 		}
 		if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
 			!isNotFound(err) {
 			return fmt.Errorf("libvirt: deleting volume %q from pool %q: %w", volName, pool.Name, err)
 		}
+	}
+
+	if ownPool != "" && !ownSwept {
+		_, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
+			return p.lv.StoragePoolLookupByName(ownPool)
+		})
+		switch {
+		case err == nil:
+			return fmt.Errorf("libvirt: storage pool %q, where %q would be, was not running when it was swept; "+
+				"start it so teardown can finish, or undefine it to abandon what it holds", ownPool, volName)
+		case isContextErr(err):
+			return err
+		case !isNotFound(err):
+			return fmt.Errorf("libvirt: looking up storage pool %q to find %q: %w", ownPool, volName, err)
+		}
+		// Undefined: nothing reachable through libvirt can delete what it held.
+		// If it is ever defined again, the next sweep looks there again.
+	}
+
+	stopped, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
+	})
+	if err != nil {
+		// A cancelled or expired context ends the call, as everywhere else in
+		// teardown, and unwrapped: the caller asked to stop, and reporting
+		// success would release the finalizer on a call that did not finish.
+		if isContextErr(err) {
+			return err
+		}
+		logf.FromContext(ctx).Error(err, "Failed to list stopped storage pools; skipped pools will not be logged",
+			"volume", volName)
+		return nil
+	}
+	for _, pool := range stopped {
+		if pool.Name == ownPool {
+			continue
+		}
+		// V(1): every deletion sweeps, so an Info line here would repeat for
+		// each idle pool on the host forever.
+		logf.FromContext(ctx).V(1).Info("Skipping a stopped storage pool in the leftover sweep",
+			"pool", pool.Name, "volume", volName, "machinePool", ownPool)
 	}
 	return nil
 }
@@ -1231,11 +1358,6 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	return nil
 }
 
-// deleteVolume removes a machine's disk, propagating anything that is not a
-// benign "already gone".
-//
-// The previous version swallowed pool and volume lookup errors entirely, so a
-// transient failure here looked like success and left the disk behind.
 // diskSource is one file-backed disk attached to a domain, named by its
 // absolute path on the host.
 //
@@ -1286,17 +1408,31 @@ func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]d
 // created before --libvirt-storage-pool changed is still reclaimed from the pool
 // it was really built in.
 func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
-	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolLookupByPath(path)
-	})
+	lookup := func() (golibvirt.StorageVol, error) {
+		return call(ctx, p, func() (golibvirt.StorageVol, error) {
+			return p.lv.StorageVolLookupByPath(path)
+		})
+	}
+	vol, err := lookup()
 	if err != nil {
-		if isNotFound(err) {
-			// Either already reclaimed, or in no pool libvirt knows about. Neither
-			// is something teardown can act on, and both are safe to leave: the
-			// file is not referenced by any domain once this one is undefined.
-			return nil
+		if !isNotFound(err) {
+			return fmt.Errorf("libvirt: looking up volume at %q: %w", path, err)
 		}
-		return fmt.Errorf("libvirt: looking up volume at %q: %w", path, err)
+		if err := p.confirmReclaimed(ctx, path); err != nil {
+			return err
+		}
+		// Look again before believing it. The miss and the stopped-pool list are
+		// two snapshots, and a pool started between them -- what an operator
+		// does on reading confirmReclaimed's error -- is in neither: not running
+		// for the lookup, not stopped for the list. Started, it now resolves.
+		// Fooling this would take the pool stopping, starting and stopping again
+		// across three calls.
+		if vol, err = lookup(); err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("libvirt: looking up volume at %q again: %w", path, err)
+		}
 	}
 	if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
 		!isNotFound(err) {
@@ -1305,16 +1441,128 @@ func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
 	return nil
 }
 
+// confirmReclaimed decides what a path lookup that found nothing means.
+//
+// libvirt resolves a path only against running pools. A volume in a stopped
+// pool is reported as not found, exactly like one that is gone. Taking that at
+// face value is how teardown used to orphan disks: the domain was undefined,
+// which dropped the only record of where both volumes were, and the finalizer
+// was released over files still on disk.
+//
+// The whole decision, with deleteVolumeByPath's two lookups around it. "Keep"
+// means return an error: the domain stays defined, the finalizer stays, and
+// Delete is retried.
+//
+//	first lookup   stopped pools (this function)          second lookup   result
+//	found          -                                      -               delete it
+//	other error    -                                      -               keep
+//	miss           one keeps its volumes in path's dir    -               keep, until it runs
+//	miss           cannot be checked (list, XML, parse,   -               keep
+//	               no target path, context)
+//	miss           none keeps them there                  found           delete it (pool started mid-check)
+//	miss           none keeps them there                  other error     keep
+//	miss           none keeps them there                  miss            reclaimed
+//
+// The last row is "gone" for two reasons that look identical: the volume was
+// deleted (an earlier attempt that then failed to undefine), or it is in no
+// pool libvirt knows -- a pool undefined with its files left behind. Nothing
+// reachable through libvirt can delete that file now, and an undefined pool may
+// never come back, so keeping the domain for it would wait with no defined end.
+//
+// A pool that vanishes between the stopped-pool list and reading its XML is
+// different, and keeps: undefine-then-define is an ordinary way to edit a pool,
+// so it may be back in a moment, holding the disk. That costs one retry, which
+// either finds it again or does not list it at all.
+//
+// Pools whose volumes are never host paths (networkPoolTypes) cannot hold a disk
+// a domain names by file, so they are not a reason to keep anything.
+func (p *Provider) confirmReclaimed(ctx context.Context, volPath string) error {
+	stopped, err := p.stoppedPools(ctx)
+	if err != nil {
+		return fmt.Errorf("libvirt: volume at %q was not found, and a stopped pool holding it cannot be ruled out: %w",
+			volPath, err)
+	}
+	dir := filepath.Dir(volPath)
+	for _, sp := range stopped {
+		if filepath.Clean(sp.dir) == dir {
+			return fmt.Errorf("libvirt: storage pool %q, which holds %q, is not running; "+
+				"keeping the domain until it is so its disks can be reclaimed", sp.name, volPath)
+		}
+	}
+	return nil
+}
+
+// stoppedPool is a defined storage pool that is not running, and the directory
+// it keeps its volumes in.
+type stoppedPool struct {
+	name string
+	dir  string
+}
+
+// stoppedPools lists every defined pool that is not running. A pool's XML is
+// readable whether or not it runs, which is what makes its directory knowable
+// when its volumes are not.
+func (p *Provider) stoppedPools(ctx context.Context) ([]stoppedPool, error) {
+	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
+		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing stopped storage pools: %w", err)
+	}
+	var out []stoppedPool
+	for _, pool := range pools {
+		desc, err := call(ctx, p, func() (string, error) { return p.lv.StoragePoolGetXMLDesc(pool, 0) })
+		if err != nil {
+			// Not found included: a pool undefined since the list was taken may
+			// be mid-edit and back in a moment. See confirmReclaimed.
+			return nil, fmt.Errorf("reading storage pool %q: %w", pool.Name, err)
+		}
+		var def poolDef
+		if err := xml.Unmarshal([]byte(desc), &def); err != nil {
+			return nil, fmt.Errorf("parsing storage pool %q: %w", pool.Name, err)
+		}
+		if def.Target.Path == "" {
+			if networkPoolTypes[def.Type] {
+				// Its volumes are never host paths, so no disk a domain names by
+				// file can be in it. Failing on it would hold up every deletion
+				// that misses a path, over a pool that cannot be involved.
+				continue
+			}
+			// Any other pool without a directory cannot be matched against the
+			// path, and so cannot be ruled out. Not knowing is not proof.
+			return nil, fmt.Errorf("storage pool %q (type %q) defines no target path, so it cannot be ruled out",
+				pool.Name, def.Type)
+		}
+		out = append(out, stoppedPool{name: pool.Name, dir: def.Target.Path})
+	}
+	return out, nil
+}
+
+// networkPoolTypes are the libvirt pool types whose volumes live on a remote
+// service and are addressed by protocol, never by a path on the host. A disk
+// this provider created is a file the domain names by path -- a qcow2 clone
+// with a backing file, or a raw ISO -- so it cannot be in one of these.
+var networkPoolTypes = map[string]bool{
+	"rbd":          true,
+	"sheepdog":     true,
+	"gluster":      true,
+	"iscsi-direct": true,
+}
+
+// deleteVolume removes a volume from a named pool, propagating anything that is
+// not a benign "already gone".
+//
+// Create uses it, to roll back the volumes it just made and to replace a stale
+// cloud-init image. Teardown does not: it works from the domain's disk paths
+// and from the leftover sweep, whose rules confirmReclaimed and
+// deleteVolumeAnyPool spell out.
 func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) error {
 	pool, err := p.lookupPoolNamed(ctx, poolName)
 	if err != nil {
-		// A missing pool definition does not mean the qcow2 is gone: pools can
-		// be undefined while their files remain on disk. Treating that as
-		// success lets deletion undefine the domain and release the finalizer,
-		// permanently orphaning the disk. Propagate so teardown retries once
-		// the pool is restored. Do not wrap ErrTerminal: a missing pool during
-		// teardown is expected to recover, and a terminal condition would invite
-		// remediation of a machine that is being deleted.
+		// A missing pool definition does not mean the volume is gone: pools can
+		// be undefined while their files remain on disk, so say so rather than
+		// report success. Not ErrTerminal: a missing pool can come back, and a
+		// terminal condition would invite remediation.
 		// Name the pool that was actually looked up, not the configured one. After
 		// a pool configuration change those differ, and reporting the wrong one
 		// sends an operator to restore a pool that was never the problem.
@@ -1488,6 +1736,19 @@ func isNotFound(err error) bool {
 		}
 	}
 	return false
+}
+
+// isNoStorageVol is the narrow not-found: the pool answered, and the volume is
+// not in it. isNotFound would also accept the pool itself being gone.
+func isNoStorageVol(err error) bool {
+	var e golibvirt.Error
+	return errors.As(err, &e) && golibvirt.ErrorNumber(e.Code) == golibvirt.ErrNoStorageVol
+}
+
+// isContextErr reports a cancelled or expired context, which teardown returns
+// as it is rather than wrapped, so a caller comparing it directly still sees it.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func isInvalidState(err error) bool {
