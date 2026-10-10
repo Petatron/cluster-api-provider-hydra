@@ -1440,11 +1440,30 @@ func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
 // which dropped the only record of where both volumes were, and the finalizer
 // was released over files still on disk.
 //
-// So a miss counts as reclaimed only when no stopped pool keeps its volumes in
-// the path's directory. When one does, the domain is kept, and Delete is retried
-// until the pool is running again. A path in no pool libvirt knows about is
-// still taken as gone: nothing here could reach it anyway, and a previous
-// attempt that deleted the volume and then failed to undefine looks the same.
+// The whole decision, with deleteVolumeByPath's two lookups around it. "Keep"
+// means return an error: the domain stays defined, the finalizer stays, and
+// Delete is retried.
+//
+//	first lookup   stopped pools (this function)          second lookup   result
+//	found          -                                      -               delete it
+//	other error    -                                      -               keep
+//	miss           one keeps its volumes in path's dir    -               keep, until it runs
+//	miss           cannot be checked (list, XML, parse,   -               keep
+//	               no target path, context)
+//	miss           none keeps them there                  found           delete it (pool started mid-check)
+//	miss           none keeps them there                  other error     keep
+//	miss           none keeps them there                  miss            reclaimed
+//
+// The last row is "gone" for two reasons that look identical and are both
+// final: the volume was deleted (an earlier attempt that then failed to
+// undefine), or it is in no pool libvirt knows -- a pool undefined with its
+// files left behind. Nothing reachable through libvirt can delete that file,
+// now or on any retry, so keeping the domain for it would wedge the finalizer
+// with nothing to wait for. A pool undefined between the stopped-pool list and
+// reading its XML is that same case, a moment later.
+//
+// Pools whose volumes are never host paths (networkPoolTypes) cannot hold a disk
+// a domain names by file, so they are not a reason to keep anything.
 func (p *Provider) confirmReclaimed(ctx context.Context, volPath string) error {
 	stopped, err := p.stoppedPools(ctx)
 	if err != nil {
@@ -1483,6 +1502,9 @@ func (p *Provider) stoppedPools(ctx context.Context) ([]stoppedPool, error) {
 		desc, err := call(ctx, p, func() (string, error) { return p.lv.StoragePoolGetXMLDesc(pool, 0) })
 		if err != nil {
 			if isNotFound(err) {
+				// Undefined since the list was taken. That is a pool libvirt no
+				// longer knows, which confirmReclaimed's table takes as final:
+				// a retry would not list it at all and would conclude the same.
 				continue
 			}
 			return nil, fmt.Errorf("reading storage pool %q: %w", pool.Name, err)
