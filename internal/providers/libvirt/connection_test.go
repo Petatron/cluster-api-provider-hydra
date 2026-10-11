@@ -132,6 +132,22 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 		t.Fatalf("FindByName = %v, want the reconnect to time out", err)
 	}
 
+	// The timed-out caller force-closes and returns at once; the dial goroutine
+	// still has to unwind and release its claim. A call made inside that window
+	// joins the dying attempt and gets its error -- one failed reconcile, which
+	// is requeued. What must never happen is the claim outliving the dial, so
+	// wait for it to end, and fail if it does not.
+	p.mu.Lock()
+	abandoned := p.dial
+	p.mu.Unlock()
+	if abandoned != nil {
+		select {
+		case <-abandoned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the timed-out dial never ended; every later call would join it")
+		}
+	}
+
 	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
 		t.Fatalf("FindByName after the stalled dial = %v, want an ordinary lookup", err)
 	}
