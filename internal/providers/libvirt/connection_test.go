@@ -111,10 +111,18 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 	p.dialer = newTrackingDialer(stubDialer{addr: silentListener(t)}, time.Second)
 	f.connected = false
 	var dials atomic.Int32
+	// The first dial's completion channel, captured while that dial is certainly
+	// in flight: ensureConnected sets p.dial before starting the dial and clears
+	// it only after ConnectToURI returns. Reading p.dial after the timeout
+	// instead could find it already cleared and skip the wait.
+	stalled := make(chan chan struct{}, 1)
 	f.dial = func() error {
 		if dials.Add(1) > 1 {
 			return nil
 		}
+		p.mu.Lock()
+		stalled <- p.dial
+		p.mu.Unlock()
 		// The first dial waits on a peer that never answers. Only forceClose
 		// can release it.
 		conn, err := p.dialer.Dial()
@@ -137,15 +145,16 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 	// joins the dying attempt and gets its error -- one failed reconcile, which
 	// is requeued. What must never happen is the claim outliving the dial, so
 	// wait for it to end, and fail if it does not.
-	p.mu.Lock()
-	abandoned := p.dial
-	p.mu.Unlock()
-	if abandoned != nil {
-		select {
-		case <-abandoned:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the timed-out dial never ended; every later call would join it")
-		}
+	var abandoned chan struct{}
+	select {
+	case abandoned = <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first dial never started")
+	}
+	select {
+	case <-abandoned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the timed-out dial never ended; every later call would join it")
 	}
 
 	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
