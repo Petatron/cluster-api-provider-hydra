@@ -225,6 +225,10 @@ spec:
       - DEBIAN_FRONTEND=noninteractive apt-get update
       - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet=1.35.3-* kubeadm=1.35.3-* kubectl=1.35.3-*
       - apt-mark hold kubelet kubeadm kubectl
+      # Enable, do not start: kubeadm starts kubelet itself during init/join. Without
+      # this the unit stays disabled -- kubeadm never enables it -- and a node that
+      # reboots, for a kernel update or a host restart, never rejoins (PET-56).
+      - systemctl enable kubelet
       # kubeadm 1.29+ writes an admin.conf that is NOT cluster-admin, and creates
       # super-admin.conf for that. kube-vip pointed at admin.conf cannot reach the
       # API during init, so `kubeadm init` waits for a control plane that cannot
