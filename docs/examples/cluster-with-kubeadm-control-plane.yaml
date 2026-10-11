@@ -1,11 +1,16 @@
 # A complete Kubernetes cluster built by Hydra from nothing: a KubeadmControlPlane
 # over HydraMachineTemplate, with kube-vip holding the API endpoint.
 #
-# Verified end to end on real hardware (PET-16), exactly as written here:
-# three control-plane VMs created through libvirt, kubeadm init and join driven
-# by CABPK-generated bootstrap data, all three Nodes Ready with providerIDs
-# matching their Machines, and the VIP surviving a leader failover during a
-# rolling replacement.
+# The base was verified end to end on real hardware (PET-16): three
+# control-plane VMs created through libvirt, kubeadm init and join driven by
+# CABPK-generated bootstrap data, and all three Nodes Ready with providerIDs
+# matching their Machines.
+#
+# The HA additions -- the MachineHealthCheck, KCP maxRetry, the kube-vip lease
+# timings and the Node-deletion timeout -- were verified by failure drills on
+# hardware (PET-22): a dead non-leader control plane cost no API time and was
+# replaced automatically in about 8 minutes; a dead VIP holder cost about 6s of
+# API time (10-20s before the lease change) and was replaced the same way.
 #
 # LAB-SPECIFIC VALUES -- change all of these for another site:
 #   networks / storagePool      the bridge and libvirt pool on your hypervisor
@@ -108,14 +113,26 @@ spec:
         kind: HydraMachineTemplate
         name: hydra-wl0-cp
       deletion:
-        # Longer than any VIP failover. When the machine being removed holds
-        # the kube-vip lease, the API is briefly unreachable while another CP
-        # takes the address; with the 10s default, CAPI timed out deleting that
-        # Node mid-failover and left an orphan Node behind (PET-22). Propagates
-        # to Machines in place, without a rollout.
-        nodeDeletionTimeoutSeconds: 60
+        # The clock starts when the Machine is marked for deletion, not when
+        # Node deletion begins: drain, volume detach, KCP's etcd pre-terminate
+        # hook and the HydraMachine teardown all spend it first, and removing
+        # the VIP holder took about 40s of it before the Node delete ran. With
+        # the 10s default that delete fell into the VIP failover, timed out, and
+        # left an orphan Node behind (PET-22). A Node delete that works does so
+        # first time, so a large value costs nothing on the happy path -- only a
+        # Machine that stays Deleting longer while one is failing. 0 (retry
+        # forever) can wedge a deletion. Propagates to Machines in place.
+        nodeDeletionTimeoutSeconds: 300
   # Stop retrying a replacement that keeps failing instead of looping. KCP only
   # ever remediates one machine at a time, and never at the cost of etcd quorum.
+  # Retries are paced by the MachineHealthCheck below -- a replacement must be
+  # flagged unhealthy itself first -- so they are minutes apart, not a loop.
+  #
+  # After the third failed replacement KCP stops: it logs "Skipping
+  # remediation" and sets the unhealthy Machine's OwnerRemediated condition to
+  # "already failed 3 times (MaxRetry 3)". Nothing alerts on that yet (PET-64).
+  # The way out is to fix the cause and delete that Machine by hand; a manual
+  # delete is not subject to maxRetry. (That path has not been exercised.)
   remediation:
     maxRetry: 3
   kubeadmConfigSpec:
@@ -289,8 +306,12 @@ spec:
         timeoutSeconds: 300
   remediation:
     triggerIf:
-      # The single-failure case only. Two or more control planes unhealthy at
-      # once is almost always the shared hypervisor -- a reboot, an outage --
-      # and replacing machines then deletes the very ones about to come back,
-      # while KCP could not keep quorum anyway. That is for a human.
+      # Sized for replicas: 3. With two members down, a three-member etcd has
+      # no quorum, so stand down visibly and leave it to a human. KCP refuses
+      # to remediate a 3-member control plane while another member is
+      # unhealthy anyway; this is the second line, and the only one when Node
+      # health and etcd health disagree (a flagged but healthy machine). Two
+      # failing at once usually has a shared cause -- in the reference lab, the
+      # one hypervisor all three run on. Revisit if replicas change: at 5, KCP
+      # tolerates a second failure and <= 1 would block safe remediations.
       unhealthyLessThanOrEqualTo: 1
