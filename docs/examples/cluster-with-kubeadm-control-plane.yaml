@@ -107,6 +107,17 @@ spec:
         apiGroup: infrastructure.cluster.x-k8s.io
         kind: HydraMachineTemplate
         name: hydra-wl0-cp
+      deletion:
+        # Longer than any VIP failover. When the machine being removed holds
+        # the kube-vip lease, the API is briefly unreachable while another CP
+        # takes the address; with the 10s default, CAPI timed out deleting that
+        # Node mid-failover and left an orphan Node behind (PET-22). Propagates
+        # to Machines in place, without a rollout.
+        nodeDeletionTimeoutSeconds: 60
+  # Stop retrying a replacement that keeps failing instead of looping. KCP only
+  # ever remediates one machine at a time, and never at the cost of etcd quorum.
+  remediation:
+    maxRetry: 3
   kubeadmConfigSpec:
     files:
       # kubeadm's preflight refuses to init without these. `sysctl --system` in
@@ -159,12 +170,16 @@ spec:
                     value: "false"
                   - name: vip_leaderelection
                     value: "true"
+                  # kube-vip's own defaults. A CP that is destroyed outright --
+                  # a crash, or KCP removing its machine -- never releases the
+                  # lease, so the others wait out the lease before claiming the
+                  # VIP: at 15/10/2 that was a 10-20s API outage (PET-22).
                   - name: vip_leaseduration
-                    value: "15"
+                    value: "5"
                   - name: vip_renewdeadline
-                    value: "10"
+                    value: "3"
                   - name: vip_retryperiod
-                    value: "2"
+                    value: "1"
                   # MUST equal HydraCluster.spec.controlPlaneEndpoint.host
                   # above. This is the pair that actually claims the address;
                   # the HydraCluster field only states where the API will be.
@@ -245,3 +260,37 @@ spec:
           sed -i 's#path: /etc/kubernetes/super-admin.conf#path: /etc/kubernetes/admin.conf#' \
             /etc/kubernetes/manifests/kube-vip.yaml
         fi
+---
+# Replaces a control-plane machine that has failed (PET-22). KCP does the
+# remediation: one machine at a time, never at the cost of etcd quorum.
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineHealthCheck
+metadata:
+  name: hydra-wl0-cp-unhealthy
+  namespace: default
+spec:
+  clusterName: hydra-wl0
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: hydra-wl0
+      cluster.x-k8s.io/control-plane: ""
+  checks:
+    # A new control plane gets a Node in about a minute; ten is a failed
+    # bootstrap, not a slow one.
+    nodeStartupTimeoutSeconds: 600
+    # Five minutes absorbs a reboot or a network blip -- a quick reboot never
+    # even goes NotReady -- and still replaces a dead machine promptly.
+    unhealthyNodeConditions:
+      - type: Ready
+        status: Unknown
+        timeoutSeconds: 300
+      - type: Ready
+        status: "False"
+        timeoutSeconds: 300
+  remediation:
+    triggerIf:
+      # The single-failure case only. Two or more control planes unhealthy at
+      # once is almost always the shared hypervisor -- a reboot, an outage --
+      # and replacing machines then deletes the very ones about to come back,
+      # while KCP could not keep quorum anyway. That is for a human.
+      unhealthyLessThanOrEqualTo: 1
