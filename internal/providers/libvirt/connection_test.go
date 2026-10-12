@@ -759,3 +759,67 @@ func TestAttemptLimitIsTheDialPlusTheHandshake(t *testing.T) {
 		t.Errorf("attemptLimit with nothing configured = %s, want the defaults' %s", got, want)
 	}
 }
+
+// A TLS Close sends a close-notify alert and can block for up to five seconds
+// on a peer that has stopped reading. The caller giving up must not wait for
+// that: it already ran out of time once.
+func TestGivingUpDoesNotWaitForTheSocketToClose(t *testing.T) {
+	p, f := newFakeProvider(t)
+	addr, _ := recordingListener(t)
+	inner := &slowCloseDialer{addr: addr, release: make(chan struct{})}
+	t.Cleanup(func() { close(inner.release) })
+	p.dialer = newTrackingDialer(inner, time.Second)
+	f.connected = false
+	installed := make(chan struct{})
+	f.dial = func() error {
+		conn, err := p.dialer.Dial()
+		if err != nil {
+			return err
+		}
+		close(installed)
+		_, _ = io.ReadAll(conn)
+		return errors.New("connection closed")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		_, err := p.FindByName(ctx, "worker-1")
+		errs <- err
+	}()
+	<-installed
+	cancel()
+	select {
+	case <-errs:
+	case <-time.After(time.Second):
+		t.Fatal("the caller that gave up waited on its socket's Close")
+	}
+}
+
+// slowCloseDialer hands out connections whose Close blocks until released, the
+// way a TLS close-notify does against a peer that has stopped reading. The
+// underlying socket is closed first, so reads on it still fail promptly.
+type slowCloseDialer struct {
+	addr    string
+	release chan struct{}
+}
+
+func (s *slowCloseDialer) Dial() (net.Conn, error) {
+	c, err := net.Dial("tcp", s.addr)
+	if err != nil {
+		return nil, err
+	}
+	return slowCloseConn{c, s.release}, nil
+}
+
+type slowCloseConn struct {
+	net.Conn
+	release chan struct{}
+}
+
+func (c slowCloseConn) Close() error {
+	err := c.Conn.Close()
+	<-c.release
+	return err
+}

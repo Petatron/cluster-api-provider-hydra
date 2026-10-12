@@ -279,9 +279,7 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 		// forceClose: if the dial has not produced its socket yet there is nothing
 		// to close, and this dialer is discarded with the failed New, so a socket
 		// arriving later would never be closed by anyone (PET-66).
-		if c := tracked.abandonAttempt(); c != nil {
-			_ = c.Close()
-		}
+		closeDetached(tracked.abandonAttempt())
 		return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, ctx.Err())
 	case err := <-done:
 		if err != nil {
@@ -393,11 +391,8 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 	a.waiters++
 	p.mu.Unlock()
 	// The previous connection's socket: go-libvirt stops reading a socket the
-	// daemon dropped, but does not close it. In the background: closing a TLS
-	// connection writes an alert, and nothing here needs to wait for that.
-	if stale != nil {
-		go func() { _ = stale.Close() }()
-	}
+	// daemon dropped, but does not close it.
+	closeDetached(stale)
 
 	select {
 	case <-ctx.Done():
@@ -486,11 +481,15 @@ func (p *Provider) abandonLocked(a *dialAttempt) net.Conn {
 	return p.dialer.abandonAttempt()
 }
 
-// closeDetached closes a socket detached from the dialer. Never under p.mu:
-// closing a TLS connection can block on its peer.
+// closeDetached closes a socket detached from the dialer, in the background.
+// Closing a TLS connection sends a close-notify alert, which can block for up to
+// five seconds on a peer that has stopped reading -- the very peer a socket is
+// usually abandoned for. Nobody needs to wait for that: not a caller that has
+// already run out of time, not New past its deadline, and not anyone holding
+// p.mu.
 func closeDetached(c net.Conn) {
 	if c != nil {
-		_ = c.Close()
+		go func() { _ = c.Close() }()
 	}
 }
 
