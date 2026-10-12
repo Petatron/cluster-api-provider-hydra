@@ -169,7 +169,10 @@ func (d *trackingDialer) Dial() (net.Conn, error) {
 		d.mu.Lock()
 		if d.abandoned {
 			d.mu.Unlock()
-			_ = r.conn.Close()
+			// In the background, as everywhere a socket is abandoned: until
+			// Dial returns, ConnectToURI cannot, and the abandoned attempt
+			// stays claimed.
+			closeDetached(r.conn)
 			return nil, errDialAbandoned
 		}
 		d.conn = r.conn

@@ -485,8 +485,8 @@ func (p *Provider) abandonLocked(a *dialAttempt) net.Conn {
 // Closing a TLS connection sends a close-notify alert, which can block for up to
 // five seconds on a peer that has stopped reading -- the very peer a socket is
 // usually abandoned for. Nobody needs to wait for that: not a caller that has
-// already run out of time, not New past its deadline, and not anyone holding
-// p.mu.
+// already run out of time, not New past its deadline, not a Dial whose attempt
+// is being abandoned, and not anyone holding p.mu.
 func closeDetached(c net.Conn) {
 	if c != nil {
 		go func() { _ = c.Close() }()

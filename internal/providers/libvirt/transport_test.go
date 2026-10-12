@@ -84,10 +84,13 @@ func TestTrackingDialerAbandonReleasesADialStillConnecting(t *testing.T) {
 // attempt is abandoned, so Dial takes the result before it sees the abandonment.
 // No hook can force that interleaving, so race the two many times and check the
 // invariant each time: once both have returned, no socket is left registered,
-// and a socket Dial handed out is the one the abandonment detached.
+// and a socket Dial handed out is the one the abandonment detached. And at the
+// end, every socket the inner dialer opened has been closed by someone.
 func TestTrackingDialerAbandonRacingRegistrationLeavesNoSocket(t *testing.T) {
+	var opened, closed atomic.Int32
+	inner := countingPipeDialer{&opened, &closed}
 	for range 2000 {
-		d := newTrackingDialer(pipeDialer{}, time.Second)
+		d := newTrackingDialer(inner, time.Second)
 		var (
 			wg       sync.WaitGroup
 			dialed   net.Conn
@@ -115,6 +118,70 @@ func TestTrackingDialerAbandonRacingRegistrationLeavesNoSocket(t *testing.T) {
 			}
 		}
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for closed.Load() != opened.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d sockets were never closed", opened.Load()-closed.Load(), opened.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The same race, against sockets whose Close blocks the way a TLS close-notify
+// does on a peer that has stopped reading. Closing the late socket on Dial's
+// path would hold ConnectToURI -- and so the abandoned attempt -- open for as
+// long as that Close takes, and new callers would keep joining it.
+func TestTrackingDialerAbandonRacingRegistrationDoesNotWaitForClose(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	for range 2000 {
+		d := newTrackingDialer(slowClosePipeDialer{release}, time.Second)
+		start := make(chan struct{})
+		dialed := make(chan struct{})
+		go func() {
+			<-start
+			if c, err := d.Dial(); err == nil {
+				go func() { _ = c.Close() }()
+			}
+			close(dialed)
+		}()
+		go func() {
+			<-start
+			if c := d.abandonAttempt(); c != nil {
+				go func() { _ = c.Close() }()
+			}
+		}()
+		close(start)
+		select {
+		case <-dialed:
+		case <-time.After(time.Second):
+			t.Fatal("Dial waited on closing a socket that arrived as its attempt was abandoned")
+		}
+	}
+}
+
+// slowClosePipeDialer connects instantly, to an in-memory pipe whose Close
+// blocks until release is closed.
+type slowClosePipeDialer struct{ release chan struct{} }
+
+func (s slowClosePipeDialer) Dial() (net.Conn, error) {
+	c, _ := pipeDialer{}.Dial()
+	return slowCloseConn{c, s.release}, nil
+}
+
+// countingPipeDialer is pipeDialer, counting the sockets it opens and how many
+// of them the client side has closed.
+type countingPipeDialer struct{ opened, closed *atomic.Int32 }
+
+func (d countingPipeDialer) Dial() (net.Conn, error) {
+	c, s := net.Pipe()
+	d.opened.Add(1)
+	go func() {
+		_, _ = io.Copy(io.Discard, s)
+		_ = s.Close()
+		d.closed.Add(1)
+	}()
+	return c, nil
 }
 
 // pipeDialer connects instantly, to an in-memory pipe.
