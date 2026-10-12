@@ -118,9 +118,9 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 	// instead could find it already cleared and skip the wait.
 	stalled := make(chan chan struct{}, 1)
 	// Closed once the first dial's socket is registered with the tracking
-	// dialer, so forceClose has something to close. Before that, forceClose is
-	// a no-op and the dial would stall until some later caller timed out
-	// (PET-66) -- not the behaviour under test here.
+	// dialer. Waiting for it pins this test to the "after Dial registered the
+	// socket" row of trackingDialer's table; the earlier rows have their own
+	// tests (TestAnAbandonedReconnectEnds...).
 	installed := make(chan struct{})
 	f.dial = func() error {
 		if dials.Add(1) > 1 {
@@ -129,8 +129,8 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 		p.mu.Lock()
 		stalled <- p.dial
 		p.mu.Unlock()
-		// The first dial waits on a peer that never answers. Only forceClose
-		// can release it.
+		// The first dial waits on a peer that never answers. Only abandoning
+		// the attempt, which closes its socket, can release it.
 		conn, err := p.dialer.Dial()
 		if err != nil {
 			return err
@@ -140,8 +140,8 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 		return errors.New("connection closed")
 	}
 
-	// The caller gives up by cancellation rather than by a timer, so it cannot
-	// give up before the socket exists however late the dial goroutine runs.
+	// The caller gives up by cancellation rather than by a timer, so it gives up
+	// after the socket exists however late the dial goroutine runs.
 	// ensureConnected handles both in the same ctx.Done() branch. The long
 	// deadline only stops withRPCDeadline from adding a shorter one of its own.
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
@@ -172,7 +172,7 @@ func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 		t.Fatal("FindByName did not return after its context was cancelled")
 	}
 
-	// The abandoning caller force-closes and returns at once; the dial goroutine
+	// The abandoning caller closes the socket and returns at once; the dial goroutine
 	// still has to unwind and release its claim. A call made inside that window
 	// joins the dying attempt and gets its error -- one failed reconcile, which
 	// is requeued. What must never happen is the claim outliving the dial, so
@@ -260,9 +260,10 @@ func silentListener(t *testing.T) string {
 
 // New's handshake carries its own deadline: a daemon that accepts the socket
 // and never answers would otherwise hang manager startup with no reconcile
-// loop yet running to time it out.
+// loop yet running to time it out. And the socket it gave up on must be closed:
+// the dialer is discarded with the failed New, so nothing else ever would.
 func TestNewGivesUpOnASilentDaemon(t *testing.T) {
-	addr := silentListener(t)
+	addr, accepted := recordingListener(t)
 
 	start := time.Now()
 	_, err := New(t.Context(), Config{
@@ -277,6 +278,7 @@ func TestNewGivesUpOnASilentDaemon(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("New took %s against a silent daemon", elapsed)
 	}
+	waitClosedByPeer(t, nextAccepted(t, accepted))
 }
 
 func TestNewReportsAnUnreachableDaemon(t *testing.T) {
@@ -328,5 +330,220 @@ func TestNewConnectsAndClosesAgainstALibvirtDaemon(t *testing.T) {
 	}
 	if err := p.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// PET-66: a caller that gives up before the dial has produced its socket. A
+// plain forceClose finds nothing to close then; the socket that arrives later
+// would sit in the handshake and hold the attempt open until some later caller
+// timed out too.
+func TestAnAbandonedReconnectEndsBeforeItsSocketExists(t *testing.T) {
+	p, f := newFakeProvider(t)
+	p.cfg.RPCTimeout = time.Second
+	addr, accepted := recordingListener(t)
+	p.dialer = newTrackingDialer(stubDialer{addr: addr}, time.Second)
+	f.connected = false
+
+	var dials atomic.Int32
+	stalled := make(chan chan struct{}, 1)
+	gate := make(chan struct{})
+	firstDial := make(chan error, 1)
+	f.dial = func() error {
+		if dials.Add(1) > 1 {
+			// Through the real dialer: the abandonment must not carry over and
+			// fail the next attempt too.
+			_, err := p.dialer.Dial()
+			return err
+		}
+		p.mu.Lock()
+		stalled <- p.dial
+		p.mu.Unlock()
+		<-gate // the dial goroutine runs late: its caller gives up first
+		conn, err := p.dialer.Dial()
+		firstDial <- err
+		if err != nil {
+			return err
+		}
+		_, _ = io.ReadAll(conn)
+		return errors.New("connection closed")
+	}
+
+	// A real timer, which the late dial cannot race: it has not dialed at all.
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := p.FindByName(ctx, "worker-1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FindByName = %v, want the reconnect to time out", err)
+	}
+	abandoned := <-stalled
+	close(gate)
+
+	if err := <-firstDial; !errors.Is(err, errDialAbandoned) {
+		t.Fatalf("the late dial = %v, want errDialAbandoned", err)
+	}
+	select {
+	case <-abandoned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned attempt never ended; every later call would join it")
+	}
+	select {
+	case c := <-accepted:
+		t.Fatalf("an abandoned attempt opened a socket (%s)", c.RemoteAddr())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
+		t.Fatalf("FindByName after the abandoned dial = %v, want an ordinary lookup", err)
+	}
+	if n := dials.Load(); n != 2 {
+		t.Errorf("%d dials, want the abandoned one and a fresh one", n)
+	}
+}
+
+// PET-66: a caller that gives up while the dial is still connecting. The
+// attempt must end then -- not when the connect finally completes -- and the
+// socket that completes must be closed.
+func TestAnAbandonedReconnectEndsWhileItsDialIsConnecting(t *testing.T) {
+	p, f := newFakeProvider(t)
+	p.cfg.RPCTimeout = time.Second
+	addr, accepted := recordingListener(t)
+	inner := newGatedDialer(t, addr)
+	p.dialer = newTrackingDialer(inner, time.Minute)
+	f.connected = false
+
+	var dials atomic.Int32
+	stalled := make(chan chan struct{}, 1)
+	f.dial = func() error {
+		if dials.Add(1) > 1 {
+			return nil
+		}
+		p.mu.Lock()
+		stalled <- p.dial
+		p.mu.Unlock()
+		_, err := p.dialer.Dial()
+		return err
+	}
+
+	// Give up only once the connect is under way, so this test stays on its row
+	// however late the dial goroutine runs; giving up earlier is the "before
+	// Dial" row, tested above. The long deadline only stops withRPCDeadline from
+	// adding a shorter one of its own.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	errs := make(chan error, 1)
+	go func() {
+		_, err := p.FindByName(ctx, "worker-1")
+		errs <- err
+	}()
+	inner.waitEntered(t)
+	cancel()
+	if err := <-errs; !errors.Is(err, context.Canceled) {
+		t.Fatalf("FindByName = %v, want the reconnect abandoned", err)
+	}
+	// The connect is still held open by the gate.
+	select {
+	case <-<-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned attempt waited on a connect it no longer wanted")
+	}
+
+	inner.release()
+	waitClosedByPeer(t, nextAccepted(t, accepted))
+
+	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
+		t.Fatalf("FindByName after the abandoned dial = %v, want an ordinary lookup", err)
+	}
+}
+
+// abandonDial's table, one row each. The provider is wired by hand so each row's
+// state can be set exactly; a registered socket stands in for whatever
+// connection exists at the moment the caller gives up.
+func abandonDialFixture(t *testing.T) (*Provider, net.Conn) {
+	t.Helper()
+	p, _ := newFakeProvider(t)
+	addr, accepted := recordingListener(t)
+	p.dialer = newTrackingDialer(stubDialer{addr: addr}, time.Second)
+	p.dialer.beginAttempt()
+	if _, err := p.dialer.Dial(); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	return p, nextAccepted(t, accepted)
+}
+
+func isAbandoned(d *trackingDialer) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.abandoned
+}
+
+func TestAbandonDialAbandonsTheAttemptInFlight(t *testing.T) {
+	p, peer := abandonDialFixture(t)
+	done := make(chan struct{})
+	p.dial = done
+
+	p.abandonDial(done)
+	waitClosedByPeer(t, peer)
+	if !isAbandoned(p.dialer) {
+		t.Error("the attempt in flight was not marked abandoned")
+	}
+}
+
+func TestAbandonDialAfterAFailedAttemptDoesNothing(t *testing.T) {
+	p, _ := newFakeProvider(t)
+	p.dialer = newTrackingDialer(stubDialer{addr: "127.0.0.1:1"}, time.Second)
+	p.dialErr = errInjected // finished, failed: p.dial already cleared
+
+	p.abandonDial(make(chan struct{}))
+	if isAbandoned(p.dialer) {
+		t.Error("an attempt that already failed was marked abandoned")
+	}
+}
+
+// The caller's context ended in the same instant its attempt succeeded. The
+// connection is healthy and other callers may already be using it.
+func TestAbandonDialKeepsAConnectionThatSucceeded(t *testing.T) {
+	p, peer := abandonDialFixture(t) // p.dial nil: the attempt finished
+
+	p.abandonDial(make(chan struct{}))
+	assertStillOpen(t, peer)
+	if isAbandoned(p.dialer) {
+		t.Error("a finished attempt was marked abandoned")
+	}
+}
+
+// The caller's attempt finished and another caller started the next one before
+// this caller's ctx.Done branch ran. That attempt is not this caller's to end.
+func TestAbandonDialLeavesANewerAttemptAlone(t *testing.T) {
+	p, peer := abandonDialFixture(t)
+	p.dial = make(chan struct{}) // the newer attempt
+	stale := make(chan struct{})
+
+	p.abandonDial(stale)
+	assertStillOpen(t, peer)
+	if isAbandoned(p.dialer) {
+		t.Error("the newer attempt was marked abandoned by a caller of the old one")
+	}
+}
+
+// New's dialer is discarded when New fails, so a socket that arrived after New
+// gave up would never be closed by anyone: a socket and a goroutine leaked per
+// failed construction, and main retries construction on every reconcile.
+func TestNewLeavesNoSocketBehindWhenItGivesUp(t *testing.T) {
+	addr, accepted := recordingListener(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // gives up at once, before the dial goroutine can have dialed
+
+	if _, err := New(ctx, Config{RemoteAddr: addr, Insecure: true, DialTimeout: time.Second}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("New = %v, want context.Canceled", err)
+	}
+	// Whichever way the race went, any socket that reached the listener must be
+	// closed, and none may arrive later and stay open.
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case c := <-accepted:
+			waitClosedByPeer(t, c)
+		case <-deadline:
+			return
+		}
 	}
 }
