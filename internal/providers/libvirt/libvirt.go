@@ -198,12 +198,10 @@ type Provider struct {
 
 	// mu guards the connection state below.
 	mu sync.Mutex
-	// dial is non-nil while a reconnect is in flight, and is closed when it
-	// finishes. Concurrent callers wait on it rather than opening a second
-	// connection, so a burst of reconciles against a slow hypervisor produces one
-	// dial and not one per machine.
-	dial    chan struct{}
-	dialErr error
+	// dial is non-nil while a reconnect is in flight. Concurrent callers wait on
+	// it rather than opening a second connection, so a burst of reconciles
+	// against a slow hypervisor produces one dial and not one per machine.
+	dial *dialAttempt
 
 	// dialer is the transport, retained so a stalled connection can be dropped
 	// without waiting on the daemon to acknowledge it.
@@ -211,6 +209,19 @@ type Provider struct {
 }
 
 var _ providers.MachineProvider = (*Provider)(nil)
+
+// dialAttempt is one reconnect, shared by every caller that finds the
+// connection down while it runs.
+type dialAttempt struct {
+	// done is closed when the attempt finishes; err is its result.
+	done chan struct{}
+	err  error
+	// waiters counts the callers that joined the attempt and have not given up
+	// on it, so it is abandoned only once none of them wants it. It only
+	// matters while the attempt is in flight, so callers that see it finish
+	// leave it alone. Guarded by Provider.mu.
+	waiters int
+}
 
 // New connects to libvirt and returns a Provider.
 //
@@ -341,9 +352,10 @@ func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, contex
 // dial would block the reconcile worker just as effectively as a stalled RPC.
 //
 // One attempt runs at a time, so a burst of reconciles against a slow
-// hypervisor produces one connection attempt rather than one per machine. A
-// caller that gives up abandons the attempt it was waiting on (abandonDial), so
-// the attempt ends and the next call dials afresh. The abandoned attempt's TCP
+// hypervisor produces one connection attempt rather than one per machine. An
+// attempt ends when the last caller waiting on it gives up (abandonDial), or
+// when its own limit runs out (attemptLimit) however many callers are still
+// waiting; either way the next call dials afresh. The abandoned attempt's TCP
 // or TLS connect may still finish in the background, bounded by DialTimeout,
 // and its socket is closed on arrival.
 func (p *Provider) ensureConnected(ctx context.Context) error {
@@ -352,32 +364,48 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		p.mu.Unlock()
 		return nil
 	}
+	var stale net.Conn
 	if p.dial == nil {
-		p.dial = make(chan struct{})
+		a := &dialAttempt{done: make(chan struct{})}
+		p.dial = a
 		// Here, under p.mu and before the goroutine starts -- not inside it. A
 		// caller can abandon this attempt as soon as p.mu is released; a
 		// beginAttempt that ran after that would wipe the abandonment.
-		p.dialer.beginAttempt()
+		stale = p.dialer.beginAttempt()
+		// Waiters keep an attempt alive, and go-libvirt's handshake has no
+		// deadline of its own. Without this limit, callers that overlap -- each
+		// joining before the last gives up -- would hold a stalled handshake
+		// open for as long as reconciles keep coming.
+		limit := time.AfterFunc(p.attemptLimit(), func() { p.endAttempt(a) })
 		go func() {
 			err := p.lv.ConnectToURI(p.uri)
+			// Housekeeping, not correctness: a limit that fires after this finds
+			// p.dial no longer a and does nothing. Stopping it just frees the timer.
+			limit.Stop()
 			p.mu.Lock()
-			p.dialErr = err
-			done := p.dial
+			a.err = err
 			p.dial = nil
 			p.mu.Unlock()
-			close(done)
+			close(a.done)
 		}()
 	}
-	done := p.dial
+	a := p.dial
+	a.waiters++
 	p.mu.Unlock()
+	// The previous connection's socket: go-libvirt stops reading a socket the
+	// daemon dropped, but does not close it. In the background: closing a TLS
+	// connection writes an alert, and nothing here needs to wait for that.
+	if stale != nil {
+		go func() { _ = stale.Close() }()
+	}
 
 	select {
 	case <-ctx.Done():
-		p.abandonDial(done)
+		p.abandonDial(a)
 		return fmt.Errorf("libvirt: connecting to %q: %w", p.uri, ctx.Err())
-	case <-done:
+	case <-a.done:
 		p.mu.Lock()
-		err := p.dialErr
+		err := a.err
 		p.mu.Unlock()
 		if err != nil {
 			return fmt.Errorf("libvirt: reconnecting to %q: %w", p.uri, err)
@@ -386,42 +414,81 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 	}
 }
 
-// abandonDial gives up on the attempt whose completion channel is done, if that
-// attempt is still the one in flight.
+// attemptLimit bounds one reconnect the way New bounds the first connect: the
+// dial gets DialTimeout, and the handshake after it gets RPCTimeout.
+func (p *Provider) attemptLimit() time.Duration {
+	dial, rpc := p.cfg.DialTimeout, p.cfg.RPCTimeout
+	if dial == 0 {
+		dial = defaultConnectTimeout
+	}
+	if rpc == 0 {
+		rpc = defaultRPCTimeout
+	}
+	return dial + rpc
+}
+
+// abandonDial withdraws one caller from attempt a, and abandons the attempt if
+// it is still in flight and nobody is left waiting on it.
 //
-// Left running, a stalled attempt keeps p.dial claimed and every later call
-// joins it. Abandoning it makes the dial fail -- now, or as soon as its socket
-// arrives (trackingDialer) -- so ConnectToURI returns, the goroutine clears
-// p.dial, and the next call dials afresh.
+// Left running with nobody waiting, a stalled attempt keeps p.dial claimed and
+// every later call joins it. Abandoning it makes the dial fail -- now, or as
+// soon as its socket arrives (trackingDialer) -- so ConnectToURI returns, the
+// goroutine clears p.dial, and the next call dials afresh.
 //
-//	when the caller gives up                   | action
-//	-------------------------------------------+---------------------------------
-//	its attempt is in flight (p.dial == done)  | abandon it
-//	its attempt has finished, and failed       | none; nothing is held
-//	its attempt has finished, and succeeded    | none; the connection is healthy
-//	a newer attempt is in flight               | none; it belongs to other callers
+//	when the caller gives up                      | action
+//	----------------------------------------------+-------------------------------
+//	its attempt is in flight, nobody else waiting | abandon it
+//	its attempt is in flight, others waiting      | none; the last to leave does,
+//	                                              |   or the attempt's limit
+//	its attempt has finished, and failed          | none; nothing is held
+//	its attempt has finished, and succeeded       | none; the connection is healthy
+//	a newer attempt is in flight                  | none; it belongs to other callers
 //
 // The check and the abandonment both happen under p.mu, and a new attempt only
 // begins under p.mu with p.dial nil, so the abandonment cannot land on a newer
-// attempt. p.dial still equals done for a moment after ConnectToURI returns,
-// until the goroutine takes p.mu; an attempt that succeeded in that moment is
-// treated as in flight and its connection closed, which normally costs one
-// redial.
+// attempt. p.dial still equals a for a moment after ConnectToURI returns, until
+// the goroutine takes p.mu; an attempt that succeeded in that moment is treated
+// as in flight and its connection closed. Callers waiting on it are told it
+// succeeded, and their next RPC fails on the closed socket -- one failed call,
+// then a redial.
 //
-// Not always, though, and not because of anything here. go-libvirt's
-// ConnectToURI replaces its disconnected channel only after the handshake
-// succeeds; a socket closed between those two steps -- by this, by recycle, or
-// by the daemon -- is a disconnect it never reports, and IsConnected stays
-// true. The window is two statements wide, and closing a socket in it was
-// already possible before abandonment existed.
-func (p *Provider) abandonDial(done chan struct{}) {
+// That close can cost more than a redial, through no fault of this code (PET-67).
+// go-libvirt's ConnectToURI replaces its disconnected channel only after the
+// handshake succeeds, so a socket closed between those two statements -- by
+// this, by recycle, or by the daemon -- is a disconnect it never reports.
+// IsConnected then stays true and the provider is wedged until restart. The
+// window predates abandonment, and abandonment does not widen it.
+func (p *Provider) abandonDial(a *dialAttempt) {
 	p.mu.Lock()
+	a.waiters--
 	var c net.Conn
-	if p.dial == done {
-		c = p.dialer.abandonAttempt()
+	if a.waiters == 0 {
+		c = p.abandonLocked(a)
 	}
 	p.mu.Unlock()
-	// Outside p.mu: closing a TLS connection can block on its peer.
+	closeDetached(c)
+}
+
+// endAttempt abandons attempt a when its limit runs out, waiting callers or not.
+func (p *Provider) endAttempt(a *dialAttempt) {
+	p.mu.Lock()
+	c := p.abandonLocked(a)
+	p.mu.Unlock()
+	closeDetached(c)
+}
+
+// abandonLocked abandons attempt a if it is still the one in flight, returning
+// its socket for the caller to close once p.mu is released. p.mu must be held.
+func (p *Provider) abandonLocked(a *dialAttempt) net.Conn {
+	if p.dial != a {
+		return nil
+	}
+	return p.dialer.abandonAttempt()
+}
+
+// closeDetached closes a socket detached from the dialer. Never under p.mu:
+// closing a TLS connection can block on its peer.
+func closeDetached(c net.Conn) {
 	if c != nil {
 		_ = c.Close()
 	}

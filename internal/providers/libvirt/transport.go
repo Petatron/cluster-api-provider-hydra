@@ -26,8 +26,9 @@ import (
 	"github.com/digitalocean/go-libvirt/socket"
 )
 
-// errDialAbandoned is returned by a dial whose caller gave up on it.
-var errDialAbandoned = errors.New("libvirt: dial abandoned by its caller")
+// errDialAbandoned is returned by a dial whose attempt was abandoned: every
+// caller waiting on it gave up, or its time limit ran out.
+var errDialAbandoned = errors.New("libvirt: connection attempt abandoned")
 
 // trackingDialer remembers the connection it handed to go-libvirt so the
 // transport can be force-closed later.
@@ -41,11 +42,11 @@ var errDialAbandoned = errors.New("libvirt: dial abandoned by its caller")
 // Closing the net.Conn underneath it does not negotiate anything. Every parked
 // read fails immediately, which is the whole point.
 //
-// Closing only works on a socket that exists, though. A caller can give up on
-// a connection attempt before its dial has produced one -- the dial has not
-// started, or is still connecting -- and the socket that arrives afterwards
-// would then sit in the libvirt handshake against a daemon that never answers,
-// holding the attempt open (PET-66). So giving up is recorded against the
+// Closing only works on a socket that exists, though. An attempt can be given
+// up on, by its callers or by its time limit, before its dial has produced one
+// -- the dial has not started, or is still connecting -- and the socket that
+// arrives afterwards would then sit in the libvirt handshake against a daemon
+// that never answers, holding the attempt open (PET-66). So giving up is recorded against the
 // attempt, not just applied to whatever socket happens to be registered:
 //
 //	when the attempt is abandoned          | what happens to its socket
@@ -62,8 +63,8 @@ type trackingDialer struct {
 
 	mu   sync.Mutex
 	conn net.Conn
-	// abandoned is set when the caller of the current attempt gave up, and
-	// cleared when the next attempt begins. abandonedCh is closed at the same
+	// abandoned is set when the current attempt is abandoned, and cleared when
+	// the next attempt begins. abandonedCh is closed at the same
 	// moment, to release a Dial waiting on the inner dial.
 	abandoned   bool
 	abandonedCh chan struct{}
@@ -74,10 +75,13 @@ func newTrackingDialer(inner socket.Dialer, timeout time.Duration) *trackingDial
 }
 
 // beginAttempt starts a new connection attempt, clearing any abandonment of the
-// previous one. Tolerates a nil dialer, as recycle does.
-func (d *trackingDialer) beginAttempt() {
+// previous one, and detaches the previous attempt's socket so that d.conn only
+// ever belongs to the current attempt. The caller closes the returned
+// connection, outside any lock it holds, as with abandonAttempt. Tolerates a
+// nil dialer, as recycle does.
+func (d *trackingDialer) beginAttempt() net.Conn {
 	if d == nil {
-		return
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -85,9 +89,12 @@ func (d *trackingDialer) beginAttempt() {
 		d.abandoned = false
 		d.abandonedCh = make(chan struct{})
 	}
+	c := d.conn
+	d.conn = nil
+	return c
 }
 
-// abandonAttempt records that the caller of the current attempt gave up, and
+// abandonAttempt records that the current attempt has been given up on, and
 // detaches its socket if it has one. The caller closes the returned connection,
 // outside any lock it holds: closing a TLS connection writes an alert and can
 // block on a peer that has stopped reading.

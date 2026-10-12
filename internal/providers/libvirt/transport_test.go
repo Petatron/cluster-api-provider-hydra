@@ -299,3 +299,21 @@ func (g *gatedDialer) waitEntered(t *testing.T) {
 		t.Fatal("the inner dial never started")
 	}
 }
+
+// d.conn belongs to the current attempt. A new attempt detaches the previous
+// one's socket, so abandoning the new attempt cannot reach back and return it.
+func TestTrackingDialerBeginAttemptDetachesThePreviousSocket(t *testing.T) {
+	addr, _ := recordingListener(t)
+	d := newTrackingDialer(stubDialer{addr: addr}, time.Second)
+	old, err := d.Dial()
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if c := d.beginAttempt(); c != old {
+		t.Fatalf("beginAttempt returned %v, want the previous attempt's socket", c)
+	}
+	_ = old.Close()
+	if c := d.abandonAttempt(); c != nil {
+		t.Errorf("abandoning the new attempt returned %v, the previous attempt's socket", c)
+	}
+}
