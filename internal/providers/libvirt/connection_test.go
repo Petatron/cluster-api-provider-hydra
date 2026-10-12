@@ -103,33 +103,84 @@ func TestConcurrentCallersShareOneReconnect(t *testing.T) {
 	}
 }
 
-// A caller that times out during a reconnect must not leave the dial claimed
-// forever, or every later call would join an attempt that never ends.
+// A caller that gives up during a reconnect -- its context times out or is
+// cancelled -- must not leave the dial claimed forever, or every later call
+// would join an attempt that never ends.
 func TestATimedOutReconnectDoesNotWedgeLaterCalls(t *testing.T) {
 	p, f := newFakeProvider(t)
 	p.cfg.RPCTimeout = time.Second
 	p.dialer = newTrackingDialer(stubDialer{addr: silentListener(t)}, time.Second)
 	f.connected = false
 	var dials atomic.Int32
+	// The first dial's completion channel, captured while that dial is certainly
+	// in flight: ensureConnected sets p.dial before starting the dial and clears
+	// it only after ConnectToURI returns. Reading p.dial after the timeout
+	// instead could find it already cleared and skip the wait.
+	stalled := make(chan chan struct{}, 1)
+	// Closed once the first dial's socket is registered with the tracking
+	// dialer, so forceClose has something to close. Before that, forceClose is
+	// a no-op and the dial would stall until some later caller timed out
+	// (PET-66) -- not the behaviour under test here.
+	installed := make(chan struct{})
 	f.dial = func() error {
 		if dials.Add(1) > 1 {
 			return nil
 		}
+		p.mu.Lock()
+		stalled <- p.dial
+		p.mu.Unlock()
 		// The first dial waits on a peer that never answers. Only forceClose
 		// can release it.
 		conn, err := p.dialer.Dial()
 		if err != nil {
 			return err
 		}
+		close(installed)
 		_, _ = io.ReadAll(conn)
 		return errors.New("connection closed")
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	// The caller gives up by cancellation rather than by a timer, so it cannot
+	// give up before the socket exists however late the dial goroutine runs.
+	// ensureConnected handles both in the same ctx.Done() branch. The long
+	// deadline only stops withRPCDeadline from adding a shorter one of its own.
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	_, err := p.FindByName(ctx, "worker-1")
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "connecting") {
-		t.Fatalf("FindByName = %v, want the reconnect to time out", err)
+	errs := make(chan error, 1)
+	go func() {
+		_, err := p.FindByName(ctx, "worker-1")
+		errs <- err
+	}()
+	var abandoned chan struct{}
+	select {
+	case abandoned = <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first dial never started")
+	}
+	select {
+	case <-installed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first dial never registered its connection")
+	}
+	cancel()
+	select {
+	case err := <-errs:
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "connecting") {
+			t.Fatalf("FindByName = %v, want the reconnect abandoned", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FindByName did not return after its context was cancelled")
+	}
+
+	// The abandoning caller force-closes and returns at once; the dial goroutine
+	// still has to unwind and release its claim. A call made inside that window
+	// joins the dying attempt and gets its error -- one failed reconcile, which
+	// is requeued. What must never happen is the claim outliving the dial, so
+	// wait for it to end, and fail if it does not.
+	select {
+	case <-abandoned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the timed-out dial never ended; every later call would join it")
 	}
 
 	if _, err := p.FindByName(t.Context(), "worker-1"); !errors.Is(err, providers.ErrNotFound) {
