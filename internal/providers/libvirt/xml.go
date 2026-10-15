@@ -55,14 +55,25 @@ const (
 // from libvirt, not a malformed document that means something else entirely.
 
 type domainDef struct {
-	XMLName xml.Name  `xml:"domain"`
-	Type    string    `xml:"type,attr"`
-	Name    string    `xml:"name"`
-	Memory  memoryDef `xml:"memory"`
-	VCPU    int32     `xml:"vcpu"`
-	OS      osDef     `xml:"os"`
-	Devices devices   `xml:"devices"`
+	XMLName  xml.Name    `xml:"domain"`
+	Type     string      `xml:"type,attr"`
+	Name     string      `xml:"name"`
+	Memory   memoryDef   `xml:"memory"`
+	VCPU     int32       `xml:"vcpu"`
+	OS       osDef       `xml:"os"`
+	Features featuresDef `xml:"features"`
+	Devices  devices     `xml:"devices"`
 }
+
+// featuresDef is the hypervisor features a domain is given. Both are pointers
+// so a domain read back without them parses as absent rather than as present.
+type featuresDef struct {
+	ACPI *presentDef `xml:"acpi,omitempty"`
+	APIC *presentDef `xml:"apic,omitempty"`
+}
+
+// presentDef renders as a bare element whose presence is the whole setting.
+type presentDef struct{}
 
 type memoryDef struct {
 	Unit  string `xml:"unit,attr"`
@@ -337,6 +348,16 @@ func domainXML(spec providers.MachineSpec, rootPath, cidataPath string) string {
 			Type: osTypeDef{Arch: domainArch, Machine: "q35", Value: "hvm"},
 			Boot: []bootDef{{Dev: "hd"}},
 		},
+		// Without ACPI the guest has no way to hear a shutdown request. virsh
+		// shutdown, and libvirt-guests stopping guests for a host reboot, both
+		// ask through it; a guest without it ignores them until the host's
+		// timeout expires and the guest is destroyed, mid-write if it is an
+		// etcd member. Its own poweroff only halts the CPU, too, leaving the
+		// domain "running" with nothing inside. Seen on every Hydra domain in
+		// the 2026-10-05 incident (PET-62). APIC is the interrupt controller
+		// ACPI describes to the guest; every libvirt tool emits the two
+		// together.
+		Features: featuresDef{ACPI: &presentDef{}, APIC: &presentDef{}},
 		Devices: devices{
 			Disks: []diskDef{{
 				Type:   diskTypeFile,

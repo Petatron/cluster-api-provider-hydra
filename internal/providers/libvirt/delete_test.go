@@ -152,6 +152,65 @@ func TestDeleteKeepsTheDomainWhenItsStorageCannotBeRemoved(t *testing.T) {
 	}
 }
 
+// A teardown that fails after the destroy is retried with the domain still
+// defined. If it kept autostart, a host reboot in between would boot a machine
+// Cluster API already deleted, and its kubelet would rejoin.
+//
+// Cleared after the destroy, not before: libvirt changes autostart under a
+// domain job, which a hung guest's monitor can hold; the destroy kills QEMU
+// without waiting for it.
+func TestDeleteClearsAutostartBetweenTheDestroyAndTheStorage(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := seedMachine(t, f, testPool)
+	d.autostart = true
+	f.errs["StorageVolDelete:"+rootVolumeName(testSpec().Name)] = errInjected
+
+	if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); !errors.Is(err, errInjected) {
+		t.Fatalf("Delete = %v, want the injected failure", err)
+	}
+	if _, ok := f.domains[testSpec().Name]; !ok {
+		t.Fatal("the domain was undefined while its disk remained")
+	}
+	if d.autostart {
+		t.Error("a half-deleted domain kept autostart; a host reboot would start it again")
+	}
+	destroy, clear := slices.Index(f.calls, "DomainDestroy"), slices.Index(f.calls, "DomainSetAutostart")
+	volume := slices.Index(f.calls, "StorageVolDelete")
+	if destroy < 0 || clear < destroy || volume < clear {
+		t.Errorf("calls = %v; want destroy, then autostart cleared, then storage", f.calls)
+	}
+}
+
+// Failing to clear it stops the teardown before any storage is touched, so the
+// retry finds the disks and the definition exactly as they were.
+func TestDeleteKeepsStorageWhenAutostartCannotBeCleared(t *testing.T) {
+	for name, cause := range map[string]error{
+		"backend fault": errInjected,
+		// What a domain job held past libvirt's own wait looks like.
+		"job timeout": lvErr(golibvirt.ErrOperationTimeout),
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			d := seedMachine(t, f, testPool)
+			d.autostart = true
+			f.errs["DomainSetAutostart"] = cause
+
+			if err := p.Delete(t.Context(), formatUUID(d.dom.UUID)); !errors.Is(err, cause) {
+				t.Fatalf("Delete = %v, want the injected failure", err)
+			}
+			if d.active {
+				t.Error("the domain was left running; the destroy must not depend on autostart")
+			}
+			if _, ok := f.domains[testSpec().Name]; !ok {
+				t.Error("the domain was undefined after clearing autostart failed")
+			}
+			if !f.hasVol(testPool, rootVolumeName(testSpec().Name)) || !f.hasVol(testPool, cidataVolumeName(testSpec().Name)) {
+				t.Error("volumes were deleted after clearing autostart failed")
+			}
+		})
+	}
+}
+
 // A redeploy with a different --libvirt-storage-pool must not strand a disk in
 // the old one. Deletion follows the domain's own paths.
 func TestDeleteReclaimsAMachineFromAPoolNoLongerConfigured(t *testing.T) {
@@ -381,7 +440,13 @@ func TestDeleteToleratesWhatIsAlreadyGone(t *testing.T) {
 		"volume vanishes mid-delete": func(f *fakeLibvirt, _ *fakeDomain) {
 			f.errs["StorageVolDelete"] = lvErr(golibvirt.ErrNoStorageVol)
 		},
+		// libvirt refuses autostart on a transient domain, which has none to
+		// clear.
+		"domain is transient": func(f *fakeLibvirt, _ *fakeDomain) {
+			f.errs["DomainSetAutostart"] = lvErr(golibvirt.ErrOperationInvalid)
+		},
 		"domain vanishes mid-delete": func(f *fakeLibvirt, _ *fakeDomain) {
+			f.errs["DomainSetAutostart"] = lvErr(golibvirt.ErrNoDomain)
 			f.errs["DomainDestroy"] = lvErr(golibvirt.ErrNoDomain)
 			f.errs["DomainUndefineFlags"] = lvErr(golibvirt.ErrNoDomain)
 		},
@@ -401,6 +466,7 @@ func TestDeleteToleratesWhatIsAlreadyGone(t *testing.T) {
 func TestDeleteReportsBackendFaults(t *testing.T) {
 	for name, setup := range map[string]func(*fakeLibvirt, *fakeDomain){
 		"lookup fails":       func(f *fakeLibvirt, _ *fakeDomain) { f.errs["DomainLookupByUUID"] = errInjected },
+		"autostart fails":    func(f *fakeLibvirt, _ *fakeDomain) { f.errs["DomainSetAutostart"] = errInjected },
 		"destroy fails":      func(f *fakeLibvirt, _ *fakeDomain) { f.errs["DomainDestroy"] = errInjected },
 		"domain XML fails":   func(f *fakeLibvirt, _ *fakeDomain) { f.errs["DomainGetXMLDesc"] = errInjected },
 		"undefine fails":     func(f *fakeLibvirt, _ *fakeDomain) { f.errs["DomainUndefineFlags"] = errInjected },

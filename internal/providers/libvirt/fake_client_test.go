@@ -96,9 +96,10 @@ type fakeVol struct {
 }
 
 type fakeDomain struct {
-	dom    golibvirt.Domain
-	xml    string
-	active bool
+	dom       golibvirt.Domain
+	xml       string
+	active    bool
+	autostart bool
 	// addrs is what DomainInterfaceAddresses reports per source; a source with
 	// no entry fails, the way an absent guest agent does.
 	addrs map[uint32][]golibvirt.DomainInterface
@@ -338,6 +339,19 @@ func (f *fakeLibvirt) DomainCreate(dom golibvirt.Domain) error {
 		return err
 	}
 	d.active = true
+	return nil
+}
+
+func (f *fakeLibvirt) DomainSetAutostart(dom golibvirt.Domain, autostart int32) error {
+	defer f.mu.Unlock()
+	if err := f.enter("DomainSetAutostart", dom.Name); err != nil {
+		return err
+	}
+	d, err := f.domain(dom)
+	if err != nil {
+		return err
+	}
+	d.autostart = autostart == 1
 	return nil
 }
 
