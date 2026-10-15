@@ -277,7 +277,8 @@ you looking at the socket path or at libvirtd itself.
 
 **Surviving a hypervisor reboot.** Every machine the libvirt backend creates has ACPI, so a host
 shutdown can stop its guests cleanly, and is marked to autostart, so libvirtd starts it again when
-the host comes back (PET-62). Nothing on the host needs configuring for that, with two caveats:
+the host comes back (PET-62). Nothing in the provider needs configuring for that, but two host
+settings matter:
 
 - libvirtd must start at boot. Autostart is applied when the daemon starts, so a daemon that is only
   socket-activated starts the machines when the first client connects, not when the host boots.
@@ -285,8 +286,11 @@ the host comes back (PET-62). Nothing on the host needs configuring for that, wi
   `SHUTDOWN_TIMEOUT` longer than a guest takes to stop is the clean choice. A guest still running when
   the timeout expires is destroyed.
 
-Both settings apply only to machines created by a provider that includes them. Machines that already
-existed keep their old definition until they are replaced, for example by a rollout.
+ACPI applies only to machines defined by a provider that includes it. Machines that already existed
+keep their old definition until they are replaced, for example by a rollout. Autostart is set on
+every machine this provider creates or finishes creating, so a half-created machine left by an older
+version gets autostart but not ACPI: it comes back after a host reboot, but a host shutdown still
+destroys it at the timeout.
 
 Two consequences worth knowing. A machine an operator stopped by hand comes back after a host reboot,
 because autostart is a property of the domain, not of its last state. And a machine whose autostart

@@ -772,6 +772,14 @@ func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 // included, so a failure is retried rather than forgotten: Create returns the
 // error, no providerID is recorded, and the next reconcile adopts the running
 // domain and sets it again.
+//
+// Unlike deleteDomain, nothing here tolerates libvirt's invalid-operation
+// refusal, and that is deliberate. It means the domain is transient -- running
+// but undefined, which only an operator makes -- and a transient domain cannot
+// come back after a reboot at all, so adopting it as a machine would be a lie.
+// It stays retryable rather than terminal because the fix is the operator's and
+// is quick: once the domain is defined again, the next reconcile sets autostart
+// and the machine is recorded.
 func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) error {
 	if err := startVerified(dom.Name, p.startStepsFor(ctx, dom)); err != nil {
 		return err
