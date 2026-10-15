@@ -68,6 +68,27 @@ func TestDomainXMLIsWellFormedAndComplete(t *testing.T) {
 	}
 }
 
+// Without ACPI a guest never hears virsh shutdown or a host's libvirt-guests,
+// and is destroyed when the timeout expires (PET-62).
+func TestDomainXMLGivesTheGuestACPIAndAPIC(t *testing.T) {
+	var parsed domainDef
+	if err := xml.Unmarshal([]byte(domainXML(testSpec(), "/pool/root.qcow2", "")), &parsed); err != nil {
+		t.Fatalf("generated domain XML does not parse: %v", err)
+	}
+	if parsed.Features.ACPI == nil || parsed.Features.APIC == nil {
+		t.Errorf("features = %+v, want both acpi and apic", parsed.Features)
+	}
+
+	// And the parse can tell them absent, or the check above proves nothing.
+	var bare domainDef
+	if err := xml.Unmarshal([]byte(`<domain type="kvm"><name>x</name></domain>`), &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare.Features.ACPI != nil || bare.Features.APIC != nil {
+		t.Errorf("a domain without <features> parsed as %+v", bare.Features)
+	}
+}
+
 // A machine name is derived from a Kubernetes object name, so it cannot normally
 // contain XML metacharacters -- but building this document by string
 // concatenation would make that a one-character change away from a malformed or

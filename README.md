@@ -275,6 +275,25 @@ hypervisor's `libvirt` gid, and a uid libvirtd can resolve to a host user record
 by deploying it, and both surface as a connection failure rather than a permission one — which sends
 you looking at the socket path or at libvirtd itself.
 
+**Surviving a hypervisor reboot.** Every machine the libvirt backend creates has ACPI, so a host
+shutdown can stop its guests cleanly, and is marked to autostart, so libvirtd starts it again when
+the host comes back (PET-62). Nothing on the host needs configuring for that, with two caveats:
+
+- libvirtd must start at boot. Autostart is applied when the daemon starts, so a daemon that is only
+  socket-activated starts the machines when the first client connects, not when the host boots.
+- `libvirt-guests` decides how guests are stopped at host shutdown. `ON_SHUTDOWN=shutdown` with a
+  `SHUTDOWN_TIMEOUT` longer than a guest takes to stop is the clean choice. A guest still running when
+  the timeout expires is destroyed.
+
+Both settings apply only to machines created by a provider that includes them. Machines that already
+existed keep their old definition until they are replaced, for example by a rollout.
+
+Two consequences worth knowing. A machine an operator stopped by hand comes back after a host reboot,
+because autostart is a property of the domain, not of its last state. And a machine whose autostart
+cannot be set is not reported as created: the provider retries until it can be, so a host that refuses
+it (an unwritable autostart directory, say) shows up as a machine that never finishes provisioning
+rather than as one that silently stays down after the next reboot.
+
 ### Building the clusterctl release manifest
 
 ```bash

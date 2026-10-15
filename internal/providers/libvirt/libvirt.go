@@ -164,6 +164,7 @@ type client interface {
 	DomainIsActive(dom golibvirt.Domain) (int32, error)
 	DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error)
 	DomainCreate(dom golibvirt.Domain) error
+	DomainSetAutostart(dom golibvirt.Domain, autostart int32) error
 	DomainDestroy(dom golibvirt.Domain) error
 	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
 	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
@@ -757,9 +758,32 @@ func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 }
 
 // ensureRunning starts a domain that is defined but not active, once its
-// root ports pass startVerified's check.
+// root ports pass startVerified's check, and marks it to start with the host.
+//
+// Autostart is what brings a machine back after the hypervisor reboots. Nothing
+// else does: libvirt-guests restarts only what it saved, and only when the host
+// is configured to, and the controller never starts a machine it has already
+// recorded. Without it, every VM on a rebooted host stays off until someone
+// notices (PET-62).
+//
+// It is set after the start, never before, so it inherits the guard: a domain
+// startVerified refused is left without it, and a host reboot cannot start what
+// Create would not. And it is set on every pass through here, the adopt path
+// included, so a failure is retried rather than forgotten: Create returns the
+// error, no providerID is recorded, and the next reconcile adopts the running
+// domain and sets it again.
 func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) error {
-	return startVerified(dom.Name, startSteps{
+	if err := startVerified(dom.Name, p.startStepsFor(ctx, dom)); err != nil {
+		return err
+	}
+	if err := callVoid(ctx, p, func() error { return p.lv.DomainSetAutostart(dom, 1) }); err != nil {
+		return fmt.Errorf("libvirt: setting autostart on domain %q: %w", dom.Name, err)
+	}
+	return nil
+}
+
+func (p *Provider) startStepsFor(ctx context.Context, dom golibvirt.Domain) startSteps {
+	return startSteps{
 		isActive: func() (bool, error) {
 			active, err := call(ctx, p, func() (int32, error) { return p.lv.DomainIsActive(dom) })
 			return active == 1, err
@@ -770,7 +794,7 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 			})
 		},
 		start: func() error { return callVoid(ctx, p, func() error { return p.lv.DomainCreate(dom) }) },
-	})
+	}
 }
 
 // startSteps are the three RPCs starting a domain takes. They are funcs so the
@@ -1428,6 +1452,29 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	if err := callVoid(ctx, p, func() error { return p.lv.DomainDestroy(dom) }); err != nil &&
 		!isNotFound(err) && !isInvalidState(err) {
 		return fmt.Errorf("libvirt: destroying domain %q: %w", dom.Name, err)
+	}
+
+	// Then autostart, before any storage. The domain is undefined only at the
+	// very end, after its volumes, and a teardown that fails between the two is
+	// retried with the domain still defined. A host reboot in that gap would
+	// start it again: a machine Cluster API has deleted, booting, and its
+	// kubelet rejoining as a Node. Cleared, the worst a reboot can do is nothing.
+	//
+	// After the destroy, not before. libvirt changes autostart under a domain
+	// job, and a guest whose QEMU monitor is hung -- the kind a health check
+	// deletes -- can hold that job past this call's deadline on every retry.
+	// The destroy kills QEMU without waiting for the job, so after it nothing
+	// is left to hold one. The cost is a single RPC with the domain stopped and
+	// still marked to autostart.
+	//
+	// Fail closed, except where there is nothing to clear. A domain that is gone
+	// has none, and a transient one -- running but undefined, which only an
+	// operator makes -- cannot have it; libvirt refuses that as an invalid
+	// operation. Any other failure stops the teardown before a volume is
+	// touched, and the retry destroys (a no-op by then) and clears again.
+	if err := callVoid(ctx, p, func() error { return p.lv.DomainSetAutostart(dom, 0) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
+		return fmt.Errorf("libvirt: clearing autostart on domain %q: %w", dom.Name, err)
 	}
 
 	// Resolve the disk from the domain itself rather than from current config.

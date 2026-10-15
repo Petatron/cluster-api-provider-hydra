@@ -195,6 +195,9 @@ func TestCreateRefusesToStartAnAdoptedDomainWithHotplugPorts(t *testing.T) {
 	if d.active {
 		t.Error("the refused domain was started")
 	}
+	if d.autostart {
+		t.Error("the refused domain was given autostart; a host reboot would start it")
+	}
 }
 
 // The fresh path: libvirt stores something other than what was defined. The
@@ -217,11 +220,86 @@ func TestCreateRefusesAFreshDomainLibvirtAddedHotplugPortsTo(t *testing.T) {
 	if !errors.Is(err, providers.ErrTerminal) {
 		t.Fatalf("Create = %v, want a terminal refusal", err)
 	}
-	if d, ok := f.domains["worker-1"]; !ok || d.active {
-		t.Errorf("domain defined = %v; want it left defined and never started", ok)
+	if d, ok := f.domains["worker-1"]; !ok || d.active || d.autostart {
+		t.Errorf("domain defined = %v; want it left defined, never started, without autostart", ok)
 	}
 	if !f.hasVol(testPool, rootVolumeName("worker-1")) || !f.hasVol(testPool, cidataVolumeName("worker-1")) {
 		t.Error("a refusal deleted volumes; nothing on this path may clean up")
+	}
+}
+
+// Autostart is what brings a machine back after the hypervisor reboots, and
+// every path that ends with a running machine has to leave it set: the adopt
+// paths are how a failure to set it on the fresh one is retried.
+func TestCreateSetsAutostartOnEveryPath(t *testing.T) {
+	for name, setup := range map[string]func(*fakeLibvirt){
+		"fresh":                  func(*fakeLibvirt) {},
+		"adopt a stopped domain": func(f *fakeLibvirt) { f.addDomain(testSpec().Name, goodDomainXML(), false) },
+		"adopt a running domain": func(f *fakeLibvirt) { f.addDomain(testSpec().Name, goodDomainXML(), true) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, f := newFakeProvider(t)
+			setup(f)
+
+			if _, err := p.Create(t.Context(), bootstrapSpec()); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if d := f.domains[testSpec().Name]; !d.active || !d.autostart {
+				t.Errorf("active = %v, autostart = %v; want a running domain that starts with the host", d.active, d.autostart)
+			}
+		})
+	}
+}
+
+// After the start, so a domain that fails to start is not one a host reboot
+// would try again behind the provider's back.
+func TestCreateSetsAutostartOnlyOnceTheDomainHasStarted(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.errs["DomainCreate"] = errInjected
+
+	if _, err := p.Create(t.Context(), bootstrapSpec()); !errors.Is(err, errInjected) {
+		t.Fatalf("Create = %v, want the injected failure", err)
+	}
+	if d := f.domains[testSpec().Name]; d.autostart {
+		t.Error("a domain that never started was given autostart")
+	}
+
+	// Forget the failed first start, so the order below is the retry's.
+	delete(f.errs, "DomainCreate")
+	f.calls = nil
+	if _, err := p.Create(t.Context(), bootstrapSpec()); err != nil {
+		t.Fatalf("retried Create: %v", err)
+	}
+	start, set := slices.Index(f.calls, "DomainCreate"), slices.Index(f.calls, "DomainSetAutostart")
+	if start < 0 || set < start {
+		t.Errorf("calls = %v; want autostart set after the start", f.calls)
+	}
+}
+
+// A failure to set it fails Create, so the controller records no providerID and
+// the next reconcile adopts the running domain and sets it again. Reporting
+// success would leave a machine that never comes back after a reboot, with
+// nothing left to notice.
+func TestCreateRetriesAutostartItFailedToSet(t *testing.T) {
+	p, f := newFakeProvider(t)
+	f.errs["DomainSetAutostart"] = errInjected
+
+	_, err := p.Create(t.Context(), bootstrapSpec())
+	if !errors.Is(err, errInjected) || errors.Is(err, providers.ErrTerminal) {
+		t.Fatalf("Create = %v, want the injected failure, retryable", err)
+	}
+	d := f.domains[testSpec().Name]
+	if !d.active {
+		t.Fatal("the domain was not left running for the retry to adopt")
+	}
+
+	delete(f.errs, "DomainSetAutostart")
+	if _, err := p.Create(t.Context(), providers.MachineSpec{Name: testSpec().Name}); err != nil {
+		t.Fatalf("retried Create: %v", err)
+	}
+	if !d.autostart || f.called("DomainDefineXML") != 1 {
+		t.Errorf("autostart = %v, defines = %d; want the retry to set it on the same domain",
+			d.autostart, f.called("DomainDefineXML"))
 	}
 }
 
