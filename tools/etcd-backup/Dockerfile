@@ -17,4 +17,8 @@ LABEL org.opencontainers.image.description="Encrypted etcd backups of Cluster AP
 RUN apk add --no-cache age curl jq openssl
 COPY --from=etcd /usr/local/bin/etcdctl /usr/local/bin/etcdutl /usr/local/bin/
 COPY --chmod=0755 etcd-backup.sh /usr/local/bin/etcd-backup
+# The tests run against stubs, so prove here that the real binaries start in
+# this image: a moved or dynamically linked one fails the build, not the first
+# scheduled backup.
+RUN etcdctl version && etcdutl version && age --version && jq --version && curl --version >/dev/null && openssl version
 ENTRYPOINT ["/usr/local/bin/etcd-backup"]

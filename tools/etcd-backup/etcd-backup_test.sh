@@ -117,23 +117,25 @@ cat <<'JSON'
 ]}
 JSON
 EOF
-# etcdctl: `endpoint health` passes only for endpoints in $HEALTHY. A snapshot
-# succeeds from ANY endpoint -- as from a real member cut off from quorum, which
-# still serves its own stale data. Only the health check keeps it out.
+# etcdctl: the linearizable read passes only for endpoints in $HEALTHY. A
+# snapshot succeeds from ANY endpoint -- as from a real member cut off from
+# quorum, which still serves its own stale data. Only the read keeps it out.
+# Each call is logged with its --command-timeout.
 cat >"$t/bin/etcdctl" <<'EOF'
 #!/bin/sh
-ep=""; out=""; cmd=""
+ep=""; out=""; cmd=""; to=""
 while [ $# -gt 0 ]; do
 	case $1 in
 	--endpoints) ep=$2; shift ;;
-	endpoint) cmd=health ;;
+	--command-timeout=*) to=${1#*=} ;;
+	get) cmd=health ;;
 	snapshot) cmd=save; out=$3; shift 2 ;;
 	esac
 	shift
 done
-echo "$cmd $ep" >>"$CALLS"
+echo "$cmd $ep timeout=$to" >>"$CALLS"
 if [ "$cmd" = health ]; then
-	case " $HEALTHY " in *" $ep "*) exit 0 ;; *) echo "unhealthy $ep" >&2; exit 1 ;; esac
+	case " $HEALTHY " in *" $ep "*) exit 0 ;; *) printf '{"msg":"cause-for-%s"}\nError: context deadline exceeded\n' "$ep" >&2; exit 1 ;; esac
 fi
 head -c "${SNAP_BYTES:-2000000}" /dev/zero >"$out"
 EOF
@@ -190,17 +192,46 @@ done
 d="$t/b2"; seed "$d"
 run_backup "$d" HEALTHY="https://10.0.0.2:2379" && pass "skips an unhealthy member" || { fail "skips an unhealthy member"; cat "$t/log"; }
 grep -q 'from https://10.0.0.2:2379' "$t/log" && pass "snapshots the healthy member" || fail "snapshots the healthy member"
+# The cause is on etcdctl's first stderr line, not its generic last one.
+grep -q 'skipping https://10.0.0.1:2379: .*cause-for-https://10.0.0.1:2379' "$t/log" &&
+	pass "logs why a member was skipped" || fail "logs why a member was skipped"
+# The probe gives up fast; the snapshot gets the long timeout.
+grep -q '^health https://10.0.0.1:2379 timeout=5s$' "$t/calls" && pass "probes with the short timeout" || fail "probes with the short timeout"
+grep -q '^save https://10.0.0.2:2379 timeout=600s$' "$t/calls" && pass "snapshots with the long timeout" || fail "snapshots with the long timeout"
 
 # A future-dated snapshot: write the backup, prune nothing, fail loudly.
 d="$t/b3"; seed "$d"; : >"$d/wl0-29991231T000000Z.db.age"
 if run_backup "$d"; then fail "fails when a snapshot is dated in the future"; else pass "fails when a snapshot is dated in the future"; fi
 expect "prunes nothing when a snapshot is dated in the future" "10" "$(count "$d")"
 
-# A stale partial from a SIGKILLed run is cleaned up; another cluster's is not.
-d="$t/b4"; seed "$d"; : >"$d/.partial-wl0-20200101T000000Z.db.age"; : >"$d/.partial-other-20200101T000000Z.db.age"
+# A stale partial from a SIGKILLed run is cleaned up; another cluster's is
+# not, including one whose name merely starts with this cluster's.
+d="$t/b4"; seed "$d"
+for p in wl0 other wl0-prod; do : >"$d/.partial-$p-20200101T000000Z.db.age"; done
 run_backup "$d" >/dev/null
 [ -e "$d/.partial-wl0-20200101T000000Z.db.age" ] && fail "removes its own stale partial" || pass "removes its own stale partial"
 [ -e "$d/.partial-other-20200101T000000Z.db.age" ] && pass "leaves another cluster's partial" || fail "leaves another cluster's partial"
+[ -e "$d/.partial-wl0-prod-20200101T000000Z.db.age" ] && pass "leaves a prefix-sharing cluster's partial" ||
+	fail "leaves a prefix-sharing cluster's partial"
+
+# --- MODE=check-cert, with real certificates ---------------------------------------
+# cert DAYS DIR -> a self-signed certificate valid for DAYS, at DIR/tls.crt.
+cert() {
+	mkdir -p "$2"
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$2/tls.key" \
+		-out "$2/tls.crt" -days "$1" -subj /CN=test >/dev/null 2>&1
+}
+check_cert_mode() { env MODE=check-cert CERT_DIR="$1" CERT_WARN_DAYS="$2" sh "$script" >/dev/null 2>&1; }
+cert 10 "$t/c10"
+cert 400 "$t/c400"
+check_cert_mode "$t/c400" 30 && pass "check-cert passes 400 days out at 30" || fail "check-cert passes 400 days out at 30"
+check_cert_mode "$t/c10" 30 && fail "check-cert fails 10 days out at 30" || pass "check-cert fails 10 days out at 30"
+check_cert_mode "$t/c10" 5 && pass "check-cert passes 10 days out at 5" || fail "check-cert passes 10 days out at 5"
+# 10 days left against a threshold of 08: passes if 08 is read as eight; an
+# octal reading is an arithmetic error, which fails.
+check_cert_mode "$t/c10" 08 && pass "check-cert reads 08 as eight, not octal" || fail "check-cert reads 08 as eight, not octal"
+check_cert_mode "$t/none" 30 && fail "check-cert fails on a missing certificate" || pass "check-cert fails on a missing certificate"
+check_cert_mode "$t/c400" x && fail "check-cert refuses a non-numeric threshold" || pass "check-cert refuses a non-numeric threshold"
 
 echo
 if [ "$fails" -ne 0 ]; then echo "$fails test(s) failed"; exit 1; fi

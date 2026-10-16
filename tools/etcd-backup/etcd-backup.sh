@@ -9,8 +9,11 @@
 #
 # MODE=backup (the default), one run:
 #   1. find the cluster's control-plane Machines and their IPv4 InternalIPs
-#   2. use the first member that passes a linearizable health check -- a member
-#      cut off from quorum would still hand over a snapshot, of stale data
+#   2. use the first member that answers a linearizable read -- a member cut
+#      off from quorum would still hand over a snapshot, of stale data. A read,
+#      not `endpoint health`: that also fails on any alarm, and under NOSPACE,
+#      exactly when a fresh snapshot is wanted before compacting, it would
+#      refuse a member that can serve one perfectly well
 #   3. snapshot it and verify the snapshot (etcdutl status, size floor, keys)
 #   4. encrypt it to the age recipients, write it, and only then
 #   5. prune old snapshots of this cluster, after checking the plan is sane
@@ -39,6 +42,11 @@ KEEP_DAILY=${KEEP_DAILY:-14}
 MIN_BYTES=${MIN_BYTES:-1048576}
 CERT_WARN_DAYS=${CERT_WARN_DAYS:-30}
 KUBE_API=${KUBE_API:-https://kubernetes.default.svc}
+# Separate on purpose: --command-timeout bounds the whole snapshot stream, so a
+# value short enough to give up quickly on a dead address would cap the size of
+# database that can be backed up.
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-5s}
+SNAPSHOT_TIMEOUT=${SNAPSHOT_TIMEOUT:-600s}
 SA_DIR=${SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
@@ -145,9 +153,13 @@ control_plane_endpoints() {
 }
 
 etcdctl_() {
-	etcdctl --dial-timeout=3s --command-timeout=60s \
+	etcdctl --dial-timeout=3s \
 		--cacert "$CERT_DIR/ca.crt" --cert "$CERT_DIR/tls.crt" --key "$CERT_DIR/tls.key" "$@"
 }
+
+# errors_of FILE -> etcdctl's stderr on one line. Its last line is a generic
+# "Error: ..." and the cause is on the first, so keep all of it.
+errors_of() { tr '\n' ' ' <"$1"; }
 
 check_cert() {
 	is_count "$CERT_WARN_DAYS" || die "CERT_WARN_DAYS must be a whole number, got '$CERT_WARN_DAYS'"
@@ -176,26 +188,34 @@ backup() {
 	trap 'rm -f "$plain" "$plain.part" "$partial" "$WORK_DIR/auth" "$WORK_DIR/err"' EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
-	# Leftovers of a run that was SIGKILLed. Runs never overlap (Forbid).
-	rm -f "$BACKUP_DIR"/.partial-"$CLUSTER_NAME"-*
+	# Leftovers of a run that was SIGKILLed: this cluster's partials only,
+	# matched as strictly as pruning matches -- a glob on the name would also
+	# take a cluster whose name merely starts with this one's.
+	for f in "$BACKUP_DIR"/.partial-*; do
+		[ -e "$f" ] || continue
+		b=${f##*/}
+		if is_snapshot_of "$CLUSTER_NAME" "${b#.partial-}"; then rm -f -- "$f"; fi
+	done
 
 	endpoints=$(control_plane_endpoints)
 	[ -n "$endpoints" ] || die "no control-plane InternalIPs found for $CLUSTER_NAMESPACE/$CLUSTER_NAME"
 
 	saved=""
 	for ep in $endpoints; do
-		if ! etcdctl_ --endpoints "$ep" endpoint health >/dev/null 2>"$WORK_DIR/err"; then
-			log "skipping $ep: $(tail -n 1 "$WORK_DIR/err")"
+		if ! etcdctl_ --command-timeout="$HEALTH_TIMEOUT" --endpoints "$ep" \
+			get --consistency=l --keys-only --limit=1 "" --from-key >/dev/null 2>"$WORK_DIR/err"; then
+			log "skipping $ep: $(errors_of "$WORK_DIR/err")"
 			continue
 		fi
 		rm -f "$plain" "$plain.part"
-		if etcdctl_ --endpoints "$ep" snapshot save "$plain" >/dev/null 2>"$WORK_DIR/err"; then
+		if etcdctl_ --command-timeout="$SNAPSHOT_TIMEOUT" --endpoints "$ep" \
+			snapshot save "$plain" >/dev/null 2>"$WORK_DIR/err"; then
 			saved=$ep
 			break
 		fi
-		log "snapshot from $ep failed: $(tail -n 1 "$WORK_DIR/err")"
+		log "snapshot from $ep failed: $(errors_of "$WORK_DIR/err")"
 	done
-	[ -n "$saved" ] || die "no healthy etcd member of $CLUSTER_NAME produced a snapshot"
+	[ -n "$saved" ] || die "no etcd member of $CLUSTER_NAME answered a linearizable read and produced a snapshot"
 
 	status=$(etcdutl snapshot status "$plain" -w json) || die "etcdutl could not read the snapshot from $saved"
 	keys=$(printf '%s' "$status" | jq -r '.totalKey') || die "unreadable etcdutl status"

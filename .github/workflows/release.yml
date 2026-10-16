@@ -54,6 +54,11 @@ jobs:
       - name: Unit tests
         run: make test
 
+      # The etcd-backup image is published too, and it is the tool that
+      # deletes backups: its tests gate publishing like the manager's.
+      - name: etcd-backup tests
+        run: make test-etcd-backup
+
   publish:
     name: Build and publish
     needs: verify
@@ -94,15 +99,6 @@ jobs:
       - name: Push image
         run: make docker-push IMG='${{ steps.img.outputs.image }}'
 
-      # Same tag as the manager image, under a sibling name, so one merge sha
-      # names both.
-      - name: Build and push the etcd-backup image
-        run: |
-          img='${{ steps.img.outputs.image }}'
-          backup="${img%:*}-etcd-backup:${img##*:}"
-          make docker-build-etcd-backup docker-push-etcd-backup ETCD_BACKUP_IMG="$backup"
-          echo "Published $backup"
-
       # The release manifest must reference the image just published, not the
       # placeholder in config/manager. release-manifests takes IMG for this.
       - name: Build clusterctl release manifests
@@ -127,3 +123,16 @@ jobs:
             out/metadata.yaml \
             --title '${{ github.ref_name }}' \
             --generate-notes
+
+      # Same tag as the manager image, under a sibling name, so one merge sha
+      # names both. Last, so a base-image or package-mirror failure here cannot
+      # block the provider's own image, manifests or release.
+      - name: Build and push the etcd-backup image
+        run: |
+          img='${{ steps.img.outputs.image }}'
+          backup="${img%:*}-etcd-backup:${img##*:}"
+          make docker-build-etcd-backup
+          docker run --rm --entrypoint sh -v "$PWD/tools/etcd-backup:/t:ro" etcd-backup:dev /t/etcd-backup_test.sh
+          docker tag etcd-backup:dev "$backup"
+          make docker-push-etcd-backup ETCD_BACKUP_IMG="$backup"
+          echo "Published $backup"

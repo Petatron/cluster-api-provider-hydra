@@ -79,7 +79,8 @@ make lint-fix             # after editing any *.go
 make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
-Full local loop before opening a PR: `make manifests generate lint test build`.
+Full local loop before opening a PR: `make manifests generate lint test build`, plus
+`make test-etcd-backup` when `tools/etcd-backup/` changed.
 
 **Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
 it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
@@ -96,6 +97,14 @@ CI on every PR: `lint`, `test`, `verify`. `test-e2e` runs on `main` and manual d
 publishes to ghcr on `main` and cuts a GitHub Release on `v*` tags.
 
 ## Repo-specific traps
+
+**`tools/etcd-backup/` is not part of the provider (PET-23).** It is a separate image, published
+beside the manager's, that backs up a workload cluster's etcd *from the management cluster*. It
+shares this repository's build and release only. It is the one thing here that **deletes files**
+(old snapshots), so its pruning sits behind an independent guard and is mutation-checked: run
+`make test-etcd-backup` (POSIX `sh`, needs `jq` and `openssl`) after any change, and keep the tests
+able to catch a planner that would delete the new backup or another cluster's files. The
+manifests that run it live in hydra-gitops, `clusters/<cluster>/management-cluster/`.
 
 **The backend ConfigMap is yours, not the kustomization's (PET-45).** `libvirt-config` holds
 site-specific values — a hypervisor address, a storage pool, a base image. `config/manager` ships
