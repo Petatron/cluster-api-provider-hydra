@@ -94,6 +94,15 @@ jobs:
       - name: Push image
         run: make docker-push IMG='${{ steps.img.outputs.image }}'
 
+      # Same tag as the manager image, under a sibling name, so one merge sha
+      # names both.
+      - name: Build and push the etcd-backup image
+        run: |
+          img='${{ steps.img.outputs.image }}'
+          backup="${img%:*}-etcd-backup:${img##*:}"
+          make docker-build-etcd-backup docker-push-etcd-backup ETCD_BACKUP_IMG="$backup"
+          echo "Published $backup"
+
       # The release manifest must reference the image just published, not the
       # placeholder in config/manager. release-manifests takes IMG for this.
       - name: Build clusterctl release manifests
