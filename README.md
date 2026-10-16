@@ -288,7 +288,11 @@ settings matter:
 
 How long a guest takes to stop is set inside it, by the kubelet's graceful node shutdown. The
 example control plane sets `shutdownGracePeriod: 60s` (PET-69), so `SHUTDOWN_TIMEOUT` must be longer
-than that plus a margin for the OS: 90s or more. Guests are stopped `PARALLEL_SHUTDOWN` at a time,
+than that plus a margin for the OS: 90s or more. The kubelet only enforces the grace period if
+systemd-logind allows a delay lock that long. On Ubuntu, the `unattended-upgrades` package caps
+`InhibitDelayMaxSec` at 30s through a logind drop-in that overrides the kubelet's own, so the example
+also ships a drop-in that sorts after it. Without that, the kubelet logs `Failed to start node
+shutdown manager` and the node shuts down as if no grace period were set. Guests are stopped `PARALLEL_SHUTDOWN` at a time,
 so with more guests than that the budget must cover every batch. Without graceful node shutdown the
 kubelet does not stop pods in order, and a control-plane machine takes systemd's full 90s stop
 timeout: etcd and kube-apiserver are signalled together, and the apiserver, left talking to a dead
