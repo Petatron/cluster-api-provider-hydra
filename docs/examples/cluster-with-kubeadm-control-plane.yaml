@@ -153,6 +153,30 @@ spec:
           net.bridge.bridge-nf-call-iptables  = 1
           net.bridge.bridge-nf-call-ip6tables = 1
           net.ipv4.ip_forward                 = 1
+      # Kubelet graceful node shutdown (PET-69). kubeadm leaves both periods at
+      # 0s, and then nothing stops pods in order: on a VM shutdown systemd
+      # SIGTERMs every container scope at once and stops containerd 0.1s later.
+      # etcd and kube-apiserver are signalled in the same millisecond, the
+      # apiserver's graceful termination runs against a dead etcd and does not
+      # finish, and systemd SIGKILLs it at its 90s stop timeout -- 90s of the
+      # host's libvirt-guests budget, on every control-plane machine.
+      #
+      # With a grace period the kubelet holds a logind delay lock, stops pods
+      # through the CRI while containerd is still up, and SIGKILLs what is left:
+      # regular pods get 60s-30s=30s, then critical pods (etcd and the static
+      # control plane) get 30s -- twice the slowest etcd stop measured (15s).
+      # A machine stops within about 60s. The hypervisor's shutdown timeout
+      # must exceed shutdownGracePeriod; see the README.
+      #
+      # KCP has no kubelet configuration field, so this is a kubeadm patch;
+      # patches.directory below must name this file's directory in both
+      # initConfiguration and joinConfiguration.
+      - path: /etc/kubeadm/patches/kubeletconfiguration0+merge.yaml
+        owner: root:root
+        permissions: "0644"
+        content: |
+          shutdownGracePeriod: 60s
+          shutdownGracePeriodCriticalPods: 30s
       - path: /etc/kubernetes/manifests/kube-vip.yaml
         owner: root:root
         permissions: "0644"
@@ -219,9 +243,13 @@ spec:
     initConfiguration:
       nodeRegistration:
         criSocket: unix:///run/containerd/containerd.sock
+      patches:
+        directory: /etc/kubeadm/patches
     joinConfiguration:
       nodeRegistration:
         criSocket: unix:///run/containerd/containerd.sock
+      patches:
+        directory: /etc/kubeadm/patches
     preKubeadmCommands:
       # The guest derives its own providerID from the SMBIOS UUID libvirt
       # published as the domain UUID. Quoting matters: a mangled format string
