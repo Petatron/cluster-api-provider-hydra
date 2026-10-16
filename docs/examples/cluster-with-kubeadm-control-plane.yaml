@@ -177,6 +177,25 @@ spec:
         content: |
           shutdownGracePeriod: 60s
           shutdownGracePeriodCriticalPods: 30s
+      # The kubelet only holds that lock if logind lets a delay lock last as
+      # long as shutdownGracePeriod. It writes 99-kubelet.conf to raise
+      # InhibitDelayMaxSec and reloads logind, but logind applies drop-ins in
+      # filename order across /etc and /usr/lib, and Ubuntu's unattended-upgrades
+      # ships /usr/lib/systemd/logind.conf.d/unattended-upgrades-logind-maxdelay.conf
+      # (InhibitDelayMaxSec=30), which sorts later and wins. The kubelet then
+      # logs "Failed to start node shutdown manager" and shutdown is no more
+      # graceful than with 0s -- the first roll with only the patch above did
+      # exactly that. The zz- prefix sorts after both; keep the value at least
+      # shutdownGracePeriod. Check on a node with:
+      #   busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+      #     org.freedesktop.login1.Manager InhibitDelayMaxUSec
+      # and look for a kubelet "shutdown" delay lock in `systemd-inhibit --list`.
+      - path: /etc/systemd/logind.conf.d/zz-hydra-graceful-shutdown.conf
+        owner: root:root
+        permissions: "0644"
+        content: |
+          [Login]
+          InhibitDelayMaxSec=60
       - path: /etc/kubernetes/manifests/kube-vip.yaml
         owner: root:root
         permissions: "0644"
