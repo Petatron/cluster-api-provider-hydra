@@ -286,6 +286,14 @@ settings matter:
   `SHUTDOWN_TIMEOUT` longer than a guest takes to stop is the clean choice. A guest still running when
   the timeout expires is destroyed.
 
+How long a guest takes to stop is set inside it, by the kubelet's graceful node shutdown. The
+example control plane sets `shutdownGracePeriod: 60s` (PET-69), so `SHUTDOWN_TIMEOUT` must be longer
+than that plus a margin for the OS: 90s or more. Guests are stopped `PARALLEL_SHUTDOWN` at a time,
+so with more guests than that the budget must cover every batch. Without graceful node shutdown the
+kubelet does not stop pods in order, and a control-plane machine takes systemd's full 90s stop
+timeout: etcd and kube-apiserver are signalled together, and the apiserver, left talking to a dead
+etcd, is killed only when the timeout expires.
+
 ACPI applies only to machines defined by a provider that includes it. Machines that already existed
 keep their old definition until they are replaced, for example by a rollout. Autostart is set on
 every machine this provider creates or finishes creating, so a half-created machine left by an older
