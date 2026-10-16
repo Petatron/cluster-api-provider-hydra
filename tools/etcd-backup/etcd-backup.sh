@@ -29,6 +29,9 @@ set -eu
 # pipefail where the shell has it (busybox ash in the image does); dash, which
 # CI tests under, does not -- every pipeline that matters is checked explicitly.
 if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+# Everything this writes is private: the bearer token and the plaintext
+# snapshot in WORK_DIR, and the encrypted backups, which only root restores.
+umask 077
 
 MODE=${MODE:-backup}
 CLUSTER_NAME=${CLUSTER_NAME:-}

@@ -175,6 +175,8 @@ expect "a clean run keeps 5 newest + first-of-day for 2 days" "6" "$(count "$d")
 [ -e "$d/notes.txt" ] && pass "a clean run keeps the operator's file" || fail "a clean run keeps the operator's file"
 ls -1A "$d" | grep -q '^\.partial-' && fail "a clean run leaves no partial" || pass "a clean run leaves no partial"
 [ -z "$(ls -A "$t/work")" ] && pass "no plaintext left in WORK_DIR" || fail "no plaintext left in WORK_DIR"
+newfile=$(ls -1A "$d" | snapshots_of wl0 | awk '$0 "" > m "" { m = $0 } END { print m }')
+case $(ls -l "$d/$newfile" | cut -c1-10) in -rw-------) pass "the backup is written owner-only" ;; *) fail "the backup is written owner-only" ;; esac
 grep -q 'fd00' "$t/calls" && fail "skips IPv6 addresses" || pass "skips IPv6 addresses"
 grep -q '10.0.0.9' "$t/calls" && fail "skips a Machine being deleted" || pass "skips a Machine being deleted"
 
