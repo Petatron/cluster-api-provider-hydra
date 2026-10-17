@@ -59,6 +59,18 @@ jobs:
       - name: Build manager binary
         run: make build
 
+      # The runner's sh is dash, a stricter POSIX shell than a laptop's, which
+      # is the point: the image runs the script under busybox ash.
+      - name: Test the etcd-backup tool
+        run: make test-etcd-backup
+
+      - name: Build the etcd-backup image
+        run: make docker-build-etcd-backup
+
+      # Again inside the image itself: busybox ash is the shell it runs under.
+      - name: Test the etcd-backup tool in its image
+        run: docker run --rm --entrypoint sh -v "$PWD/tools/etcd-backup:/t:ro" etcd-backup:dev /t/etcd-backup_test.sh
+
       - name: Build clusterctl release manifests
         run: make release-manifests
 

@@ -167,6 +167,22 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+# The etcd-backup tool (PET-23) runs in the management cluster, beside the
+# provider rather than inside it, and ships as its own image.
+ETCD_BACKUP_IMG ?= etcd-backup:dev
+
+.PHONY: test-etcd-backup
+test-etcd-backup: ## Test the etcd-backup tool's naming and pruning logic.
+	sh tools/etcd-backup/etcd-backup_test.sh
+
+.PHONY: docker-build-etcd-backup
+docker-build-etcd-backup: ## Build the etcd-backup image.
+	$(CONTAINER_TOOL) build -t ${ETCD_BACKUP_IMG} tools/etcd-backup
+
+.PHONY: docker-push-etcd-backup
+docker-push-etcd-backup: ## Push the etcd-backup image.
+	$(CONTAINER_TOOL) push ${ETCD_BACKUP_IMG}
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
