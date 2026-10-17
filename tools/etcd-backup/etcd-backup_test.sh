@@ -216,6 +216,25 @@ run_backup "$d" >/dev/null
 [ -e "$d/.partial-wl0-prod-20200101T000000Z.db.age" ] && pass "leaves a prefix-sharing cluster's partial" ||
 	fail "leaves a prefix-sharing cluster's partial"
 
+# A run in progress holds the lock: a second run does nothing at all.
+d="$t/b5"; seed "$d"; mkdir "$d/.lock-wl0"
+if run_backup "$d"; then fail "refuses to run while another holds the lock"; else pass "refuses to run while another holds the lock"; fi
+expect "writes and deletes nothing while locked out" "8" "$(count "$d")"
+[ -d "$d/.lock-wl0" ] && pass "leaves the other run's lock in place" || fail "leaves the other run's lock in place"
+
+# A lock left by a killed run is broken once stale, and released after the run.
+d="$t/b6"; seed "$d"; mkdir "$d/.lock-wl0"; touch -t 202001010000 "$d/.lock-wl0"
+run_backup "$d" && pass "breaks a stale lock" || { fail "breaks a stale lock"; cat "$t/log"; }
+[ -e "$d/.lock-wl0" ] && fail "releases the lock after a run" || pass "releases the lock after a run"
+
+# A failed run releases its lock too.
+d="$t/b7"; seed "$d"
+run_backup "$d" ETCDUTL_FAIL=1
+[ -e "$d/.lock-wl0" ] && fail "releases the lock after a failed run" || pass "releases the lock after a failed run"
+
+# The lock is never mistaken for a snapshot, nor pruned.
+is_snapshot_of wl0 ".lock-wl0" && fail "the lock is not a snapshot" || pass "the lock is not a snapshot"
+
 # --- MODE=check-cert, with real certificates ---------------------------------------
 # cert DAYS DIR -> a self-signed certificate valid for DAYS, at DIR/tls.crt.
 cert() {

@@ -49,6 +49,9 @@ KUBE_API=${KUBE_API:-https://kubernetes.default.svc}
 # value short enough to give up quickly on a dead address would cap the size of
 # database that can be backed up.
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-5s}
+# A lock older than this is taken to be left by a killed run and broken. Keep it
+# well above the Job's activeDeadlineSeconds.
+LOCK_STALE_MINUTES=${LOCK_STALE_MINUTES:-60}
 SNAPSHOT_TIMEOUT=${SNAPSHOT_TIMEOUT:-600s}
 SA_DIR=${SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}
 
@@ -179,6 +182,7 @@ backup() {
 	is_count "$KEEP_HOURLY" && [ "$KEEP_HOURLY" -ge 1 ] || die "KEEP_HOURLY must be a whole number >= 1"
 	is_count "$KEEP_DAILY" || die "KEEP_DAILY must be a whole number >= 0"
 	is_count "$MIN_BYTES" || die "MIN_BYTES must be a whole number"
+	is_count "$LOCK_STALE_MINUTES" && [ "$LOCK_STALE_MINUTES" -ge 1 ] || die "LOCK_STALE_MINUTES must be a whole number >= 1"
 	[ -s "$AGE_RECIPIENTS_FILE" ] || die "no age recipients at $AGE_RECIPIENTS_FILE; refusing to write an unencrypted backup"
 	[ -d "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ] || die "backup directory $BACKUP_DIR is missing or not writable"
 
@@ -186,11 +190,29 @@ backup() {
 	name=$(snapshot_name "$CLUSTER_NAME" "$stamp")
 	plain="$WORK_DIR/snapshot.db"
 	partial="$BACKUP_DIR/.partial-$name"
+	lock="$BACKUP_DIR/.lock-$CLUSTER_NAME"
+	locked=0
 	# A trapped signal must still end the run: in sh the trap runs and the
-	# script carries on, so INT and TERM exit explicitly, and EXIT cleans up.
-	trap 'rm -f "$plain" "$plain.part" "$partial" "$WORK_DIR/auth" "$WORK_DIR/err"' EXIT
+	# script carries on, so INT and TERM exit explicitly, and EXIT cleans up --
+	# the lock only if this run took it.
+	trap 'rm -f "$plain" "$plain.part" "$partial" "$WORK_DIR/auth" "$WORK_DIR/err"; [ "$locked" = 0 ] || rmdir "$lock" 2>/dev/null' EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
+
+	# One run per cluster per BACKUP_DIR. The CronJob forbids overlap, but a Job
+	# made by hand from it (the runbook's first run) does not, and two runs
+	# would remove each other's in-flight partial. mkdir is atomic. A lock left
+	# by a SIGKILLed run is broken once it is LOCK_STALE_MINUTES old.
+	if ! mkdir "$lock" 2>/dev/null; then
+		if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]; then
+			log "breaking a lock older than $LOCK_STALE_MINUTES minutes, left by a run that did not finish"
+			rmdir "$lock" 2>/dev/null || true
+			mkdir "$lock" 2>/dev/null || die "another backup of $CLUSTER_NAME took the lock first"
+		else
+			die "another backup of $CLUSTER_NAME is running (lock $lock); nothing done"
+		fi
+	fi
+	locked=1
 	# Leftovers of a run that was SIGKILLed: this cluster's partials only,
 	# matched as strictly as pruning matches -- a glob on the name would also
 	# take a cluster whose name merely starts with this one's.
