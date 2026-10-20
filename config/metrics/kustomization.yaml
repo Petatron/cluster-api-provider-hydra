@@ -1,0 +1,5 @@
+# Not part of config/default and not in the release manifest: it configures a
+# kube-state-metrics deployment the operator runs, which this provider does not
+# ship. crd-metrics-config.yaml is data for that deployment, not a resource.
+resources:
+- crd-clusterrole.yaml

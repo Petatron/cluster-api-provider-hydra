@@ -6,6 +6,9 @@ The manager serves Prometheus metrics on `:8443` over HTTPS, protected by
 a ServiceMonitor for a Prometheus Operator install; nothing here depends on one
 being present.
 
+[alerts.md](alerts.md) describes the alerts shipped in `config/prometheus/alerts.yaml`,
+which are built on these metrics and on kube-state-metrics.
+
 Everything below is in addition to what controller-runtime already publishes.
 Read those first: `controller_runtime_reconcile_total`,
 `controller_runtime_reconcile_time_seconds` and
