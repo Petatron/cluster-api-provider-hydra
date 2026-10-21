@@ -357,9 +357,18 @@ func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, contex
 // waiting; either way the next call dials afresh. The abandoned attempt's TCP
 // or TLS connect may still finish in the background, bounded by DialTimeout,
 // and its socket is closed on arrival.
+//
+// Connected means go-libvirt says so, the socket it was given is alive, and no
+// reconnect is under way. go-libvirt can report a dead socket as connected for
+// good (PET-67), and trusting IsConnected alone would then fail every call until
+// a restart. And while a reconnect recovers from that, IsConnected still says
+// true and the new socket is already alive, so only p.dial shows the handshake
+// has not finished; a caller that skipped it would send RPCs before the
+// connection was open. p.dial is checked last: the order of the other two
+// checks is what callers observe.
 func (p *Provider) ensureConnected(ctx context.Context) error {
 	p.mu.Lock()
-	if p.lv.IsConnected() {
+	if p.lv.IsConnected() && !p.dialer.socketLost() && p.dial == nil {
 		p.mu.Unlock()
 		return nil
 	}
@@ -377,7 +386,7 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		// open for as long as reconciles keep coming.
 		limit := time.AfterFunc(p.attemptLimit(), func() { p.endAttempt(a) })
 		go func() {
-			err := p.lv.ConnectToURI(p.uri)
+			err := p.connectOnce()
 			// Housekeeping, not correctness: a limit that fires after this finds
 			// p.dial no longer a and does nothing. Stopping it just frees the timer.
 			limit.Stop()
@@ -409,6 +418,61 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		return nil
 	}
 }
+
+// connectOnce runs ConnectToURI once go-libvirt has finished with the previous
+// socket, retrying while it still counts that socket as open.
+//
+// socketLost lets a reconnect start as soon as the old socket dies, which can be
+// before go-libvirt's own cleanup of it (waitAndDisconnect) has run. A reconnect
+// that overlapped that cleanup could have its handshake's callbacks dropped, or
+// its new disconnected channel closed under it. Before PET-67 a reconnect began
+// only once IsConnected had gone false, which happens at the end of that
+// cleanup; so wait for that first, briefly. In the wedge PET-67 fixes,
+// IsConnected never goes false and the wait simply runs out.
+//
+// A socket this provider detached is marked dead at once but closed in the
+// background (closeDetached), and go-libvirt's socket layer counts it connected
+// until its reader sees the close. ConnectToURI refuses to dial over it in that
+// moment -- before it calls the dialer, so abandoning the attempt does not end
+// the refusal the way it ends a dial. The loop checks for abandonment itself:
+// it stops when the last caller gives up or the attempt's limit runs out
+// (endAttempt), so it never holds the attempt longer than a dial would. A
+// refusal that never clears -- an old socket go-libvirt never finishes with --
+// therefore costs each attempt its full limit; it used to fail at once, but the
+// provider was wedged either way.
+func (p *Provider) connectOnce() error {
+	for wait := time.Now().Add(goLibvirtCleanupWait); p.lv.IsConnected() && time.Now().Before(wait); {
+		time.Sleep(goLibvirtCleanupPoll)
+	}
+	for {
+		err := p.lv.ConnectToURI(p.uri)
+		if err == nil || err.Error() != errSocketStillOpen {
+			return err
+		}
+		if p.dialer.attemptAbandoned() {
+			return fmt.Errorf("%w while the previous socket was still closing", errDialAbandoned)
+		}
+		time.Sleep(socketStillOpenRetry)
+	}
+}
+
+// goLibvirtCleanupWait bounds the wait for go-libvirt to finish with a dead
+// socket. Its cleanup is a few map operations, so this only ever runs out in the
+// wedge, where the cleanup already returned without reporting anything.
+const (
+	goLibvirtCleanupWait = 50 * time.Millisecond
+	goLibvirtCleanupPoll = 2 * time.Millisecond
+)
+
+// errSocketStillOpen is go-libvirt's socket.Connect refusing to dial while its
+// previous socket is still marked connected. It is an unexported errors.New, so
+// it can only be recognised by its text; TestSocketStillOpenMatchesGoLibvirt pins
+// it to the go-libvirt this module builds against.
+const errSocketStillOpen = "already connected to socket"
+
+// socketStillOpenRetry is how long connectOnce waits before trying again. The
+// close it waits for is already under way, so this is short.
+const socketStillOpenRetry = 20 * time.Millisecond
 
 // attemptLimit bounds one reconnect the way New bounds the first connect: the
 // dial gets DialTimeout, and the handshake after it gets RPCTimeout.
@@ -448,12 +512,13 @@ func (p *Provider) attemptLimit() time.Duration {
 // succeeded, and their next RPC fails on the closed socket -- one failed call,
 // then a redial.
 //
-// That close can cost more than a redial, through no fault of this code (PET-67).
-// go-libvirt's ConnectToURI replaces its disconnected channel only after the
-// handshake succeeds, so a socket closed between those two statements -- by
-// this, by recycle, or by the daemon -- is a disconnect it never reports.
-// IsConnected then stays true and the provider is wedged until restart. The
-// window predates abandonment, and abandonment does not widen it.
+// go-libvirt never reports that close (PET-67). Its ConnectToURI replaces its
+// disconnected channel only after the handshake succeeds, so a socket closed
+// between those two statements -- by this, by recycle, or by the daemon -- is a
+// disconnect it never reports, and IsConnected stays true. Detaching marks the
+// socket dead in trackingDialer, and ensureConnected checks that as well as
+// IsConnected, so the next call redials instead of failing on the dead socket
+// until a restart.
 func (p *Provider) abandonDial(a *dialAttempt) {
 	p.mu.Lock()
 	a.waiters--

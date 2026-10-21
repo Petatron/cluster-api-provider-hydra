@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/digitalocean/go-libvirt/socket"
@@ -63,6 +64,10 @@ type trackingDialer struct {
 
 	mu   sync.Mutex
 	conn net.Conn
+	// last is the socket most recently handed to go-libvirt. Unlike conn it is
+	// not cleared when the socket is detached: it is what socketLost asks about
+	// (PET-67).
+	last *trackedConn
 	// abandoned is set when the current attempt is abandoned, and cleared when
 	// the next attempt begins. abandonedCh is closed at the same
 	// moment, to release a Dial waiting on the inner dial.
@@ -89,9 +94,48 @@ func (d *trackingDialer) beginAttempt() net.Conn {
 		d.abandoned = false
 		d.abandonedCh = make(chan struct{})
 	}
+	return d.detachLocked()
+}
+
+// detachLocked detaches the current socket for the caller to close, and marks
+// it dead now rather than when that close lands: the close runs in the
+// background, and until it does nothing else would tell socketLost. d.mu must
+// be held.
+func (d *trackingDialer) detachLocked() net.Conn {
 	c := d.conn
 	d.conn = nil
+	if tc, ok := c.(*trackedConn); ok {
+		tc.markDead()
+	}
 	return c
+}
+
+// attemptAbandoned reports whether the current attempt has been abandoned. A nil
+// dialer has no attempts to abandon.
+func (d *trackingDialer) attemptAbandoned() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.abandoned
+}
+
+// socketLost reports whether the socket go-libvirt was last given is dead: its
+// reader has seen the error go-libvirt's own listen loop stops on, or it was
+// closed or detached. go-libvirt does not always report that itself (PET-67), so
+// ensureConnected asks this as well as IsConnected.
+//
+// A dialer that has handed out no socket has nothing to report, and neither
+// does a nil one; both say false, leaving IsConnected the only signal.
+func (d *trackingDialer) socketLost() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	last := d.last
+	d.mu.Unlock()
+	return last != nil && last.isDead()
 }
 
 // abandonAttempt records that the current attempt has been given up on, and
@@ -108,9 +152,7 @@ func (d *trackingDialer) abandonAttempt() net.Conn {
 		d.abandoned = true
 		close(d.abandonedCh)
 	}
-	c := d.conn
-	d.conn = nil
-	return c
+	return d.detachLocked()
 }
 
 // Dial implements socket.Dialer, bounded so a stalled peer cannot block the
@@ -175,9 +217,10 @@ func (d *trackingDialer) Dial() (net.Conn, error) {
 			closeDetached(r.conn)
 			return nil, errDialAbandoned
 		}
-		d.conn = r.conn
+		tc := &trackedConn{Conn: r.conn}
+		d.conn, d.last = tc, tc
 		d.mu.Unlock()
-		return r.conn, nil
+		return tc, nil
 	case <-abandonedCh:
 		closeOnArrival()
 		return nil, errDialAbandoned
@@ -197,11 +240,52 @@ const defaultDialTimeout = 30 * time.Second
 // that is deliberately ignored.
 func (d *trackingDialer) forceClose() {
 	d.mu.Lock()
-	c := d.conn
-	d.conn = nil
+	c := d.detachLocked()
 	d.mu.Unlock()
 
 	if c != nil {
 		_ = c.Close()
 	}
+}
+
+// trackedConn is the socket handed to go-libvirt, recording when it dies the way
+// go-libvirt's own listen loop decides it has: a read error that is not
+// temporary, or a close (PET-67). go-libvirt's socket layer knows the same thing
+// but does not expose it, and its Libvirt can miss it entirely.
+type trackedConn struct {
+	net.Conn
+	dead atomic.Bool
+}
+
+func (c *trackedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err != nil && !temporaryReadError(err) {
+		c.dead.Store(true)
+	}
+	return n, err
+}
+
+func (c *trackedConn) Close() error {
+	c.dead.Store(true)
+	return c.Conn.Close()
+}
+
+func (c *trackedConn) markDead()    { c.dead.Store(true) }
+func (c *trackedConn) isDead() bool { return c.dead.Load() }
+
+// temporaryReadError mirrors go-libvirt's socket.isTemporary, the test its listen
+// loop applies to decide whether a read error ends the connection, so trackedConn
+// calls a socket dead whenever go-libvirt's reader would stop -- and possibly a
+// little earlier: that loop skips a failed header or payload read and stops only
+// at the next length read, which fails the same way on a closed socket, and
+// detaching marks a socket dead before its close lands. Earlier is safe; it
+// only starts the reconnect sooner (see connectOnce).
+//
+// A plain type assertion, not errors.As, because that is what go-libvirt uses.
+func temporaryReadError(err error) bool {
+	opErr, ok := err.(*net.OpError) //nolint:errorlint // must match go-libvirt's assertion exactly
+	if ok {
+		return opErr.Temporary() //nolint:staticcheck // the deprecated check go-libvirt itself applies
+	}
+	return false
 }
