@@ -80,7 +80,8 @@ make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
 Full local loop before opening a PR: `make manifests generate lint test build`, plus
-`make test-etcd-backup` when `tools/etcd-backup/` changed.
+`make test-etcd-backup` when `tools/etcd-backup/` changed, and `make test-alerts` when
+`config/prometheus/` or `config/metrics/` changed.
 
 **Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
 it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
@@ -105,6 +106,14 @@ shares this repository's build and release only. It is the one thing here that *
 `make test-etcd-backup` (POSIX `sh`, needs `jq` and `openssl`) after any change, and keep the tests
 able to catch a planner that would delete the new backup or another cluster's files. The
 manifests that run it live in hydra-gitops, `clusters/<cluster>/management-cluster/`.
+
+**Alerts ship as config, not in the release manifest (PET-64).** `config/prometheus/alerts.yaml`
+is a `PrometheusRule` over the provider's metrics and kube-state-metrics' Cluster API series;
+`config/metrics/` is this provider's kube-state-metrics custom-resource-state config in Cluster
+API's own shape (`capi_hydramachine_*`). Every alert must have a promtool case in
+`alerts_test.yaml` that fires it and a section in `docs/alerts.md`; `make test` enforces both and
+`make test-alerts` runs promtool. promtool compares annotations in full, so the unit tests run on a
+copy with annotations stripped. Do not "fix" a failing case by restating the prose.
 
 **The backend ConfigMap is yours, not the kustomization's (PET-45).** `libvirt-config` holds
 site-specific values — a hypervisor address, a storage pool, a base image. `config/manager` ships

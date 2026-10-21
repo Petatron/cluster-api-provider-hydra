@@ -1,0 +1,310 @@
+# Alerts for clusters built with this provider. docs/alerts.md says what each
+# one means and what to do about it.
+#
+# Inputs, all read on the management cluster:
+#   - this provider's own metrics (the ServiceMonitor in monitor.yaml);
+#   - kube-state-metrics loaded with Cluster API's custom-resource-state config
+#     (capi_cluster_*, capi_machine_*, capi_kubeadmcontrolplane_*) and this
+#     provider's (config/metrics: capi_hydracluster_*, capi_hydramachine_*).
+#
+# Rules over Cluster API objects only look at clusters whose infrastructure is
+# a HydraCluster, and at machines whose infrastructure is a HydraMachine, so
+# the file is safe on a management cluster shared with other providers.
+#
+# A control plane, or a machine, in its first hour or half hour is still being
+# built: it is Ready on nothing and has no quorum yet, which is not an outage.
+# The control-plane and machine-readiness rules leave such objects out; one
+# that is still not there after that is reported.
+#
+# Every alert is named Hydra*, which is what an Alertmanager route can match on.
+# The unit tests are alerts_test.yaml; run them with `make test-alerts`.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    app.kubernetes.io/name: cluster-api-provider-hydra
+    app.kubernetes.io/managed-by: kustomize
+  name: alerts
+  namespace: system
+spec:
+  groups:
+  - name: hydra-provider
+    rules:
+    - alert: HydraProviderDown
+      expr: absent(up{job="cluster-api-provider-hydra-controller-manager-metrics-service"} == 1)
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: The Hydra provider is not running, or Prometheus cannot scrape it
+        description: >-
+          No Hydra provider metrics endpoint has answered for 5 minutes. While the
+          manager is down nothing creates, repairs or deletes Hydra machines, and
+          every other Hydra* alert built on its metrics is blind.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraproviderdown
+    - alert: HydraBackendUnreachable
+      expr: |
+        sum by (job) (increase(hydra_provider_operation_duration_seconds_count{outcome="error"}[15m])) > 0
+        unless on (job)
+        sum by (job) (increase(hydra_provider_operation_duration_seconds_count{outcome!="error"}[15m])) > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Every call the Hydra provider made to its hypervisor in 15 minutes failed
+        description: >-
+          The provider reaches its backend at least every 5 minutes per machine,
+          and for the last 15 minutes every call ended in a connection error
+          with no call getting through. The hypervisor is down, unreachable from
+          the management cluster, or refusing the provider's credentials.
+          Running VMs may be fine; nothing can be created, repaired or deleted.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydrabackendunreachable
+    - alert: HydraProviderReconcileErrors
+      expr: |
+        sum by (job, controller) (rate(controller_runtime_reconcile_errors_total{job="cluster-api-provider-hydra-controller-manager-metrics-service"}[15m])) > 0
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: The Hydra {{ $labels.controller }} controller has been failing reconciles for 30 minutes
+        description: >-
+          An occasional error is normal (an update conflict is retried at once).
+          Errors in every 15-minute window for half an hour are not. The
+          manager's log says which object and why.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraproviderreconcileerrors
+    - alert: HydraMachineTerminalFailure
+      # The counter's child is created by its first Inc(), so the first failure
+      # arrives as a new series already at 1, which increase() cannot see. The
+      # second clause catches a series that did not exist 15 minutes ago.
+      expr: |
+        sum by (job, stage) (increase(hydra_machine_failure_total{cause="terminal"}[15m])) > 0
+        or
+        sum by (job, stage) (
+          hydra_machine_failure_total{cause="terminal"}
+          unless hydra_machine_failure_total{cause="terminal"} offset 15m
+        )
+      labels:
+        severity: warning
+      annotations:
+        summary: A Hydra machine failed in a way that will not clear on its own ({{ $labels.stage }})
+        description: >-
+          The backend refused an operation and will refuse it again, so retries
+          cannot help: someone has to change something. The HydraMachine's
+          ProvisioningFailed condition, or the manager's log, names the cause.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydramachineterminalfailure
+  - name: hydra-infrastructure
+    rules:
+    - alert: HydraClusterInfrastructureFailed
+      expr: capi_hydracluster_status_condition{type="InfrastructureFailed",status="True"} == 1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: HydraCluster {{ $labels.namespace }}/{{ $labels.name }} needs an operator
+        description: >-
+          A cluster-scoped prerequisite is missing and will not appear by
+          itself, typically a storage pool that does not exist or a base image
+          missing from it. No new machine can be created in this cluster until
+          it is fixed.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraclusterinfrastructurefailed
+    - alert: HydraClusterNotReady
+      expr: capi_hydracluster_status_condition{type="Ready",status="True"} == 0
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: HydraCluster {{ $labels.namespace }}/{{ $labels.name }} has not been Ready for 15 minutes
+        description: >-
+          The cluster's infrastructure cannot take new machines right now. Its
+          Ready condition's message says why.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraclusternotready
+    - alert: HydraControlPlaneMachineNotReady
+      expr: |
+        (capi_hydramachine_status_condition{type="Ready",status="True"} == 0)
+        and on (namespace, name) capi_hydramachine_info{control_plane_name!=""}
+        unless on (namespace, name) (time() - capi_hydramachine_created < 1800)
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: Control-plane HydraMachine {{ $labels.namespace }}/{{ $labels.name }} has not been Ready for 10 minutes
+        description: >-
+          The VM behind a control-plane machine of cluster {{ $labels.cluster_name }}
+          is missing, stopped or unreachable. With etcd on every control-plane
+          machine, each one lost takes the cluster closer to losing quorum.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydramachinenotready
+    - alert: HydraMachineNotReady
+      expr: |
+        (capi_hydramachine_status_condition{type="Ready",status="True"} == 0)
+        unless on (namespace, name) capi_hydramachine_info{control_plane_name!=""}
+        unless on (namespace, name) (time() - capi_hydramachine_created < 1800)
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: HydraMachine {{ $labels.namespace }}/{{ $labels.name }} has not been Ready for 10 minutes
+        description: >-
+          The VM behind a worker machine of cluster {{ $labels.cluster_name }}
+          is missing, stopped or unreachable. Its Ready condition's message says
+          which.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydramachinenotready
+    - alert: HydraMachineProvisioningFailed
+      expr: capi_hydramachine_status_condition{type="ProvisioningFailed",status="True"} == 1
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: HydraMachine {{ $labels.namespace }}/{{ $labels.name }} failed to provision and will not retry into success
+        description: >-
+          The provider has given up on this machine. The condition's message
+          names the cause; delete the Machine once it is fixed and Cluster API
+          creates a replacement.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydramachineprovisioningfailed
+  - name: hydra-clusters
+    rules:
+    - alert: HydraClusterAPIUnreachable
+      expr: |
+        label_replace(capi_cluster_status_condition{type="RemoteConnectionProbe",status="False"} == 1, "cluster_name", "$1", "name", "(.+)")
+        and on (namespace, name) capi_cluster_info{infrastructure_reference_kind="HydraCluster"}
+      for: 3m
+      labels:
+        severity: critical
+      annotations:
+        summary: The management cluster cannot reach cluster {{ $labels.cluster_name }}'s API server
+        description: >-
+          Cluster API's connection probe to the workload cluster's API endpoint
+          has been failing for 3 minutes. Either the cluster's control plane
+          (or the address in front of it) is down, or the network between the
+          two clusters is. Until it recovers Cluster API cannot see the
+          cluster's nodes, so its other alerts for this cluster are unreliable.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraclusterapiunreachable
+    - alert: HydraClusterNotAvailable
+      expr: |
+        label_replace(capi_cluster_status_condition{type="Available",status="True"} == 0, "cluster_name", "$1", "name", "(.+)")
+        and on (namespace, name) capi_cluster_info{infrastructure_reference_kind="HydraCluster"}
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Cluster {{ $labels.cluster_name }} has not been Available for 15 minutes
+        description: >-
+          Cluster API's summary condition for the whole cluster. More specific
+          alerts usually fire first; this one catches whatever they miss. The
+          Cluster's Available condition message lists each reason.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraclusternotavailable
+    - alert: HydraControlPlaneNodeUnhealthy
+      expr: |
+        (
+          (capi_machine_status_condition{type="NodeHealthy",status="True"} == 0)
+          * on (namespace, name) group_left (node_name) capi_machine_status_noderef
+          unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
+        )
+        and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine",control_plane_name!=""}
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Control-plane node {{ $labels.node_name }} of cluster {{ $labels.cluster_name }} has been unhealthy for 5 minutes
+        description: >-
+          The node behind Machine {{ $labels.namespace }}/{{ $labels.name }} is
+          NotReady, unreachable, or its control-plane pods are failing. A
+          MachineHealthCheck, if there is one, may already be replacing it.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydranodeunhealthy
+    - alert: HydraNodeUnhealthy
+      expr: |
+        (
+          (capi_machine_status_condition{type="NodeHealthy",status="True"} == 0)
+          * on (namespace, name) group_left (node_name) capi_machine_status_noderef
+          unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
+        )
+        and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine",control_plane_name=""}
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: Node {{ $labels.node_name }} of cluster {{ $labels.cluster_name }} has been unhealthy for 5 minutes
+        description: >-
+          The node behind Machine {{ $labels.namespace }}/{{ $labels.name }} is
+          NotReady or unreachable. Its pods are being evicted or are stuck. If the
+          VM itself is gone, HydraMachineNotReady follows.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydranodeunhealthy
+    - alert: HydraNodeFlapping
+      # A VM that dies and is restarted keeps its node unhealthy for less than
+      # the 5 minutes HydraNodeUnhealthy waits: the provider starts a stopped
+      # domain at its next check, every 5 minutes. Counting transitions catches
+      # the loop; one outage and recovery is two.
+      expr: |
+        (
+          (changes(capi_machine_status_condition{type="NodeHealthy",status="True"}[30m]) >= 4)
+          * on (namespace, name) group_left (node_name) capi_machine_status_noderef
+          unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
+        )
+        and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine"}
+      labels:
+        severity: warning
+      annotations:
+        summary: Node {{ $labels.node_name }} of cluster {{ $labels.cluster_name }} keeps going unhealthy and back
+        description: >-
+          The node behind Machine {{ $labels.namespace }}/{{ $labels.name }} changed
+          health {{ $value | printf "%.0f" }} times in 30 minutes. Each episode is shorter
+          than HydraNodeUnhealthy waits, so that alert never fires: typically a VM
+          that crashes and is restarted by the provider, or a kubelet that keeps
+          failing.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydranodeflapping
+    - alert: HydraEtcdUnhealthy
+      expr: |
+        (capi_kubeadmcontrolplane_status_condition{type="EtcdClusterHealthy",status="True"} == 0)
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: etcd of cluster {{ $labels.cluster_name }} has been unhealthy for 5 minutes
+        description: >-
+          The control plane {{ $labels.namespace }}/{{ $labels.name }} reports
+          an etcd member down, unreachable or in alarm. Another failure may cost
+          quorum, after which the cluster's API stops accepting writes. Check
+          the backups before touching anything.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraetcdunhealthy
+    - alert: HydraControlPlaneUnavailable
+      # Cluster API's own judgement, not replica arithmetic: a KubeadmControlPlane
+      # is Available while an API server is healthy and, with stacked etcd, etcd
+      # has quorum. Counting Ready machines against the desired count cannot
+      # tell a lost quorum from a scale-up still in progress (1 of 3 Ready).
+      expr: |
+        (capi_kubeadmcontrolplane_status_condition{type="Available",status="True"} == 0)
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: The control plane of cluster {{ $labels.cluster_name }} is unavailable
+        description: >-
+          Cluster API reports the control plane {{ $labels.namespace }}/{{ $labels.name }}
+          not Available: no API server is healthy, or etcd has lost quorum. The
+          cluster's API is down or read-only. Do not delete control-plane
+          machines to "fix" it; that makes recovery harder. The
+          KubeadmControlPlane's Available condition message says which.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydracontrolplaneunavailable
+    - alert: HydraControlPlaneDegraded
+      expr: |
+        (capi_kubeadmcontrolplane_status_replicas_ready < capi_kubeadmcontrolplane_spec_replicas)
+        and on (namespace, name) (capi_kubeadmcontrolplane_status_condition{type="Available",status="True"} == 1)
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: Cluster {{ $labels.cluster_name }} is running with fewer control-plane machines than it should
+        description: >-
+          The control plane {{ $labels.namespace }}/{{ $labels.name }} is still
+          Available, but one more failure may take it away. A scale-up,
+          rollout or remediation normally restores the count well inside 15
+          minutes.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydracontrolplanedegraded

@@ -175,6 +175,13 @@ ETCD_BACKUP_IMG ?= etcd-backup:dev
 test-etcd-backup: ## Test the etcd-backup tool's naming and pruning logic.
 	sh tools/etcd-backup/etcd-backup_test.sh
 
+# The alerts in config/prometheus/alerts.yaml (PET-64). promtool checks and
+# unit-tests them; the Go test also holds every alert to a severity, a summary
+# and a runbook section in docs/alerts.md.
+.PHONY: test-alerts
+test-alerts: promtool ## Lint and unit-test the shipped Prometheus alerts with promtool.
+	PROMTOOL="$(PROMTOOL)" go test ./internal/alerts/ -count=1 -v -run 'TestAlerts|TestEveryAlert'
+
 .PHONY: docker-build-etcd-backup
 docker-build-etcd-backup: ## Build the etcd-backup image.
 	$(CONTAINER_TOOL) build -t ${ETCD_BACKUP_IMG} tools/etcd-backup
@@ -251,6 +258,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+PROMTOOL ?= $(LOCALBIN)/promtool
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
@@ -267,6 +275,9 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.12.2
+# The Prometheus release promtool comes from. Keep it at the version the
+# management cluster's Prometheus runs, so the tests evaluate PromQL the way it does.
+PROMETHEUS_VERSION ?= 3.14.0
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -299,6 +310,30 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
+
+# promtool is downloaded from the Prometheus release rather than built: the
+# Prometheus module carries replace directives, which `go install` refuses. The
+# archive is checked against the release's sha256sums.txt before anything in it
+# is used.
+.PHONY: promtool
+promtool: $(PROMTOOL) ## Download promtool locally if necessary.
+$(PROMTOOL): $(LOCALBIN)
+	@[ -f "$(PROMTOOL)-v$(PROMETHEUS_VERSION)" ] && [ "$$(readlink -- "$(PROMTOOL)" 2>/dev/null)" = "$(PROMTOOL)-v$(PROMETHEUS_VERSION)" ] || { \
+	set -e; \
+	os=$$(go env GOOS); arch=$$(go env GOARCH); \
+	name=prometheus-$(PROMETHEUS_VERSION).$$os-$$arch; \
+	base=https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION); \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	echo "Downloading $$name.tar.gz"; \
+	curl -fsSL -o "$$tmp/$$name.tar.gz" "$$base/$$name.tar.gz"; \
+	curl -fsSL -o "$$tmp/sha256sums.txt" "$$base/sha256sums.txt"; \
+	want=$$(awk -v f="$$name.tar.gz" '$$2 == f { print $$1 }' "$$tmp/sha256sums.txt"); \
+	have=$$( (sha256sum "$$tmp/$$name.tar.gz" 2>/dev/null || shasum -a 256 "$$tmp/$$name.tar.gz") | awk '{ print $$1 }'); \
+	[ -n "$$want" ] && [ "$$want" = "$$have" ] || { echo "promtool: checksum mismatch for $$name.tar.gz" >&2; exit 1; }; \
+	tar -xzf "$$tmp/$$name.tar.gz" -C "$$tmp" "$$name/promtool"; \
+	mv "$$tmp/$$name/promtool" "$(PROMTOOL)-v$(PROMETHEUS_VERSION)"; \
+	} ;\
+	ln -sf "$$(realpath "$(PROMTOOL)-v$(PROMETHEUS_VERSION)")" "$(PROMTOOL)"
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

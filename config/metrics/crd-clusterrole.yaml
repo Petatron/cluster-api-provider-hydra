@@ -1,0 +1,21 @@
+# Lets kube-state-metrics list and watch this provider's objects, for the
+# custom-resource-state configuration beside it. The aggregation label is the
+# one Cluster API's own metrics ClusterRole uses, so a kube-state-metrics
+# deployment that aggregates Cluster API's role picks this one up too; bind it
+# directly otherwise.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    kube-state-metrics/aggregate-to-manager: "true"
+  name: kube-state-metrics-reader
+rules:
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - hydraclusters
+  - hydramachines
+  verbs:
+  - get
+  - list
+  - watch

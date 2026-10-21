@@ -1,0 +1,148 @@
+# kube-state-metrics custom-resource-state configuration for this provider's
+# HydraCluster and HydraMachine objects.
+#
+# It follows Cluster API's own configuration (core/config/metrics in
+# kubernetes-sigs/cluster-api) exactly: the same metricNamePrefix shape
+# (capi_<lowercase kind>), the same labels, and the same status_condition
+# StateSet. A Cluster API dashboard or rule that already reads
+# capi_dockermachine_status_condition reads capi_hydramachine_status_condition
+# the same way. Load it into kube-state-metrics next to Cluster API's file by
+# appending this file's resources to that file's spec.resources: the flag
+# --custom-resource-state-config-file takes a single file.
+#
+# The alerts in config/prometheus/alerts.yaml need these series and Cluster
+# API's capi_cluster_*, capi_machine_* and capi_kubeadmcontrolplane_* series.
+---
+kind: CustomResourceStateMetrics
+spec:
+  resources:
+  - groupVersionKind:
+      group: infrastructure.cluster.x-k8s.io
+      kind: HydraCluster
+      version: v1alpha1
+    labelsFromPath:
+      cluster_name:
+      - metadata
+      - labels
+      - cluster.x-k8s.io/cluster-name
+      name:
+      - metadata
+      - name
+      namespace:
+      - metadata
+      - namespace
+      uid:
+      - metadata
+      - uid
+    metricNamePrefix: capi_hydracluster
+    metrics:
+    - name: status_condition
+      help: The condition of a hydracluster.
+      each:
+        stateSet:
+          labelName: status
+          labelsFromPath:
+            type:
+            - type
+          list:
+          - "True"
+          - "False"
+          - Unknown
+          path:
+          - status
+          - conditions
+          valueFrom:
+          - status
+        type: StateSet
+    - name: status_condition_last_transition_time
+      help: The condition last transition time of a hydracluster.
+      each:
+        gauge:
+          labelsFromPath:
+            status:
+            - status
+            type:
+            - type
+          path:
+          - status
+          - conditions
+          valueFrom:
+          - lastTransitionTime
+        type: Gauge
+  - groupVersionKind:
+      group: infrastructure.cluster.x-k8s.io
+      kind: HydraMachine
+      version: v1alpha1
+    labelsFromPath:
+      cluster_name:
+      - metadata
+      - labels
+      - cluster.x-k8s.io/cluster-name
+      name:
+      - metadata
+      - name
+      namespace:
+      - metadata
+      - namespace
+      uid:
+      - metadata
+      - uid
+    metricNamePrefix: capi_hydramachine
+    metrics:
+    - name: created
+      help: Unix creation timestamp.
+      each:
+        gauge:
+          path:
+          - metadata
+          - creationTimestamp
+        type: Gauge
+    - name: info
+      help: Information about a hydramachine.
+      each:
+        info:
+          labelsFromPath:
+            control_plane_name:
+            - metadata
+            - labels
+            - cluster.x-k8s.io/control-plane-name
+            failure_domain:
+            - status
+            - failureDomain
+            provider_id:
+            - spec
+            - providerID
+        type: Info
+    - name: status_condition
+      help: The condition of a hydramachine.
+      each:
+        stateSet:
+          labelName: status
+          labelsFromPath:
+            type:
+            - type
+          list:
+          - "True"
+          - "False"
+          - Unknown
+          path:
+          - status
+          - conditions
+          valueFrom:
+          - status
+        type: StateSet
+    - name: status_condition_last_transition_time
+      help: The condition last transition time of a hydramachine.
+      each:
+        gauge:
+          labelsFromPath:
+            status:
+            - status
+            type:
+            - type
+          path:
+          - status
+          - conditions
+          valueFrom:
+          - lastTransitionTime
+        type: Gauge

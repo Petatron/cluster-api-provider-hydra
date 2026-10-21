@@ -59,6 +59,11 @@ jobs:
       - name: Build manager binary
         run: make build
 
+      # `make test` already checks every alert is documented and unit-tested;
+      # this runs promtool's lint and the unit tests themselves (PET-64).
+      - name: Test the shipped alerts
+        run: make test-alerts
+
       # The runner's sh is dash, a stricter POSIX shell than a laptop's, which
       # is the point: the image runs the script under busybox ash.
       - name: Test the etcd-backup tool

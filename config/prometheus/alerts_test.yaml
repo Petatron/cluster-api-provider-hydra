@@ -1,0 +1,531 @@
+# promtool unit tests for alerts.yaml. Run with `make test-alerts`.
+#
+# promtool reads plain rule files, so internal/alerts writes the
+# PrometheusRule's spec next to a copy of this file before running it:
+# alerts.unit.rules.yaml is that spec with the annotations removed, because
+# promtool compares annotations in full and these tests are about the
+# expressions. The annotations are checked by the Go test instead.
+#
+# The kube-state-metrics series below have the labels Cluster API's and this
+# provider's custom-resource-state configs give them. A StateSet publishes one
+# series per state, 1 for the current one, so "Ready is not True" is
+# status="True" == 0 and covers both False and Unknown.
+rule_files:
+- alerts.unit.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+# --- the provider itself -----------------------------------------------------
+- name: provider down after being up
+  interval: 1m
+  input_series:
+  - series: 'up{job="cluster-api-provider-hydra-controller-manager-metrics-service", instance="10.0.0.5:8443"}'
+    values: '1x4 0x15'
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: HydraProviderDown
+    exp_alerts: []
+  - eval_time: 8m
+    alertname: HydraProviderDown
+    exp_alerts: []
+  - eval_time: 11m
+    alertname: HydraProviderDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+
+- name: provider never scraped at all
+  interval: 1m
+  input_series:
+  - series: 'up{job="something-else"}'
+    values: '1x10'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: HydraProviderDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+
+- name: backend unreachable only once nothing gets through
+  interval: 1m
+  input_series:
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="error"}'
+    values: '0+1x40'
+  # Calls keep succeeding until 10m, then stop.
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="success"}'
+    values: '5+1x10 15x30'
+  # A not_found is the backend answering, not failing.
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="FindByName", outcome="not_found"}'
+    values: '2x40'
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: HydraBackendUnreachable
+    exp_alerts: []
+  - eval_time: 28m
+    alertname: HydraBackendUnreachable
+    exp_alerts: []
+  - eval_time: 35m
+    alertname: HydraBackendUnreachable
+    exp_alerts:
+    - exp_labels:
+        job: cluster-api-provider-hydra-controller-manager-metrics-service
+        severity: critical
+
+- name: backend errors while calls also succeed are not an outage
+  interval: 1m
+  input_series:
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="error"}'
+    values: '0+1x40'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="FindByName", outcome="not_found"}'
+    values: '0+1x40'
+  alert_rule_test:
+  - eval_time: 35m
+    alertname: HydraBackendUnreachable
+    exp_alerts: []
+
+- name: sustained reconcile errors, not a single one
+  interval: 1m
+  input_series:
+  - series: 'controller_runtime_reconcile_errors_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", controller="hydramachine"}'
+    values: '0+1x60'
+  - series: 'controller_runtime_reconcile_errors_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", controller="hydracluster"}'
+    values: '0 1x60'
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: HydraProviderReconcileErrors
+    exp_alerts: []
+  - eval_time: 40m
+    alertname: HydraProviderReconcileErrors
+    exp_alerts:
+    - exp_labels:
+        job: cluster-api-provider-hydra-controller-manager-metrics-service
+        controller: hydramachine
+        severity: warning
+
+- name: terminal failures alert, retryable ones do not
+  interval: 1m
+  input_series:
+  # Born at 1 by its first Inc(), as in the manager: no 0 sample before it.
+  - series: 'hydra_machine_failure_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", stage="Provisioning", cause="terminal"}'
+    values: '_x5 1x30'
+  - series: 'hydra_machine_failure_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", stage="Provisioning", cause="error"}'
+    values: '0+1x35'
+  alert_rule_test:
+  - eval_time: 7m
+    alertname: HydraMachineTerminalFailure
+    exp_alerts:
+    - exp_labels:
+        job: cluster-api-provider-hydra-controller-manager-metrics-service
+        stage: Provisioning
+        severity: warning
+  - eval_time: 25m
+    alertname: HydraMachineTerminalFailure
+    exp_alerts: []
+
+# --- HydraCluster and HydraMachine ------------------------------------------
+- name: hydracluster conditions
+  interval: 1m
+  input_series:
+  - series: 'capi_hydracluster_status_condition{cluster_name="wl", name="wl", namespace="default", uid="hc1", type="InfrastructureFailed", status="True"}'
+    values: '1x20'
+  - series: 'capi_hydracluster_status_condition{cluster_name="wl", name="wl", namespace="default", uid="hc1", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydracluster_status_condition{cluster_name="ok", name="ok", namespace="default", uid="hc2", type="InfrastructureFailed", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydracluster_status_condition{cluster_name="ok", name="ok", namespace="default", uid="hc2", type="Ready", status="True"}'
+    values: '1x20'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: HydraClusterInfrastructureFailed
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl
+        namespace: default
+        uid: hc1
+        type: InfrastructureFailed
+        status: "True"
+        severity: warning
+  - eval_time: 10m
+    alertname: HydraClusterNotReady
+    exp_alerts: []
+  - eval_time: 16m
+    alertname: HydraClusterNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl
+        namespace: default
+        uid: hc1
+        type: Ready
+        status: "True"
+        severity: warning
+
+- name: hydramachine readiness, split by role
+  interval: 1m
+  input_series:
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-cp-a", namespace="default", uid="m1", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_info{cluster_name="wl", name="wl-cp-a", namespace="default", uid="m1", control_plane_name="wl-cp", provider_id="libvirt:///a"}'
+    values: '1x20'
+  # A worker: kube-state-metrics leaves out a label whose path is missing.
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="m2", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_info{cluster_name="wl", name="wl-md-a", namespace="default", uid="m2", provider_id="libvirt:///b"}'
+    values: '1x20'
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="m2", type="ProvisioningFailed", status="True"}'
+    values: '1x20'
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-b", namespace="default", uid="m3", type="Ready", status="True"}'
+    values: '1x20'
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-b", namespace="default", uid="m3", type="ProvisioningFailed", status="True"}'
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: HydraMachineProvisioningFailed
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-a
+        namespace: default
+        uid: m2
+        type: ProvisioningFailed
+        status: "True"
+        severity: warning
+  - eval_time: 9m
+    alertname: HydraMachineNotReady
+    exp_alerts: []
+  - eval_time: 11m
+    alertname: HydraControlPlaneMachineNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-cp-a
+        namespace: default
+        uid: m1
+        type: Ready
+        status: "True"
+        severity: critical
+  - eval_time: 11m
+    alertname: HydraMachineNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-a
+        namespace: default
+        uid: m2
+        type: Ready
+        status: "True"
+        severity: warning
+
+# --- Cluster API objects of Hydra clusters ----------------------------------
+- name: cluster-level conditions, Hydra clusters only
+  interval: 1m
+  input_series:
+  - series: 'capi_cluster_status_condition{name="wl", namespace="default", uid="c1", type="RemoteConnectionProbe", status="False"}'
+    values: '0x2 1x20'
+  - series: 'capi_cluster_status_condition{name="wl", namespace="default", uid="c1", type="Available", status="True"}'
+    values: '0x25'
+  - series: 'capi_cluster_info{name="wl", namespace="default", uid="c1", infrastructure_reference_kind="HydraCluster", control_plane_reference_kind="KubeadmControlPlane"}'
+    values: '1x25'
+  # Another provider's cluster on the same management cluster.
+  - series: 'capi_cluster_status_condition{name="dock", namespace="default", uid="c2", type="RemoteConnectionProbe", status="False"}'
+    values: '1x25'
+  - series: 'capi_cluster_status_condition{name="dock", namespace="default", uid="c2", type="Available", status="True"}'
+    values: '0x25'
+  - series: 'capi_cluster_info{name="dock", namespace="default", uid="c2", infrastructure_reference_kind="DockerCluster"}'
+    values: '1x25'
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: HydraClusterAPIUnreachable
+    exp_alerts: []
+  - eval_time: 6m
+    alertname: HydraClusterAPIUnreachable
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl
+        namespace: default
+        uid: c1
+        type: RemoteConnectionProbe
+        status: "False"
+        severity: critical
+  - eval_time: 16m
+    alertname: HydraClusterNotAvailable
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl
+        namespace: default
+        uid: c1
+        type: Available
+        status: "True"
+        severity: warning
+
+- name: node health from Cluster API's view
+  interval: 1m
+  input_series:
+  # A control-plane node that goes unhealthy at 2m.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-cp-a", namespace="default", uid="a", type="NodeHealthy", status="True"}'
+    values: '1x2 0x20'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-cp-a", namespace="default", uid="a", node_name="wl-cp-a"}'
+    values: '1x25'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-cp-a", namespace="default", uid="a", infrastructure_reference_kind="HydraMachine", control_plane_name="wl-cp"}'
+    values: '1x25'
+  # A worker that goes unhealthy at 2m.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="b", type="NodeHealthy", status="True"}'
+    values: '1x2 0x20'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-a", namespace="default", uid="b", node_name="wl-md-a"}'
+    values: '1x25'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-a", namespace="default", uid="b", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x25'
+  # Still provisioning: no node yet, so not unhealthy.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-b", namespace="default", uid="c", type="NodeHealthy", status="True"}'
+    values: '0x25'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-b", namespace="default", uid="c", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x25'
+  # Being deleted: its node going away is expected.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-c", namespace="default", uid="d", type="NodeHealthy", status="True"}'
+    values: '0x25'
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-c", namespace="default", uid="d", type="Deleting", status="True"}'
+    values: '1x25'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-c", namespace="default", uid="d", node_name="wl-md-c"}'
+    values: '1x25'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-c", namespace="default", uid="d", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x25'
+  # Another provider's machine.
+  - series: 'capi_machine_status_condition{cluster_name="dock", name="dock-md-a", namespace="default", uid="e", type="NodeHealthy", status="True"}'
+    values: '0x25'
+  - series: 'capi_machine_status_noderef{cluster_name="dock", name="dock-md-a", namespace="default", uid="e", node_name="dock-md-a"}'
+    values: '1x25'
+  - series: 'capi_machine_info{cluster_name="dock", name="dock-md-a", namespace="default", uid="e", infrastructure_reference_kind="DockerMachine"}'
+    values: '1x25'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: HydraNodeUnhealthy
+    exp_alerts: []
+  - eval_time: 8m
+    alertname: HydraControlPlaneNodeUnhealthy
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-cp-a
+        namespace: default
+        uid: a
+        node_name: wl-cp-a
+        type: NodeHealthy
+        status: "True"
+        severity: critical
+  - eval_time: 8m
+    alertname: HydraNodeUnhealthy
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-a
+        namespace: default
+        uid: b
+        node_name: wl-md-a
+        type: NodeHealthy
+        status: "True"
+        severity: warning
+
+- name: control plane and etcd
+  interval: 1m
+  input_series:
+  - series: 'capi_cluster_info{name="wl", namespace="default", uid="c1", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  - series: 'capi_cluster_info{name="wl2", namespace="default", uid="c2", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  - series: 'capi_cluster_info{name="up", namespace="default", uid="c6", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  - series: 'capi_cluster_info{name="dock", namespace="default", uid="c3", infrastructure_reference_kind="DockerCluster"}'
+    values: '1x30'
+  # wl: etcd unhealthy from 3m, one control plane lost at 3m, Cluster API
+  # declares it unavailable at 13m.
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl", name="wl-cp", namespace="default", uid="k1", type="EtcdClusterHealthy", status="True"}'
+    values: '1x2 0x25'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl", name="wl-cp", namespace="default", uid="k1", type="Available", status="True"}'
+    values: '1x12 0x15'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="wl", name="wl-cp", namespace="default", uid="k1"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="wl", name="wl-cp", namespace="default", uid="k1"}'
+    values: '3x2 2x9 1x15'
+  # wl2: one of three control planes down for good, still Available.
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2", type="Available", status="True"}'
+    values: '1x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2"}'
+    values: '2x30'
+  # up: a long-lived single control plane being scaled 1 -> 3. One of three is
+  # Ready for ten minutes, but nothing has failed.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '-86400x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="up", name="up-cp", namespace="default", uid="k6", type="Available", status="True"}'
+    values: '1x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '1x2 3x28'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '1x12 2x5 3x12'
+  # Another provider's cluster, unavailable with etcd down.
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="dock", name="dock-cp", namespace="default", uid="k3", type="EtcdClusterHealthy", status="True"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="dock", name="dock-cp", namespace="default", uid="k3", type="Available", status="True"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="dock", name="dock-cp", namespace="default", uid="k3"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="dock", name="dock-cp", namespace="default", uid="k3"}'
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: HydraEtcdUnhealthy
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-cp
+        namespace: default
+        uid: k1
+        type: EtcdClusterHealthy
+        status: "True"
+        severity: critical
+  # The scale-up is not an outage at any point.
+  - eval_time: 10m
+    alertname: HydraControlPlaneUnavailable
+    exp_alerts: []
+  - eval_time: 14m
+    alertname: HydraControlPlaneUnavailable
+    exp_alerts: []
+  - eval_time: 16m
+    alertname: HydraControlPlaneUnavailable
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-cp
+        namespace: default
+        uid: k1
+        type: Available
+        status: "True"
+        severity: critical
+  - eval_time: 16m
+    alertname: HydraControlPlaneDegraded
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl2
+        name: wl2-cp
+        namespace: default
+        uid: k2
+        severity: warning
+  # By 20m wl has had too few control planes for 17 minutes, but it became
+  # unavailable at 13m, which is HydraControlPlaneUnavailable, not this. The
+  # scale-up of "up" finished at 18m, inside the 15 minutes this waits.
+  - eval_time: 20m
+    alertname: HydraControlPlaneDegraded
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl2
+        name: wl2-cp
+        namespace: default
+        uid: k2
+        severity: warning
+
+# --- objects still being built, and a VM in a crash loop --------------------
+- name: control planes in their first hour are not an outage
+  interval: 1m
+  input_series:
+  - series: 'capi_cluster_info{name="new", namespace="default", uid="c4", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  - series: 'capi_cluster_info{name="old", namespace="default", uid="c5", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  # Created at the start of the test: 16 minutes old at 16m.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '0x10 1x20'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="new", name="new-cp", namespace="default", uid="k4", type="Available", status="True"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="new", name="new-cp", namespace="default", uid="k4", type="EtcdClusterHealthy", status="True"}'
+    values: '0x30'
+  # Created two hours before the test started.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '-7200x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '1x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="old", name="old-cp", namespace="default", uid="k5", type="Available", status="True"}'
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 16m
+    alertname: HydraControlPlaneUnavailable
+    exp_alerts:
+    - exp_labels:
+        cluster_name: old
+        name: old-cp
+        namespace: default
+        uid: k5
+        type: Available
+        status: "True"
+        severity: critical
+  - eval_time: 16m
+    alertname: HydraEtcdUnhealthy
+    exp_alerts: []
+
+- name: machines in their first half hour are not stuck yet
+  interval: 1m
+  input_series:
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-new", namespace="default", uid="m7", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_created{cluster_name="wl", name="wl-md-new", namespace="default", uid="m7"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-old", namespace="default", uid="m8", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_created{cluster_name="wl", name="wl-md-old", namespace="default", uid="m8"}'
+    values: '-7200x20'
+  alert_rule_test:
+  - eval_time: 11m
+    alertname: HydraMachineNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-old
+        namespace: default
+        uid: m8
+        type: Ready
+        status: "True"
+        severity: warning
+
+- name: a VM restarted every five minutes
+  interval: 1m
+  input_series:
+  # Unhealthy four minutes in every five: never the five HydraNodeUnhealthy waits.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", type="NodeHealthy", status="True"}'
+    values: '1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", node_name="wl-md-a"}'
+    values: '1x35'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x35'
+  # One outage and its recovery is not flapping.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", type="NodeHealthy", status="True"}'
+    values: '1x5 0x10 1x20'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", node_name="wl-md-b"}'
+    values: '1x35'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x35'
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: HydraNodeUnhealthy
+    exp_alerts: []
+  - eval_time: 30m
+    alertname: HydraNodeFlapping
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-a
+        namespace: default
+        uid: f1
+        node_name: wl-md-a
+        type: NodeHealthy
+        status: "True"
+        severity: warning
