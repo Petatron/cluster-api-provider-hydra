@@ -73,8 +73,16 @@ spec:
           manager's log says which object and why.
         runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraproviderreconcileerrors
     - alert: HydraMachineTerminalFailure
+      # The counter's child is created by its first Inc(), so the first failure
+      # arrives as a new series already at 1, which increase() cannot see. The
+      # second clause catches a series that did not exist 15 minutes ago.
       expr: |
         sum by (job, stage) (increase(hydra_machine_failure_total{cause="terminal"}[15m])) > 0
+        or
+        sum by (job, stage) (
+          hydra_machine_failure_total{cause="terminal"}
+          unless hydra_machine_failure_total{cause="terminal"} offset 15m
+        )
       labels:
         severity: warning
       annotations:
@@ -260,9 +268,13 @@ spec:
           quorum, after which the cluster's API stops accepting writes. Check
           the backups before touching anything.
         runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraetcdunhealthy
-    - alert: HydraControlPlaneQuorumLost
+    - alert: HydraControlPlaneUnavailable
+      # Cluster API's own judgement, not replica arithmetic: a KubeadmControlPlane
+      # is Available while an API server is healthy and, with stacked etcd, etcd
+      # has quorum. Counting Ready machines against the desired count cannot
+      # tell a lost quorum from a scale-up still in progress (1 of 3 Ready).
       expr: |
-        (capi_kubeadmcontrolplane_status_replicas_ready * 2 <= capi_kubeadmcontrolplane_spec_replicas)
+        (capi_kubeadmcontrolplane_status_condition{type="Available",status="True"} == 0)
         and on (namespace, cluster_name)
         label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
         unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
@@ -270,19 +282,18 @@ spec:
       labels:
         severity: critical
       annotations:
-        summary: Cluster {{ $labels.cluster_name }} has lost control-plane quorum
+        summary: The control plane of cluster {{ $labels.cluster_name }} is unavailable
         description: >-
-          Half or fewer of the control plane {{ $labels.namespace }}/{{ $labels.name }}'s
-          desired machines are Ready, so etcd cannot have a majority. The
+          Cluster API reports the control plane {{ $labels.namespace }}/{{ $labels.name }}
+          not Available: no API server is healthy, or etcd has lost quorum. The
           cluster's API is down or read-only. Do not delete control-plane
-          machines to "fix" it; that makes recovery harder.
-        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydracontrolplanequorumlost
+          machines to "fix" it; that makes recovery harder. The
+          KubeadmControlPlane's Available condition message says which.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydracontrolplaneunavailable
     - alert: HydraControlPlaneDegraded
       expr: |
-        (
-          capi_kubeadmcontrolplane_status_replicas_ready < capi_kubeadmcontrolplane_spec_replicas
-          and capi_kubeadmcontrolplane_status_replicas_ready * 2 > capi_kubeadmcontrolplane_spec_replicas
-        )
+        (capi_kubeadmcontrolplane_status_replicas_ready < capi_kubeadmcontrolplane_spec_replicas)
+        and on (namespace, name) (capi_kubeadmcontrolplane_status_condition{type="Available",status="True"} == 1)
         and on (namespace, cluster_name)
         label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
         unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
@@ -292,7 +303,8 @@ spec:
       annotations:
         summary: Cluster {{ $labels.cluster_name }} is running with fewer control-plane machines than it should
         description: >-
-          The control plane {{ $labels.namespace }}/{{ $labels.name }} still has
-          quorum, but one more failure may take it away. A rollout or
-          remediation normally restores the count well inside 15 minutes.
+          The control plane {{ $labels.namespace }}/{{ $labels.name }} is still
+          Available, but one more failure may take it away. A scale-up,
+          rollout or remediation normally restores the count well inside 15
+          minutes.
         runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydracontrolplanedegraded

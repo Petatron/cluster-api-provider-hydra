@@ -20,6 +20,13 @@ Everything is evaluated on the **management cluster**, from two sources:
   `config/metrics/crd-clusterrole.yaml` lets kube-state-metrics read the Hydra
   objects.
 
+**Label the rule for your Prometheus.** The `PrometheusRule` carries no
+`release` label, and a Prometheus Operator whose `ruleSelector` requires one
+ignores it silently: no error and no alerts. Add whatever your Prometheus
+selects on, for example with a kustomize `labels:` entry, and confirm the
+rules appear under Prometheus' *Alerts* page after applying. The same goes for
+the ServiceMonitor and kube-state-metrics' monitor.
+
 Rules over Cluster API objects only consider clusters whose infrastructure is
 a `HydraCluster` and machines whose infrastructure is a `HydraMachine`, so the
 file is safe on a management cluster shared with other providers.
@@ -102,6 +109,10 @@ object and the error.
 **warning.** The backend refused an operation in a way that will not change on
 retry (`hydra_machine_failure_total{cause="terminal"}`), for example a disk
 size the storage pool cannot hold.
+
+The counter's series is created by its first failure, already at 1, so the
+rule also fires on a series that did not exist 15 minutes earlier: the first
+failure counts, not only the second.
 
 Someone has to change something. The affected HydraMachine's `ProvisioningFailed`
 condition carries the message; see
@@ -206,11 +217,17 @@ Another failure may cost quorum. Before changing anything, confirm the latest
 etcd backup is recent. The KubeadmControlPlane's condition message, and each
 control-plane Machine's `EtcdMemberHealthy`, say which member.
 
-### HydraControlPlaneQuorumLost
+### HydraControlPlaneUnavailable
 
-**critical, 2m.** Half or fewer of a KubeadmControlPlane's desired machines are
-Ready, so etcd cannot hold a majority. The cluster's API is down or refuses
-writes.
+**critical, 2m.** Cluster API reports a Hydra cluster's KubeadmControlPlane not
+`Available`: no API server is healthy, or, with stacked etcd, etcd has lost
+quorum. The cluster's API is down or refuses writes. The condition's message
+says which.
+
+This reads Cluster API's own judgement rather than counting Ready machines
+against the desired number. That count cannot tell a lost quorum from a
+scale-up still in progress: a single control plane being grown to three has
+one of three Ready for minutes, and nothing is wrong.
 
 Do not delete control-plane machines to "fix" this; removing members from a
 cluster without quorum makes recovery harder. Bring the missing machines back
@@ -218,8 +235,9 @@ if they can come back, otherwise restore from an etcd backup.
 
 ### HydraControlPlaneDegraded
 
-**warning, 15m.** Fewer control-plane machines are Ready than desired, but
-etcd still has a majority. One more failure may take it away.
+**warning, 15m.** Fewer control-plane machines are Ready than desired while
+the control plane is still Available. One more failure may take it away.
 
-A rollout or remediation normally restores the count well within 15 minutes.
+A scale-up, rollout or remediation normally restores the count well within 15
+minutes.
 If not, look at the KubeadmControlPlane's `MachinesReady` condition.

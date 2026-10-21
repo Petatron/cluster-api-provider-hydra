@@ -106,8 +106,9 @@ tests:
 - name: terminal failures alert, retryable ones do not
   interval: 1m
   input_series:
+  # Born at 1 by its first Inc(), as in the manager: no 0 sample before it.
   - series: 'hydra_machine_failure_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", stage="Provisioning", cause="terminal"}'
-    values: '0x5 1x30'
+    values: '_x5 1x30'
   - series: 'hydra_machine_failure_total{job="cluster-api-provider-hydra-controller-manager-metrics-service", stage="Provisioning", cause="error"}'
     values: '0+1x35'
   alert_rule_test:
@@ -335,22 +336,41 @@ tests:
     values: '1x30'
   - series: 'capi_cluster_info{name="wl2", namespace="default", uid="c2", infrastructure_reference_kind="HydraCluster"}'
     values: '1x30'
+  - series: 'capi_cluster_info{name="up", namespace="default", uid="c6", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
   - series: 'capi_cluster_info{name="dock", namespace="default", uid="c3", infrastructure_reference_kind="DockerCluster"}'
     values: '1x30'
-  # wl: etcd unhealthy from 3m; one control plane lost at 3m, a second at 13m.
+  # wl: etcd unhealthy from 3m, one control plane lost at 3m, Cluster API
+  # declares it unavailable at 13m.
   - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl", name="wl-cp", namespace="default", uid="k1", type="EtcdClusterHealthy", status="True"}'
     values: '1x2 0x25'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl", name="wl-cp", namespace="default", uid="k1", type="Available", status="True"}'
+    values: '1x12 0x15'
   - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="wl", name="wl-cp", namespace="default", uid="k1"}'
     values: '3x30'
   - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="wl", name="wl-cp", namespace="default", uid="k1"}'
     values: '3x2 2x9 1x15'
-  # wl2: one of three control planes down for good.
+  # wl2: one of three control planes down for good, still Available.
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2", type="Available", status="True"}'
+    values: '1x30'
   - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2"}'
     values: '3x30'
   - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="wl2", name="wl2-cp", namespace="default", uid="k2"}'
     values: '2x30'
-  # Another provider's cluster that has lost quorum, etcd and all.
+  # up: a long-lived single control plane being scaled 1 -> 3. One of three is
+  # Ready for ten minutes, but nothing has failed.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '-86400x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="up", name="up-cp", namespace="default", uid="k6", type="Available", status="True"}'
+    values: '1x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '1x2 3x28'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="up", name="up-cp", namespace="default", uid="k6"}'
+    values: '1x12 2x5 3x12'
+  # Another provider's cluster, unavailable with etcd down.
   - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="dock", name="dock-cp", namespace="default", uid="k3", type="EtcdClusterHealthy", status="True"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="dock", name="dock-cp", namespace="default", uid="k3", type="Available", status="True"}'
     values: '0x30'
   - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="dock", name="dock-cp", namespace="default", uid="k3"}'
     values: '3x30'
@@ -368,17 +388,23 @@ tests:
         type: EtcdClusterHealthy
         status: "True"
         severity: critical
+  # The scale-up is not an outage at any point.
+  - eval_time: 10m
+    alertname: HydraControlPlaneUnavailable
+    exp_alerts: []
   - eval_time: 14m
-    alertname: HydraControlPlaneQuorumLost
+    alertname: HydraControlPlaneUnavailable
     exp_alerts: []
   - eval_time: 16m
-    alertname: HydraControlPlaneQuorumLost
+    alertname: HydraControlPlaneUnavailable
     exp_alerts:
     - exp_labels:
         cluster_name: wl
         name: wl-cp
         namespace: default
         uid: k1
+        type: Available
+        status: "True"
         severity: critical
   - eval_time: 16m
     alertname: HydraControlPlaneDegraded
@@ -389,8 +415,9 @@ tests:
         namespace: default
         uid: k2
         severity: warning
-  # By 20m wl has had too few control planes for 17 minutes, but it lost
-  # quorum at 13m, which is QuorumLost's alert, not this one.
+  # By 20m wl has had too few control planes for 17 minutes, but it became
+  # unavailable at 13m, which is HydraControlPlaneUnavailable, not this. The
+  # scale-up of "up" finished at 18m, inside the 15 minutes this waits.
   - eval_time: 20m
     alertname: HydraControlPlaneDegraded
     exp_alerts:
@@ -416,6 +443,8 @@ tests:
     values: '3x30'
   - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
     values: '0x10 1x20'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="new", name="new-cp", namespace="default", uid="k4", type="Available", status="True"}'
+    values: '0x30'
   - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="new", name="new-cp", namespace="default", uid="k4", type="EtcdClusterHealthy", status="True"}'
     values: '0x30'
   # Created two hours before the test started.
@@ -425,15 +454,19 @@ tests:
     values: '3x30'
   - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
     values: '1x30'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="old", name="old-cp", namespace="default", uid="k5", type="Available", status="True"}'
+    values: '0x30'
   alert_rule_test:
   - eval_time: 16m
-    alertname: HydraControlPlaneQuorumLost
+    alertname: HydraControlPlaneUnavailable
     exp_alerts:
     - exp_labels:
         cluster_name: old
         name: old-cp
         namespace: default
         uid: k5
+        type: Available
+        status: "True"
         severity: critical
   - eval_time: 16m
     alertname: HydraEtcdUnhealthy
