@@ -178,9 +178,8 @@ More specific alerts usually fire first; this one catches whatever they miss.
 The Cluster's `Available` condition message lists each reason.
 
 A Cluster whose control plane Cluster API does not manage (no `controlPlaneRef`,
-for example an adopted cluster) can never become Available, and this fires for
-it permanently. Exclude such a cluster in Alertmanager by its `name` label,
-with a note saying why.
+for example an adopted cluster) can never become Available, so the rule leaves
+it out. Watch such a cluster's nodes some other way.
 
 ### HydraNodeUnhealthy
 
@@ -190,7 +189,10 @@ for 5 minutes. The node is NotReady, unreachable, or (for a control plane) its
 static pods are failing.
 
 Only machines that already have a node and are not being deleted count, so a
-machine still booting or a scale-down does not fire this. `node_name` names the
+machine still booting or a scale-down does not fire this. Neither do machines of
+a cluster whose control plane Cluster API has not initialized (an adopted
+cluster with no `controlPlaneRef` never is): Cluster API cannot inspect their
+nodes, so `NodeHealthy` stays Unknown and says nothing about them. `node_name` names the
 node. A MachineHealthCheck, if there is one, may already be replacing it.
 
 If [HydraClusterAPIUnreachable](#hydraclusterapiunreachable) fires for the same

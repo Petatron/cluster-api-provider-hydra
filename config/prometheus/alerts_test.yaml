@@ -228,6 +228,11 @@ tests:
     values: '0x25'
   - series: 'capi_cluster_info{name="wl", namespace="default", uid="c1", infrastructure_reference_kind="HydraCluster", control_plane_reference_kind="KubeadmControlPlane"}'
     values: '1x25'
+  # An adopted cluster: no controlPlaneRef, so it can never be Available.
+  - series: 'capi_cluster_status_condition{name="adopted", namespace="default", uid="c9", type="Available", status="True"}'
+    values: '0x25'
+  - series: 'capi_cluster_info{name="adopted", namespace="default", uid="c9", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x25'
   # Another provider's cluster on the same management cluster.
   - series: 'capi_cluster_status_condition{name="dock", namespace="default", uid="c2", type="RemoteConnectionProbe", status="False"}'
     values: '1x25'
@@ -265,6 +270,21 @@ tests:
 - name: node health from Cluster API's view
   interval: 1m
   input_series:
+  - series: 'capi_cluster_status_condition{name="wl", namespace="default", uid="c1", type="ControlPlaneInitialized", status="True"}'
+    values: '1x25'
+  - series: 'capi_cluster_status_condition{name="dock", namespace="default", uid="c2", type="ControlPlaneInitialized", status="True"}'
+    values: '1x25'
+  # An adopted cluster: its control plane is not Cluster API's, so it never
+  # counts as initialized and its nodes are never inspected (NodeHealthy
+  # Unknown, reason InspectionFailed), though its machines have a node.
+  - series: 'capi_cluster_status_condition{name="adopted", namespace="default", uid="c9", type="ControlPlaneInitialized", status="True"}'
+    values: '0x25'
+  - series: 'capi_machine_status_condition{cluster_name="adopted", name="adopted-md-a", namespace="default", uid="g", type="NodeHealthy", status="True"}'
+    values: '0x25'
+  - series: 'capi_machine_status_noderef{cluster_name="adopted", name="adopted-md-a", namespace="default", uid="g", node_name="adopted-md-a"}'
+    values: '1x25'
+  - series: 'capi_machine_info{cluster_name="adopted", name="adopted-md-a", namespace="default", uid="g", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x25'
   # A control-plane node that goes unhealthy at 2m.
   - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-cp-a", namespace="default", uid="a", type="NodeHealthy", status="True"}'
     values: '1x2 0x20'
@@ -499,6 +519,8 @@ tests:
 - name: a VM restarted every five minutes
   interval: 1m
   input_series:
+  - series: 'capi_cluster_status_condition{name="wl", namespace="default", uid="c1", type="ControlPlaneInitialized", status="True"}'
+    values: '1x35'
   # Unhealthy four minutes in every five: never the five HydraNodeUnhealthy waits.
   - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", type="NodeHealthy", status="True"}'
     values: '1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1'
