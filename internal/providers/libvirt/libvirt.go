@@ -194,8 +194,16 @@ var _ client = (*golibvirt.Libvirt)(nil)
 // Provider implements providers.MachineProvider against libvirt.
 type Provider struct {
 	cfg Config
-	lv  client
 	uri golibvirt.ConnectURI
+
+	// lv is the go-libvirt client. Read it through client(): a reconnect that
+	// recovers from a disconnect go-libvirt missed replaces it (PET-67).
+	lvMu sync.RWMutex
+	lv   client
+	// newClient builds a fresh client on the same dialer, for that
+	// replacement. Nil keeps the one client for good, which is what the fakes
+	// in tests want.
+	newClient func() client
 
 	// mu guards the connection state below.
 	mu sync.Mutex
@@ -210,6 +218,13 @@ type Provider struct {
 }
 
 var _ providers.MachineProvider = (*Provider)(nil)
+
+// client returns the current go-libvirt client.
+func (p *Provider) client() client {
+	p.lvMu.RLock()
+	defer p.lvMu.RUnlock()
+	return p.lv
+}
 
 // dialAttempt is one reconnect, shared by every caller that finds the
 // connection down while it runs.
@@ -287,7 +302,10 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 			return nil, fmt.Errorf("libvirt: connecting to %q: %w", uri, err)
 		}
 	}
-	return &Provider{cfg: cfg, lv: lv, uri: uri, dialer: tracked}, nil
+	return &Provider{
+		cfg: cfg, lv: lv, uri: uri, dialer: tracked,
+		newClient: func() client { return golibvirt.NewWithDialer(tracked) },
+	}, nil
 }
 
 // Close releases the libvirt connection.
@@ -299,7 +317,7 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 // version does not return promptly.
 func (p *Provider) Close() error {
 	done := make(chan error, 1)
-	go func() { done <- p.lv.Disconnect() }()
+	go func() { done <- p.client().Disconnect() }()
 
 	select {
 	case err := <-done:
@@ -358,22 +376,39 @@ func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, contex
 // or TLS connect may still finish in the background, bounded by DialTimeout,
 // and its socket is closed on arrival.
 //
-// Connected means go-libvirt says so, the socket it was given is alive, and no
-// reconnect is under way. go-libvirt can report a dead socket as connected for
+// Connected means no reconnect is under way, go-libvirt says so, and the socket
+// it was given is alive. go-libvirt can report a dead socket as connected for
 // good (PET-67), and trusting IsConnected alone would then fail every call until
-// a restart. And while a reconnect recovers from that, IsConnected still says
-// true and the new socket is already alive, so only p.dial shows the handshake
-// has not finished; a caller that skipped it would send RPCs before the
-// connection was open. p.dial is checked last: the order of the other two
-// checks is what callers observe.
+// a restart.
+//
+// The in-flight reconnect is checked first, and a caller that finds one joins it
+// without consulting the client at all. While a reconnect recovers from the
+// wedge, IsConnected still says true and the new socket is already alive, so
+// only p.dial shows the handshake has not finished; a caller that went by the
+// other two would send RPCs before the connection was open. Checking it first
+// also means the client is only ever asked IsConnected under p.mu with no
+// ConnectToURI running on it: go-libvirt reads and writes its disconnected
+// channel without a lock, so asking during a reconnect is a data race.
+//
+// A reconnect normally reuses the client, as go-libvirt allows once it has seen
+// the disconnect. When it has not -- it still says connected over a dead socket,
+// the PET-67 wedge -- the reconnect dials on a fresh client instead. Reusing
+// that one would race go-libvirt's own disconnect watcher for the old socket
+// (waitAndDisconnect), which may not even have started yet: it reads the
+// client's socket and disconnected channel without a lock, could end up
+// watching the new socket alongside the new watcher, and two watchers closing
+// one channel panic the process. A fresh client shares none of that state; the
+// old one is dropped, and its watcher only ever sees the old, dead socket.
 func (p *Provider) ensureConnected(ctx context.Context) error {
 	p.mu.Lock()
-	if p.lv.IsConnected() && !p.dialer.socketLost() && p.dial == nil {
-		p.mu.Unlock()
-		return nil
-	}
 	var stale net.Conn
 	if p.dial == nil {
+		lv := p.client()
+		connected := lv.IsConnected()
+		if connected && !p.dialer.socketLost() {
+			p.mu.Unlock()
+			return nil
+		}
 		a := &dialAttempt{done: make(chan struct{})}
 		p.dial = a
 		// Here, under p.mu and before the goroutine starts -- not inside it. A
@@ -385,12 +420,21 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		// joining before the last gives up -- would hold a stalled handshake
 		// open for as long as reconciles keep coming.
 		limit := time.AfterFunc(p.attemptLimit(), func() { p.endAttempt(a) })
+		target := lv
+		if connected && p.newClient != nil {
+			target = p.newClient()
+		}
 		go func() {
-			err := p.connectOnce()
+			err := target.ConnectToURI(p.uri)
 			// Housekeeping, not correctness: a limit that fires after this finds
 			// p.dial no longer a and does nothing. Stopping it just frees the timer.
 			limit.Stop()
 			p.mu.Lock()
+			if err == nil && target != lv {
+				p.lvMu.Lock()
+				p.lv = target
+				p.lvMu.Unlock()
+			}
 			a.err = err
 			p.dial = nil
 			p.mu.Unlock()
@@ -418,61 +462,6 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		return nil
 	}
 }
-
-// connectOnce runs ConnectToURI once go-libvirt has finished with the previous
-// socket, retrying while it still counts that socket as open.
-//
-// socketLost lets a reconnect start as soon as the old socket dies, which can be
-// before go-libvirt's own cleanup of it (waitAndDisconnect) has run. A reconnect
-// that overlapped that cleanup could have its handshake's callbacks dropped, or
-// its new disconnected channel closed under it. Before PET-67 a reconnect began
-// only once IsConnected had gone false, which happens at the end of that
-// cleanup; so wait for that first, briefly. In the wedge PET-67 fixes,
-// IsConnected never goes false and the wait simply runs out.
-//
-// A socket this provider detached is marked dead at once but closed in the
-// background (closeDetached), and go-libvirt's socket layer counts it connected
-// until its reader sees the close. ConnectToURI refuses to dial over it in that
-// moment -- before it calls the dialer, so abandoning the attempt does not end
-// the refusal the way it ends a dial. The loop checks for abandonment itself:
-// it stops when the last caller gives up or the attempt's limit runs out
-// (endAttempt), so it never holds the attempt longer than a dial would. A
-// refusal that never clears -- an old socket go-libvirt never finishes with --
-// therefore costs each attempt its full limit; it used to fail at once, but the
-// provider was wedged either way.
-func (p *Provider) connectOnce() error {
-	for wait := time.Now().Add(goLibvirtCleanupWait); p.lv.IsConnected() && time.Now().Before(wait); {
-		time.Sleep(goLibvirtCleanupPoll)
-	}
-	for {
-		err := p.lv.ConnectToURI(p.uri)
-		if err == nil || err.Error() != errSocketStillOpen {
-			return err
-		}
-		if p.dialer.attemptAbandoned() {
-			return fmt.Errorf("%w while the previous socket was still closing", errDialAbandoned)
-		}
-		time.Sleep(socketStillOpenRetry)
-	}
-}
-
-// goLibvirtCleanupWait bounds the wait for go-libvirt to finish with a dead
-// socket. Its cleanup is a few map operations, so this only ever runs out in the
-// wedge, where the cleanup already returned without reporting anything.
-const (
-	goLibvirtCleanupWait = 50 * time.Millisecond
-	goLibvirtCleanupPoll = 2 * time.Millisecond
-)
-
-// errSocketStillOpen is go-libvirt's socket.Connect refusing to dial while its
-// previous socket is still marked connected. It is an unexported errors.New, so
-// it can only be recognised by its text; TestSocketStillOpenMatchesGoLibvirt pins
-// it to the go-libvirt this module builds against.
-const errSocketStillOpen = "already connected to socket"
-
-// socketStillOpenRetry is how long connectOnce waits before trying again. The
-// close it waits for is already under way, so this is short.
-const socketStillOpenRetry = 20 * time.Millisecond
 
 // attemptLimit bounds one reconnect the way New bounds the first connect: the
 // dial gets DialTimeout, and the handshake after it gets RPCTimeout.
@@ -517,8 +506,8 @@ func (p *Provider) attemptLimit() time.Duration {
 // between those two statements -- by this, by recycle, or by the daemon -- is a
 // disconnect it never reports, and IsConnected stays true. Detaching marks the
 // socket dead in trackingDialer, and ensureConnected checks that as well as
-// IsConnected, so the next call redials instead of failing on the dead socket
-// until a restart.
+// IsConnected, so the next call redials -- on a fresh client -- instead of
+// failing on the dead socket until a restart.
 func (p *Provider) abandonDial(a *dialAttempt) {
 	p.mu.Lock()
 	a.waiters--
@@ -646,7 +635,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// without being started would be polled forever, because nothing else in the
 	// reconcile loop ever attempts a start.
 	dom, err := call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainLookupByName(spec.Name)
+		return p.client().DomainLookupByName(spec.Name)
 	})
 	switch {
 	case err == nil:
@@ -673,7 +662,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 
 	volName := rootVolumeName(spec.Name)
 	_, err = call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolCreateXML(pool, volumeXML(volName, backingPath, spec.DiskBytes), 0)
+		return p.client().StorageVolCreateXML(pool, volumeXML(volName, backingPath, spec.DiskBytes), 0)
 	})
 	if err != nil && !isAlreadyExists(err) {
 		return nil, fmt.Errorf("libvirt: creating volume %q: %w", volName, err)
@@ -730,7 +719,7 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	}
 
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainDefineXML(domainXML(spec, rootPath, cidataPath))
+		return p.client().DomainDefineXML(domainXML(spec, rootPath, cidataPath))
 	})
 	if err != nil {
 		rollback()
@@ -780,7 +769,7 @@ func (p *Provider) ensureCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 	}
 
 	if err := callVoid(ctx, p, func() error {
-		return p.lv.StorageVolUpload(vol, bytes.NewReader(iso), 0, uint64(len(iso)), 0)
+		return p.client().StorageVolUpload(vol, bytes.NewReader(iso), 0, uint64(len(iso)), 0)
 	}); err != nil {
 		// A half-written image is worse than none: cloud-init would find a
 		// corrupt filesystem and the machine would boot unconfigured with nothing
@@ -801,7 +790,7 @@ func (p *Provider) ensureCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 // that boots a machine which configures nothing and looks fine.
 func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.StoragePool, volName string, size int64) (golibvirt.StorageVol, error) {
 	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
+		return p.client().StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
 	})
 	if err == nil {
 		return vol, nil
@@ -814,7 +803,7 @@ func (p *Provider) createCloudInitVolume(ctx context.Context, pool golibvirt.Sto
 		return golibvirt.StorageVol{}, fmt.Errorf("libvirt: replacing a leftover cloud-init volume %q: %w", volName, err)
 	}
 	vol, err = call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
+		return p.client().StorageVolCreateXML(pool, rawVolumeXML(volName, size), 0)
 	})
 	if err != nil {
 		return golibvirt.StorageVol{}, fmt.Errorf("libvirt: recreating cloud-init volume %q: %w", volName, err)
@@ -849,7 +838,7 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 	if err := startVerified(dom.Name, p.startStepsFor(ctx, dom)); err != nil {
 		return err
 	}
-	if err := callVoid(ctx, p, func() error { return p.lv.DomainSetAutostart(dom, 1) }); err != nil {
+	if err := callVoid(ctx, p, func() error { return p.client().DomainSetAutostart(dom, 1) }); err != nil {
 		return fmt.Errorf("libvirt: setting autostart on domain %q: %w", dom.Name, err)
 	}
 	return nil
@@ -858,15 +847,15 @@ func (p *Provider) ensureRunning(ctx context.Context, dom golibvirt.Domain) erro
 func (p *Provider) startStepsFor(ctx context.Context, dom golibvirt.Domain) startSteps {
 	return startSteps{
 		isActive: func() (bool, error) {
-			active, err := call(ctx, p, func() (int32, error) { return p.lv.DomainIsActive(dom) })
+			active, err := call(ctx, p, func() (int32, error) { return p.client().DomainIsActive(dom) })
 			return active == 1, err
 		},
 		readXML: func() (string, error) {
 			return call(ctx, p, func() (string, error) {
-				return p.lv.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+				return p.client().DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
 			})
 		},
-		start: func() error { return callVoid(ctx, p, func() error { return p.lv.DomainCreate(dom) }) },
+		start: func() error { return callVoid(ctx, p, func() error { return p.client().DomainCreate(dom) }) },
 	}
 }
 
@@ -953,7 +942,7 @@ func (p *Provider) lookupPoolNamed(ctx context.Context, name string) (golibvirt.
 			providers.ErrTerminal)
 	}
 	pool, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
-		return p.lv.StoragePoolLookupByName(name)
+		return p.client().StoragePoolLookupByName(name)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -994,7 +983,7 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 	}
 
 	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolLookupByName(pool, name)
+		return p.client().StorageVolLookupByName(pool, name)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -1002,7 +991,7 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 		}
 		return "", fmt.Errorf("libvirt: looking up image %q: %w", name, err)
 	}
-	path, err := call(ctx, p, func() (string, error) { return p.lv.StorageVolGetPath(vol) })
+	path, err := call(ctx, p, func() (string, error) { return p.client().StorageVolGetPath(vol) })
 	if err != nil {
 		return "", fmt.Errorf("libvirt: resolving path for image %q: %w", name, err)
 	}
@@ -1016,12 +1005,12 @@ func (p *Provider) resolveBackingPath(ctx context.Context, pool golibvirt.Storag
 // absence is a genuine backend fault and retrying is the right response.
 func (p *Provider) volumePath(ctx context.Context, pool golibvirt.StoragePool, volName string) (string, error) {
 	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolLookupByName(pool, volName)
+		return p.client().StorageVolLookupByName(pool, volName)
 	})
 	if err != nil {
 		return "", fmt.Errorf("libvirt: looking up volume %q in pool %q: %w", volName, pool.Name, err)
 	}
-	path, err := call(ctx, p, func() (string, error) { return p.lv.StorageVolGetPath(vol) })
+	path, err := call(ctx, p, func() (string, error) { return p.client().StorageVolGetPath(vol) })
 	if err != nil {
 		return "", fmt.Errorf("libvirt: resolving path for volume %q: %w", volName, err)
 	}
@@ -1091,7 +1080,7 @@ func (p *Provider) attachableNetwork(ctx context.Context, spec providers.Managed
 		return "", err
 	}
 	existing, err := call(ctx, p, func() (golibvirt.Network, error) {
-		return p.lv.NetworkLookupByName(spec.Name)
+		return p.client().NetworkLookupByName(spec.Name)
 	})
 	if err != nil {
 		if !isNotFound(err) {
@@ -1112,7 +1101,7 @@ func (p *Provider) createNetwork(ctx context.Context, spec providers.ManagedNetw
 		return "", err
 	}
 	created, err := call(ctx, p, func() (golibvirt.Network, error) {
-		return p.lv.NetworkDefineXML(doc)
+		return p.client().NetworkDefineXML(doc)
 	})
 	if err != nil {
 		return "", fmt.Errorf("libvirt: defining network %q: %w", spec.Name, err)
@@ -1143,31 +1132,31 @@ func (p *Provider) createNetwork(ctx context.Context, spec providers.ManagedNetw
 // unlike the address and range checks in verifyNetwork, which refuse to touch
 // what an operator configured.
 func (p *Provider) bringUp(ctx context.Context, n golibvirt.Network, name string) error {
-	active, err := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
+	active, err := call(ctx, p, func() (int32, error) { return p.client().NetworkIsActive(n) })
 	if err != nil {
 		return fmt.Errorf("libvirt: checking whether network %q is running: %w", name, err)
 	}
 	if active == 0 {
-		if err := callVoid(ctx, p, func() error { return p.lv.NetworkCreate(n) }); err != nil {
+		if err := callVoid(ctx, p, func() error { return p.client().NetworkCreate(n) }); err != nil {
 			// Something else can start the network between the check above and
 			// this call. libvirt then reports operation-invalid ("network is
 			// already active"), not already-exists, and the same code covers
 			// faults that are real. So ask again rather than guess from the code:
 			// running is the state this was after.
-			again, aErr := call(ctx, p, func() (int32, error) { return p.lv.NetworkIsActive(n) })
+			again, aErr := call(ctx, p, func() (int32, error) { return p.client().NetworkIsActive(n) })
 			if aErr != nil || again != 1 {
 				return fmt.Errorf("libvirt: starting network %q: %w", name, err)
 			}
 		}
 	}
-	if err := callVoid(ctx, p, func() error { return p.lv.NetworkSetAutostart(n, 1) }); err != nil {
+	if err := callVoid(ctx, p, func() error { return p.client().NetworkSetAutostart(n, 1) }); err != nil {
 		return fmt.Errorf("libvirt: setting autostart on network %q: %w", name, err)
 	}
 	return nil
 }
 
 func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
-	desc, err := call(ctx, p, func() (string, error) { return p.lv.NetworkGetXMLDesc(n, 0) })
+	desc, err := call(ctx, p, func() (string, error) { return p.client().NetworkGetXMLDesc(n, 0) })
 	if err != nil {
 		return "", fmt.Errorf("libvirt: reading network %q: %w", spec.Name, err)
 	}
@@ -1214,7 +1203,7 @@ func (p *Provider) verifyNetwork(ctx context.Context, n golibvirt.Network, spec 
 // networkBridge reads back the bridge libvirt chose, which is the name machines
 // are attached by.
 func (p *Provider) networkBridge(ctx context.Context, n golibvirt.Network, name string) (string, error) {
-	desc, err := call(ctx, p, func() (string, error) { return p.lv.NetworkGetXMLDesc(n, 0) })
+	desc, err := call(ctx, p, func() (string, error) { return p.client().NetworkGetXMLDesc(n, 0) })
 	if err != nil {
 		return "", fmt.Errorf("libvirt: reading network %q: %w", name, err)
 	}
@@ -1248,7 +1237,7 @@ func (p *Provider) EnsureInfrastructure(ctx context.Context, spec providers.Infr
 	// Defined but not running is its own failure, and a distinct one: the pool
 	// resolves, so a lookup succeeds, but every volume operation against it
 	// fails. Without this check that surfaces as a confusing per-machine error.
-	active, err := call(ctx, p, func() (int32, error) { return p.lv.StoragePoolIsActive(pool) })
+	active, err := call(ctx, p, func() (int32, error) { return p.client().StoragePoolIsActive(pool) })
 	if err != nil {
 		return fmt.Errorf("libvirt: checking whether storage pool %q is active: %w", pool.Name, err)
 	}
@@ -1321,7 +1310,7 @@ func (p *Provider) FindByName(ctx context.Context, name string) (*providers.Mach
 	defer cancel()
 
 	dom, err := call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainLookupByName(name)
+		return p.client().DomainLookupByName(name)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -1368,7 +1357,7 @@ func (p *Provider) DeleteByName(ctx context.Context, name, storagePool string) e
 	defer cancel()
 
 	dom, err := call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainLookupByName(name)
+		return p.client().DomainLookupByName(name)
 	})
 	switch {
 	case err == nil:
@@ -1434,7 +1423,7 @@ func (p *Provider) DeleteByName(ctx context.Context, name, storagePool string) e
 // too, not returned.
 func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool string) error {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsActive)
+		return p.client().ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsActive)
 	})
 	if err != nil {
 		// Do not fall back to the configured pool. A domain-less partial can be in
@@ -1451,7 +1440,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 	ownSwept := false
 	for _, pool := range pools {
 		vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-			return p.lv.StorageVolLookupByName(pool, volName)
+			return p.client().StorageVolLookupByName(pool, volName)
 		})
 		// The own pool counts as swept only once libvirt has answered for its
 		// contents. A pool that vanished between the list and this lookup has
@@ -1470,7 +1459,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 		if err != nil {
 			continue
 		}
-		if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+		if err := callVoid(ctx, p, func() error { return p.client().StorageVolDelete(vol, 0) }); err != nil &&
 			!isNotFound(err) {
 			return fmt.Errorf("libvirt: deleting volume %q from pool %q: %w", volName, pool.Name, err)
 		}
@@ -1478,7 +1467,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 
 	if ownPool != "" && !ownSwept {
 		_, err := call(ctx, p, func() (golibvirt.StoragePool, error) {
-			return p.lv.StoragePoolLookupByName(ownPool)
+			return p.client().StoragePoolLookupByName(ownPool)
 		})
 		switch {
 		case err == nil:
@@ -1494,7 +1483,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 	}
 
 	stopped, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
+		return p.client().ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
 		// A cancelled or expired context ends the call, as everywhere else in
@@ -1522,7 +1511,7 @@ func (p *Provider) deleteVolumeAnyPool(ctx context.Context, volName, ownPool str
 func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error {
 	// A running domain must be stopped before its disk can be removed. A stopped
 	// one reports an invalid-state error here, which is expected rather than fatal.
-	if err := callVoid(ctx, p, func() error { return p.lv.DomainDestroy(dom) }); err != nil &&
+	if err := callVoid(ctx, p, func() error { return p.client().DomainDestroy(dom) }); err != nil &&
 		!isNotFound(err) && !isInvalidState(err) {
 		return fmt.Errorf("libvirt: destroying domain %q: %w", dom.Name, err)
 	}
@@ -1545,7 +1534,7 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	// operator makes -- cannot have it; libvirt refuses that as an invalid
 	// operation. Any other failure stops the teardown before a volume is
 	// touched, and the retry destroys (a no-op by then) and clears again.
-	if err := callVoid(ctx, p, func() error { return p.lv.DomainSetAutostart(dom, 0) }); err != nil &&
+	if err := callVoid(ctx, p, func() error { return p.client().DomainSetAutostart(dom, 0) }); err != nil &&
 		!isNotFound(err) && !isInvalidState(err) {
 		return fmt.Errorf("libvirt: clearing autostart on domain %q: %w", dom.Name, err)
 	}
@@ -1586,7 +1575,7 @@ func (p *Provider) deleteDomain(ctx context.Context, dom golibvirt.Domain) error
 	}
 
 	const flags = golibvirt.DomainUndefineSnapshotsMetadata | golibvirt.DomainUndefineNvram
-	if err := callVoid(ctx, p, func() error { return p.lv.DomainUndefineFlags(dom, flags) }); err != nil &&
+	if err := callVoid(ctx, p, func() error { return p.client().DomainUndefineFlags(dom, flags) }); err != nil &&
 		!isNotFound(err) {
 		return fmt.Errorf("libvirt: undefining domain %q: %w", dom.Name, err)
 	}
@@ -1610,7 +1599,7 @@ type diskSource struct {
 // error: there is simply nothing for this provider to reclaim.
 func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]diskSource, error) {
 	desc, err := call(ctx, p, func() (string, error) {
-		return p.lv.DomainGetXMLDesc(dom, 0)
+		return p.client().DomainGetXMLDesc(dom, 0)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -1645,7 +1634,7 @@ func (p *Provider) diskSourcesOf(ctx context.Context, dom golibvirt.Domain) ([]d
 func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
 	lookup := func() (golibvirt.StorageVol, error) {
 		return call(ctx, p, func() (golibvirt.StorageVol, error) {
-			return p.lv.StorageVolLookupByPath(path)
+			return p.client().StorageVolLookupByPath(path)
 		})
 	}
 	vol, err := lookup()
@@ -1669,7 +1658,7 @@ func (p *Provider) deleteVolumeByPath(ctx context.Context, path string) error {
 			return fmt.Errorf("libvirt: looking up volume at %q again: %w", path, err)
 		}
 	}
-	if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+	if err := callVoid(ctx, p, func() error { return p.client().StorageVolDelete(vol, 0) }); err != nil &&
 		!isNotFound(err) {
 		return fmt.Errorf("libvirt: deleting volume at %q: %w", path, err)
 	}
@@ -1739,14 +1728,14 @@ type stoppedPool struct {
 // when its volumes are not.
 func (p *Provider) stoppedPools(ctx context.Context) ([]stoppedPool, error) {
 	pools, _, err := call2(ctx, p, func() ([]golibvirt.StoragePool, uint32, error) {
-		return p.lv.ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
+		return p.client().ConnectListAllStoragePools(1, golibvirt.ConnectListStoragePoolsInactive)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing stopped storage pools: %w", err)
 	}
 	var out []stoppedPool
 	for _, pool := range pools {
-		desc, err := call(ctx, p, func() (string, error) { return p.lv.StoragePoolGetXMLDesc(pool, 0) })
+		desc, err := call(ctx, p, func() (string, error) { return p.client().StoragePoolGetXMLDesc(pool, 0) })
 		if err != nil {
 			// Not found included: a pool undefined since the list was taken may
 			// be mid-edit and back in a moment. See confirmReclaimed.
@@ -1806,7 +1795,7 @@ func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) e
 	}
 
 	vol, err := call(ctx, p, func() (golibvirt.StorageVol, error) {
-		return p.lv.StorageVolLookupByName(pool, volName)
+		return p.client().StorageVolLookupByName(pool, volName)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -1815,7 +1804,7 @@ func (p *Provider) deleteVolume(ctx context.Context, poolName, volName string) e
 		return fmt.Errorf("libvirt: looking up volume %q: %w", volName, err)
 	}
 
-	if err := callVoid(ctx, p, func() error { return p.lv.StorageVolDelete(vol, 0) }); err != nil &&
+	if err := callVoid(ctx, p, func() error { return p.client().StorageVolDelete(vol, 0) }); err != nil &&
 		!isNotFound(err) {
 		return fmt.Errorf("libvirt: deleting volume %q: %w", volName, err)
 	}
@@ -1832,7 +1821,7 @@ func (p *Provider) lookupByUUID(ctx context.Context, id string) (golibvirt.Domai
 		return golibvirt.Domain{}, fmt.Errorf("%w: libvirt: %v", providers.ErrInvalidID, err)
 	}
 	dom, err := call(ctx, p, func() (golibvirt.Domain, error) {
-		return p.lv.DomainLookupByUUID(uuid)
+		return p.client().DomainLookupByUUID(uuid)
 	})
 	if err != nil {
 		if isNotFound(err) {
@@ -1846,7 +1835,7 @@ func (p *Provider) lookupByUUID(ctx context.Context, id string) (golibvirt.Domai
 func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*providers.MachineState, error) {
 	state := &providers.MachineState{ID: formatUUID(dom.UUID), Name: dom.Name}
 
-	st, _, err := call2(ctx, p, func() (int32, int32, error) { return p.lv.DomainGetState(dom, 0) })
+	st, _, err := call2(ctx, p, func() (int32, int32, error) { return p.client().DomainGetState(dom, 0) })
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: domain state for %q: %w", state.ID, err)
 	}
@@ -1876,7 +1865,7 @@ func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*provider
 func (p *Provider) addressesOf(ctx context.Context, dom golibvirt.Domain) ([]providers.Address, error) {
 	for _, source := range []uint32{addrSourceAgent, addrSourceLease} {
 		ifaces, err := call(ctx, p, func() ([]golibvirt.DomainInterface, error) {
-			return p.lv.DomainInterfaceAddresses(dom, source, 0)
+			return p.client().DomainInterfaceAddresses(dom, source, 0)
 		})
 		if err != nil {
 			// A source being unavailable is ordinary -- no guest agent, no lease --

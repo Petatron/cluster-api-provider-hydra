@@ -110,17 +110,6 @@ func (d *trackingDialer) detachLocked() net.Conn {
 	return c
 }
 
-// attemptAbandoned reports whether the current attempt has been abandoned. A nil
-// dialer has no attempts to abandon.
-func (d *trackingDialer) attemptAbandoned() bool {
-	if d == nil {
-		return false
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.abandoned
-}
-
 // socketLost reports whether the socket go-libvirt was last given is dead: its
 // reader has seen the error go-libvirt's own listen loop stops on, or it was
 // closed or detached. go-libvirt does not always report that itself (PET-67), so
@@ -278,8 +267,8 @@ func (c *trackedConn) isDead() bool { return c.dead.Load() }
 // calls a socket dead whenever go-libvirt's reader would stop -- and possibly a
 // little earlier: that loop skips a failed header or payload read and stops only
 // at the next length read, which fails the same way on a closed socket, and
-// detaching marks a socket dead before its close lands. Earlier is safe; it
-// only starts the reconnect sooner (see connectOnce).
+// detaching marks a socket dead before its close lands. Earlier is safe: a
+// reconnect started then dials on a fresh client (see ensureConnected).
 //
 // A plain type assertion, not errors.As, because that is what go-libvirt uses.
 func temporaryReadError(err error) bool {

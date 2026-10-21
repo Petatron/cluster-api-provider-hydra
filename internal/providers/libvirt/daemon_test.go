@@ -74,6 +74,15 @@ const (
 
 func startScriptDaemon(t *testing.T) *scriptDaemon {
 	t.Helper()
+	// These tests make go-libvirt drop a connection right after it opens, which
+	// trips a data race inside go-libvirt itself: ConnectToURI writes
+	// Libvirt.disconnected while the waitAndDisconnect goroutine it just started
+	// reads it, without a lock. The provider cannot avoid that, and the race
+	// detector would fail the tests for it. The provider's own synchronisation is
+	// covered under -race by the fake-client tests in wedge_test.go.
+	if raceDetector {
+		t.Skip("go-libvirt races on Libvirt.disconnected when a connection drops right after opening (upstream)")
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

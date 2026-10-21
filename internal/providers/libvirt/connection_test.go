@@ -80,12 +80,19 @@ func TestConcurrentCallersShareOneReconnect(t *testing.T) {
 			errs <- err
 		})
 	}
-	// Hold the dial until every caller has found the connection down, so all of
-	// them are either dialing or waiting on the dial.
+	// Hold the dial until every caller has joined it.
+	waiting := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.dial == nil {
+			return 0
+		}
+		return p.dial.waiters
+	}
 	deadline := time.Now().Add(5 * time.Second)
-	for f.connectedChecks() < callers {
+	for waiting() < callers {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d callers reached the connection check", f.connectedChecks(), callers)
+			t.Fatalf("only %d of %d callers joined the reconnect", waiting(), callers)
 		}
 		time.Sleep(time.Millisecond)
 	}

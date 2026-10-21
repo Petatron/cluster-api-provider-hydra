@@ -60,9 +60,6 @@ type fakeLibvirt struct {
 	// dial, when set, runs inside ConnectToURI outside the lock, standing in for
 	// the socket go-libvirt dials; its error fails the connect.
 	dial func() error
-	// isConnectedCalls counts IsConnected, which every provider call makes
-	// before it decides whether to dial.
-	isConnectedCalls int
 
 	pools    map[string]*fakePool
 	domains  map[string]*fakeDomain
@@ -181,12 +178,6 @@ func (f *fakeLibvirt) stall(t *testing.T, method string) {
 	}
 }
 
-func (f *fakeLibvirt) connectedChecks() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.isConnectedCalls
-}
-
 func (f *fakeLibvirt) called(method string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -248,7 +239,6 @@ func (f *fakeLibvirt) Disconnect() error {
 func (f *fakeLibvirt) IsConnected() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.isConnectedCalls++
 	return f.connected
 }
 

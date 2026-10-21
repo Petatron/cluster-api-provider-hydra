@@ -17,7 +17,6 @@ limitations under the License.
 package libvirt
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net"
@@ -25,8 +24,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/digitalocean/go-libvirt/socket"
 
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 )
@@ -52,8 +49,10 @@ import (
 //     and a reader goroutine stands in for go-libvirt's listen loop on it;
 //   - when that reader stops, RPCs fail with EINVAL, but the fake stays
 //     "connected" -- the disconnect go-libvirt never reports;
-//   - a connect while the previous reader still runs fails the way go-libvirt's
-//     socket.Connect does, because its socket is still marked connected.
+//   - a connect on the same client while the previous reader still runs fails
+//     the way go-libvirt's socket.Connect does, because its socket is still
+//     marked connected; a fresh client (newClient) has its own socket and does
+//     not, which is what the provider relies on to recover.
 type wedgeFixture struct {
 	t      *testing.T
 	p      *Provider
@@ -64,13 +63,8 @@ type wedgeFixture struct {
 	reading    bool          // the listen loop for the current socket runs
 	readerDone chan struct{} // closed when that loop exits
 	sockets    int           // sockets dialled; a refused connect dials none
-
-	// cleanup, when set, models go-libvirt noticing the disconnect after all:
-	// that long after the reader stops, IsConnected goes false. A handshake
-	// started inside that window has its callbacks dropped by the cleanup and
-	// fails, as it would in go-libvirt's waitAndDisconnect.
-	cleanup        time.Duration
-	cleanupPending bool
+	fresh      bool          // the next connect is on a fresh client
+	freshMade  int           // fresh clients the provider asked for
 }
 
 func newWedgeFixture(t *testing.T) *wedgeFixture {
@@ -98,19 +92,29 @@ func newWedgeFixture(t *testing.T) *wedgeFixture {
 	w.p.dialer = newTrackingDialer(stubDialer{addr: ln.Addr().String()}, 5*time.Second)
 	w.f.connected = false
 	w.f.dial = w.connect
+	// A fresh go-libvirt client starts disconnected with a socket of its own.
+	// The fake stands in for it, so the hypervisor's state carries over.
+	w.p.newClient = func() client {
+		w.mu.Lock()
+		w.fresh = true
+		w.freshMade++
+		w.mu.Unlock()
+		w.f.mu.Lock()
+		w.f.connected = false
+		w.f.mu.Unlock()
+		return w.f
+	}
 	return w
 }
 
 // connect is the socket half of go-libvirt's ConnectToURI.
 func (w *wedgeFixture) connect() error {
 	w.mu.Lock()
-	if w.reading {
+	fresh := w.fresh
+	w.fresh = false
+	if w.reading && !fresh {
 		w.mu.Unlock()
 		return errors.New("already connected to socket") // go-libvirt's socket.Connect
-	}
-	if w.cleanupPending {
-		w.mu.Unlock()
-		return errors.New("handshake interrupted by the previous socket's cleanup")
 	}
 	w.mu.Unlock()
 
@@ -120,8 +124,9 @@ func (w *wedgeFixture) connect() error {
 	}
 	done := make(chan struct{})
 	w.mu.Lock()
-	w.reading, w.readerDone = true, done
 	w.sockets++
+	id := w.sockets
+	w.reading, w.readerDone = true, done
 	w.mu.Unlock()
 	w.f.mu.Lock()
 	delete(w.f.errs, "DomainLookupByName")
@@ -129,30 +134,25 @@ func (w *wedgeFixture) connect() error {
 
 	go func() {
 		_, _ = io.Copy(io.Discard, conn)
-		// The socket is dead: every RPC now fails as go-libvirt's SendPacket
-		// does on a disconnected socket. IsConnected is left alone -- that is
-		// the wedge.
-		w.f.mu.Lock()
-		if w.f.errs == nil {
-			w.f.errs = map[string]error{}
-		}
-		w.f.errs["DomainLookupByName"] = syscall.EINVAL
-		w.f.mu.Unlock()
 		w.mu.Lock()
-		w.reading = false
-		cleanup := w.cleanup
-		w.cleanupPending = cleanup > 0
-		w.mu.Unlock()
-		close(done)
-		if cleanup > 0 {
-			time.Sleep(cleanup)
-			w.f.mu.Lock()
-			w.f.connected = false
-			w.f.mu.Unlock()
-			w.mu.Lock()
-			w.cleanupPending = false
-			w.mu.Unlock()
+		current := id == w.sockets
+		if current {
+			w.reading = false
 		}
+		w.mu.Unlock()
+		// The socket is dead: every RPC on it now fails as go-libvirt's
+		// SendPacket does on a disconnected socket. IsConnected is left alone --
+		// that is the wedge. A socket already replaced belongs to a client the
+		// provider has dropped, and affects nothing.
+		if current {
+			w.f.mu.Lock()
+			if w.f.errs == nil {
+				w.f.errs = map[string]error{}
+			}
+			w.f.errs["DomainLookupByName"] = syscall.EINVAL
+			w.f.mu.Unlock()
+		}
+		close(done)
 	}()
 	return nil
 }
@@ -195,10 +195,14 @@ func (w *wedgeFixture) assertRecovers() {
 		w.t.Fatalf("FindByName after the socket died = %v, want a redial and an ordinary lookup", err)
 	}
 	w.mu.Lock()
-	n := w.sockets
+	n, fresh := w.sockets, w.freshMade
 	w.mu.Unlock()
 	if n != 2 {
 		w.t.Errorf("%d sockets dialled, want the first and one redial", n)
+	}
+	// go-libvirt still says connected, so the redial must not reuse its client.
+	if fresh != 1 {
+		w.t.Errorf("%d fresh clients, want the redial on one", fresh)
 	}
 }
 
@@ -231,8 +235,9 @@ func TestARecycledSocketDoesNotWedge(t *testing.T) {
 // An attempt abandoned in the moment after its handshake succeeded, while
 // p.dial still names it (abandonDial's table): its socket is detached and
 // closed, in the background, by whoever abandoned it. The next call must not
-// trust that socket, even before the close has landed, and must get through
-// even while go-libvirt's socket layer still thinks the old one is open.
+// trust that socket, even before the close has landed. go-libvirt's socket layer
+// still counts the old socket open then and would refuse to dial on the same
+// client; the redial goes through on a fresh one.
 func TestAnAttemptAbandonedAfterItsHandshakeDoesNotWedge(t *testing.T) {
 	w := newWedgeFixture(t)
 	w.established()
@@ -260,39 +265,6 @@ func TestALiveSocketIsNotRedialled(t *testing.T) {
 		t.Errorf("%d connects on a healthy socket, want 1", n)
 	}
 }
-
-// connectOnce recognises go-libvirt's refusal by its text, so pin that text to
-// the go-libvirt this module builds against: dial its real socket twice.
-func TestSocketStillOpenMatchesGoLibvirt(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			t.Cleanup(func() { _ = c.Close() })
-		}
-	}()
-
-	s := socket.New(stubDialer{addr: ln.Addr().String()}, discardRouter{})
-	if err := s.Connect(); err != nil {
-		t.Fatalf("first Connect: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Disconnect() })
-	err = s.Connect()
-	if err == nil || err.Error() != errSocketStillOpen {
-		t.Fatalf("second Connect = %v, want go-libvirt's %q; connectOnce would stop retrying", err, errSocketStillOpen)
-	}
-}
-
-type discardRouter struct{}
-
-func (discardRouter) Route(*socket.Header, []byte) {}
 
 // trackedConn calls a socket dead exactly when go-libvirt's listen loop gives up
 // on it: a temporary read error leaves it alive, any other ends it.
@@ -338,36 +310,6 @@ type failingConn struct {
 
 func (c failingConn) Read([]byte) (int, error) { return 0, c.err }
 func (c failingConn) Close() error             { return nil }
-
-// A refused redial does not outlive its attempt. go-libvirt refuses before it
-// dials, so abandoning the attempt cannot end the refusal through Dial; the
-// retry loop has to notice. Here the old socket never finishes closing, the
-// caller gives up, and the attempt must end with it rather than hold every
-// later call.
-func TestARefusedRedialEndsWhenItsCallerGivesUp(t *testing.T) {
-	w := newWedgeFixture(t)
-	w.established()
-	_ = w.p.dialer.abandonAttempt() // detached, and never closed
-
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-	if _, err := w.p.FindByName(ctx, "worker-1"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("FindByName = %v, want the caller to give up on the refused redial", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		w.p.mu.Lock()
-		inFlight := w.p.dial != nil
-		w.p.mu.Unlock()
-		if !inFlight {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the refused redial kept its attempt claimed after its only caller gave up")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
 
 // While a reconnect recovers from the wedge, IsConnected still says true and the
 // new socket is already alive; only the in-flight attempt shows the handshake is
@@ -418,20 +360,4 @@ func TestACallerDuringTheRecoveryWaitsForTheHandshake(t *testing.T) {
 			t.Errorf("FindByName = %v after the handshake, want an ordinary lookup", err)
 		}
 	}
-}
-
-// When go-libvirt does notice a disconnect, it does so a moment after the socket
-// dies, and a handshake started inside that moment is torn down by its cleanup.
-// socketLost sees the death first, so the reconnect has to wait out that moment
-// -- as it effectively did before PET-67, when it began only once IsConnected
-// went false -- rather than fail one call.
-func TestTheReconnectWaitsForGoLibvirtsCleanup(t *testing.T) {
-	w := newWedgeFixture(t)
-	w.cleanup = 20 * time.Millisecond
-	daemonEnd := w.established()
-	reader := w.currentReader()
-
-	_ = daemonEnd.Close()
-	w.waitForReader(reader)
-	w.assertRecovers()
 }
