@@ -11,6 +11,11 @@
 # a HydraCluster, and at machines whose infrastructure is a HydraMachine, so
 # the file is safe on a management cluster shared with other providers.
 #
+# A control plane, or a machine, in its first hour or half hour is still being
+# built: it is Ready on nothing and has no quorum yet, which is not an outage.
+# The control-plane and machine-readiness rules leave such objects out; one
+# that is still not there after that is reported.
+#
 # Every alert is named Hydra*, which is what an Alertmanager route can match on.
 # The unit tests are alerts_test.yaml; run them with `make test-alerts`.
 apiVersion: monitoring.coreos.com/v1
@@ -109,6 +114,7 @@ spec:
       expr: |
         (capi_hydramachine_status_condition{type="Ready",status="True"} == 0)
         and on (namespace, name) capi_hydramachine_info{control_plane_name!=""}
+        unless on (namespace, name) (time() - capi_hydramachine_created < 1800)
       for: 10m
       labels:
         severity: critical
@@ -123,6 +129,7 @@ spec:
       expr: |
         (capi_hydramachine_status_condition{type="Ready",status="True"} == 0)
         unless on (namespace, name) capi_hydramachine_info{control_plane_name!=""}
+        unless on (namespace, name) (time() - capi_hydramachine_created < 1800)
       for: 10m
       labels:
         severity: warning
@@ -213,11 +220,35 @@ spec:
           NotReady or unreachable. Its pods are being evicted or are stuck. If the
           VM itself is gone, HydraMachineNotReady follows.
         runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydranodeunhealthy
+    - alert: HydraNodeFlapping
+      # A VM that dies and is restarted keeps its node unhealthy for less than
+      # the 5 minutes HydraNodeUnhealthy waits: the provider starts a stopped
+      # domain at its next check, every 5 minutes. Counting transitions catches
+      # the loop; one outage and recovery is two.
+      expr: |
+        (
+          (changes(capi_machine_status_condition{type="NodeHealthy",status="True"}[30m]) >= 4)
+          * on (namespace, name) group_left (node_name) capi_machine_status_noderef
+          unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
+        )
+        and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine"}
+      labels:
+        severity: warning
+      annotations:
+        summary: Node {{ $labels.node_name }} of cluster {{ $labels.cluster_name }} keeps going unhealthy and back
+        description: >-
+          The node behind Machine {{ $labels.namespace }}/{{ $labels.name }} changed
+          health {{ $value | printf "%.0f" }} times in 30 minutes. Each episode is shorter
+          than HydraNodeUnhealthy waits, so that alert never fires: typically a VM
+          that crashes and is restarted by the provider, or a kubelet that keeps
+          failing.
+        runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydranodeflapping
     - alert: HydraEtcdUnhealthy
       expr: |
         (capi_kubeadmcontrolplane_status_condition{type="EtcdClusterHealthy",status="True"} == 0)
         and on (namespace, cluster_name)
         label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
       for: 5m
       labels:
         severity: critical
@@ -234,6 +265,7 @@ spec:
         (capi_kubeadmcontrolplane_status_replicas_ready * 2 <= capi_kubeadmcontrolplane_spec_replicas)
         and on (namespace, cluster_name)
         label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
       for: 2m
       labels:
         severity: critical
@@ -253,6 +285,7 @@ spec:
         )
         and on (namespace, cluster_name)
         label_replace(capi_cluster_info{infrastructure_reference_kind="HydraCluster"}, "cluster_name", "$1", "name", "(.+)")
+        unless on (namespace, name) (time() - capi_kubeadmcontrolplane_created < 3600)
       for: 15m
       labels:
         severity: warning

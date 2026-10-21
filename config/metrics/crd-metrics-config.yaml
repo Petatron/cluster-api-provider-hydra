@@ -89,6 +89,14 @@ spec:
       - uid
     metricNamePrefix: capi_hydramachine
     metrics:
+    - name: created
+      help: Unix creation timestamp.
+      each:
+        gauge:
+          path:
+          - metadata
+          - creationTimestamp
+        type: Gauge
     - name: info
       help: Information about a hydramachine.
       each:

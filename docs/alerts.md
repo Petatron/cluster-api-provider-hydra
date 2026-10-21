@@ -27,6 +27,13 @@ file is safe on a management cluster shared with other providers.
 Every alert is named `Hydra*`, and `severity` is `critical` (something is down
 or about to be) or `warning` (someone has to act, but nothing is down yet).
 
+## Objects still being built
+
+A new control plane has no quorum and its machines are not Ready yet. The
+etcd and control-plane alerts therefore ignore a KubeadmControlPlane in its
+first hour, and the machine-readiness alerts ignore a HydraMachine in its first
+30 minutes. One still not healthy after that is reported.
+
 ## What the rules cannot see
 
 - **The management cluster itself.** If it, its Prometheus or its Alertmanager
@@ -177,6 +184,17 @@ node. A MachineHealthCheck, if there is one, may already be replacing it.
 
 If [HydraClusterAPIUnreachable](#hydraclusterapiunreachable) fires for the same
 cluster, start there: Cluster API cannot see any node then.
+
+### HydraNodeFlapping
+
+**warning, 30m window.** A Hydra machine's `NodeHealthy` condition changed at
+least four times in 30 minutes, i.e. at least two separate unhealthy episodes,
+each too short for [HydraNodeUnhealthy](#hydranodeunhealthy).
+
+The usual cause is a VM that keeps dying: the provider starts a stopped domain
+at its next check, every 5 minutes, so the node is back before the 5-minute
+alert fires. A kubelet that keeps failing looks the same. Look at the VM's
+console log on the hypervisor and the node's kubelet log.
 
 ### HydraEtcdUnhealthy
 

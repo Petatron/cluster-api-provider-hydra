@@ -400,3 +400,99 @@ tests:
         namespace: default
         uid: k2
         severity: warning
+
+# --- objects still being built, and a VM in a crash loop --------------------
+- name: control planes in their first hour are not an outage
+  interval: 1m
+  input_series:
+  - series: 'capi_cluster_info{name="new", namespace="default", uid="c4", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  - series: 'capi_cluster_info{name="old", namespace="default", uid="c5", infrastructure_reference_kind="HydraCluster"}'
+    values: '1x30'
+  # Created at the start of the test: 16 minutes old at 16m.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '0x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="new", name="new-cp", namespace="default", uid="k4"}'
+    values: '0x10 1x20'
+  - series: 'capi_kubeadmcontrolplane_status_condition{cluster_name="new", name="new-cp", namespace="default", uid="k4", type="EtcdClusterHealthy", status="True"}'
+    values: '0x30'
+  # Created two hours before the test started.
+  - series: 'capi_kubeadmcontrolplane_created{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '-7200x30'
+  - series: 'capi_kubeadmcontrolplane_spec_replicas{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '3x30'
+  - series: 'capi_kubeadmcontrolplane_status_replicas_ready{cluster_name="old", name="old-cp", namespace="default", uid="k5"}'
+    values: '1x30'
+  alert_rule_test:
+  - eval_time: 16m
+    alertname: HydraControlPlaneQuorumLost
+    exp_alerts:
+    - exp_labels:
+        cluster_name: old
+        name: old-cp
+        namespace: default
+        uid: k5
+        severity: critical
+  - eval_time: 16m
+    alertname: HydraEtcdUnhealthy
+    exp_alerts: []
+
+- name: machines in their first half hour are not stuck yet
+  interval: 1m
+  input_series:
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-new", namespace="default", uid="m7", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_created{cluster_name="wl", name="wl-md-new", namespace="default", uid="m7"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_status_condition{cluster_name="wl", name="wl-md-old", namespace="default", uid="m8", type="Ready", status="True"}'
+    values: '0x20'
+  - series: 'capi_hydramachine_created{cluster_name="wl", name="wl-md-old", namespace="default", uid="m8"}'
+    values: '-7200x20'
+  alert_rule_test:
+  - eval_time: 11m
+    alertname: HydraMachineNotReady
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-old
+        namespace: default
+        uid: m8
+        type: Ready
+        status: "True"
+        severity: warning
+
+- name: a VM restarted every five minutes
+  interval: 1m
+  input_series:
+  # Unhealthy four minutes in every five: never the five HydraNodeUnhealthy waits.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", type="NodeHealthy", status="True"}'
+    values: '1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", node_name="wl-md-a"}'
+    values: '1x35'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-a", namespace="default", uid="f1", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x35'
+  # One outage and its recovery is not flapping.
+  - series: 'capi_machine_status_condition{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", type="NodeHealthy", status="True"}'
+    values: '1x5 0x10 1x20'
+  - series: 'capi_machine_status_noderef{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", node_name="wl-md-b"}'
+    values: '1x35'
+  - series: 'capi_machine_info{cluster_name="wl", name="wl-md-b", namespace="default", uid="f2", infrastructure_reference_kind="HydraMachine"}'
+    values: '1x35'
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: HydraNodeUnhealthy
+    exp_alerts: []
+  - eval_time: 30m
+    alertname: HydraNodeFlapping
+    exp_alerts:
+    - exp_labels:
+        cluster_name: wl
+        name: wl-md-a
+        namespace: default
+        uid: f1
+        node_name: wl-md-a
+        type: NodeHealthy
+        status: "True"
+        severity: warning
