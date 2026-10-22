@@ -16,6 +16,11 @@
 # The control-plane and machine-readiness rules leave such objects out; one
 # that is still not there after that is reported.
 #
+# A Cluster whose control plane Cluster API does not manage (no controlPlaneRef,
+# e.g. an adopted cluster) never becomes Available or ControlPlaneInitialized,
+# and Cluster API cannot inspect its nodes, so NodeHealthy stays Unknown. The
+# rules that read those leave such clusters out rather than fire forever.
+#
 # Every alert is named Hydra*, which is what an Alertmanager route can match on.
 # The unit tests are alerts_test.yaml; run them with `make test-alerts`.
 apiVersion: monitoring.coreos.com/v1
@@ -182,6 +187,7 @@ spec:
       expr: |
         label_replace(capi_cluster_status_condition{type="Available",status="True"} == 0, "cluster_name", "$1", "name", "(.+)")
         and on (namespace, name) capi_cluster_info{infrastructure_reference_kind="HydraCluster"}
+        unless on (namespace, name) capi_cluster_info{control_plane_reference_kind=""}
       for: 15m
       labels:
         severity: warning
@@ -200,6 +206,8 @@ spec:
           unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
         )
         and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine",control_plane_name!=""}
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_status_condition{type="ControlPlaneInitialized",status="True"} == 1, "cluster_name", "$1", "name", "(.+)")
       for: 5m
       labels:
         severity: critical
@@ -218,6 +226,8 @@ spec:
           unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
         )
         and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine",control_plane_name=""}
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_status_condition{type="ControlPlaneInitialized",status="True"} == 1, "cluster_name", "$1", "name", "(.+)")
       for: 5m
       labels:
         severity: warning
@@ -240,6 +250,8 @@ spec:
           unless on (namespace, name) (capi_machine_status_condition{type="Deleting",status="True"} == 1)
         )
         and on (namespace, name) capi_machine_info{infrastructure_reference_kind="HydraMachine"}
+        and on (namespace, cluster_name)
+        label_replace(capi_cluster_status_condition{type="ControlPlaneInitialized",status="True"} == 1, "cluster_name", "$1", "name", "(.+)")
       labels:
         severity: warning
       annotations:
