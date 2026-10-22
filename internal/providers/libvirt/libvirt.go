@@ -133,6 +133,13 @@ type Config struct {
 	// cacert.pem. Empty uses go-libvirt's default search paths.
 	PKIPath string
 
+	// Credentials, when set, is the TLS client PKI itself, held in memory
+	// rather than read from PKIPath -- how a connection named by one cluster
+	// carries credentials of its own (PET-38). It needs RemoteAddr and TLS:
+	// with Insecure, or with no remote address, there is no TLS to use it in,
+	// and New refuses rather than ignore it.
+	Credentials *TLSCredentials
+
 	// StoragePool is the libvirt pool that machine disks are created in.
 	StoragePool string
 
@@ -148,6 +155,36 @@ type Config struct {
 	// set a deadline. Defaults to 30s.
 	RPCTimeout time.Duration
 }
+
+// TLSCredentials is a TLS client identity and the CA its server must chain to,
+// as PEM: the contents of cacert.pem, clientcert.pem and clientkey.pem.
+type TLSCredentials struct {
+	CACert, ClientCert, ClientKey []byte
+}
+
+// Hypervisor names the endpoint cfg reaches, for metrics and logs: host:port for
+// a remote daemon, with the transport's default port filled in, or "local" for
+// the local socket. Two configs reaching the same daemon name it the same way.
+func (c Config) Hypervisor() string {
+	if c.RemoteAddr == "" {
+		return "local"
+	}
+	host, port, err := splitRemoteAddr(c.RemoteAddr)
+	if err != nil {
+		return c.RemoteAddr
+	}
+	if port == "" {
+		port = defaultTLSPort
+		if c.Insecure {
+			port = defaultTCPPort
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// defaultTCPPort is libvirtd's plain-TCP port, used when an insecure remote
+// address names none.
+const defaultTCPPort = "16509"
 
 // client is the part of go-libvirt's API this provider calls. *golibvirt.Libvirt
 // is the only production implementation; the interface exists so the failure

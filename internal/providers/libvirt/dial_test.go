@@ -17,6 +17,7 @@ limitations under the License.
 package libvirt
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -128,5 +129,38 @@ func TestNewDialerRejectsMalformedAddr(t *testing.T) {
 	_, err := newDialer(Config{RemoteAddr: testHost + ":" + testTCPPort + ":extra"})
 	if err == nil {
 		t.Fatal("newDialer accepted a malformed address")
+	}
+}
+
+// Credentials are TLS material. Given for a connection that uses no TLS they
+// would be silently ignored, so they are refused instead.
+func TestNewDialerRefusesCredentialsWithoutTLS(t *testing.T) {
+	creds := &TLSCredentials{CACert: []byte("x")}
+	for name, cfg := range map[string]Config{
+		"local socket": {Credentials: creds},
+		"insecure TCP": {RemoteAddr: "hypervisor:16509", Insecure: true, Credentials: creds},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := newDialer(cfg); err == nil || !strings.Contains(err.Error(), "does not use TLS") {
+				t.Fatalf("newDialer = %v, want the credentials refused", err)
+			}
+		})
+	}
+}
+
+func TestConfigHypervisorNamesTheEndpoint(t *testing.T) {
+	const tls = "192.168.15.13:16514"
+	for cfg, want := range map[Config]string{
+		{}:                                      "local",
+		{RemoteAddr: "192.168.15.13"}:           tls,
+		{RemoteAddr: tls}:                       tls,
+		{RemoteAddr: "hv", Insecure: true}:      "hv:16509",
+		{RemoteAddr: "hv:2000", Insecure: true}: "hv:2000",
+		{RemoteAddr: "[2001:db8::1]"}:           "[2001:db8::1]:16514",
+		{RemoteAddr: "2001:db8::1"}:             "[2001:db8::1]:16514",
+	} {
+		if got := cfg.Hypervisor(); got != want {
+			t.Errorf("Config{RemoteAddr: %q, Insecure: %v}.Hypervisor() = %q, want %q", cfg.RemoteAddr, cfg.Insecure, got, want)
+		}
 	}
 }

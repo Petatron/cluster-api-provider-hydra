@@ -21,7 +21,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
-	"sync"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -29,6 +28,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -251,62 +251,39 @@ func main() {
 		setupLog.Error(err, "Libvirt backend cannot be reached with this configuration")
 	}
 
-	var providerMu sync.Mutex
-	// Two references to one provider: what the reconcilers use, and what has to
-	// be closed. They differ because the reconcilers get an instrumented wrapper
-	// around the libvirt provider, and only the latter owns a connection --
-	// MachineProvider has no Close, deliberately, since not every backend holds
-	// one open.
-	var machineProvider providers.MachineProvider
-	var libvirtConn *libvirtprovider.Provider
-	defer func() {
-		providerMu.Lock()
-		defer providerMu.Unlock()
-		if libvirtConn != nil {
-			if err := libvirtConn.Close(); err != nil {
-				setupLog.Error(err, "Failed to close the libvirt connection")
-			}
-		}
-	}()
+	// Backend connections are held by a pool, one per hypervisor, and closed
+	// when nothing uses them any more (PET-38). Every cluster resolves to the
+	// connection the --libvirt-* flags configure, held with no owner and so
+	// never closed while the manager runs -- the single shared connection this
+	// replaces. The pool is what lets a cluster name a hypervisor of its own.
+	var pool providers.Pool
+	defer pool.CloseAll()
 
-	// The factory itself is the singleton, nil-check included, all under the
-	// lock. Two reconcilers share it and each caches what it returns, so a
-	// factory that always dialled would open one connection per reconciler and
-	// leave the first unreferenced -- closed by nothing, since the assignment
-	// below would have overwritten it. Holding the lock across the whole body
-	// also closes the race where both call in at once.
-	newProvider := func(ctx context.Context) (providers.MachineProvider, error) {
-		providerMu.Lock()
-		defer providerMu.Unlock()
-
-		if machineProvider != nil {
-			return machineProvider, nil
-		}
-		// Timed here rather than in the decorator, because the dial and handshake
-		// happen inside the constructor -- before there is a provider to wrap.
-		// An unreachable hypervisor consumes the whole dial timeout, and without
-		// this that would be the one operation producing no sample at all.
+	hypervisor := libvirtCfg.Hypervisor()
+	// The flag-configured connection. Timed here rather than in the decorator,
+	// because the dial and handshake happen inside the constructor -- before
+	// there is a provider to wrap. An unreachable hypervisor consumes the whole
+	// dial timeout, and without this that would be the one operation producing
+	// no sample at all. Wrapped once, here, so every reconciler shares the same
+	// instrumented instance.
+	openDefault := func(ctx context.Context) (providers.MachineProvider, func() error, error) {
 		dialStart := time.Now()
 		p, err := libvirtprovider.New(ctx, libvirtCfg)
-		providers.ObserveDial(dialStart, err)
+		providers.ObserveDial(hypervisor, dialStart, err)
 		if err != nil {
-			// Deliberately not cached. A hypervisor that was down at first
-			// reconcile is retried, not remembered as broken.
-			return nil, err
+			return nil, nil, err
 		}
-		// Wrapped once, here, so both reconcilers share the same instrumented
-		// instance and the singleton above still holds -- a wrapper created per
-		// caller would be harmless for metrics but would defeat the nil check
-		// that keeps this to one libvirt connection.
-		libvirtConn = p
-		machineProvider = providers.NewInstrumented(p)
-		return machineProvider, nil
+		return providers.NewInstrumented(p, hypervisor), p.Close, nil
+	}
+	providerFor := func(ctx context.Context, _ *infrastructurev1alpha1.HydraCluster) (providers.MachineProvider, error) {
+		return pool.Get(ctx, types.NamespacedName{}, "flags", hypervisor, openDefault)
 	}
 
 	if err := (&controller.HydraClusterReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		NewProvider: newProvider,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		ProviderFor:     providerFor,
+		ReleaseProvider: pool.Release,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydracluster")
 		os.Exit(1)
@@ -331,7 +308,7 @@ func main() {
 		// start a cluster-wide Secret informer and hold every Secret in the
 		// cluster in this process's memory.
 		APIReader:   mgr.GetAPIReader(),
-		NewProvider: newProvider,
+		ProviderFor: providerFor,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")
 		os.Exit(1)

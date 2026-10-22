@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -88,11 +87,15 @@ type HydraMachineReconciler struct {
 	// reconciler can be tested exhaustively against a fake, and so a second
 	// backend requires no controller changes.
 	//
-	// Tests set this directly. In production it is left nil and built on first
-	// use from NewProvider.
+	// Tests set this directly, and it then serves every machine. In production
+	// it is left nil and each reconcile asks ProviderFor.
 	Provider providers.MachineProvider
 
-	// NewProvider builds the backend on first reconcile.
+	// ProviderFor returns the backend for the machines of a HydraCluster, or of
+	// no cluster when hydraCluster is nil (a standalone machine, or one whose
+	// cluster cannot be read). Connections are held by whatever implements it,
+	// not here: a manager can reach more than one hypervisor (PET-38), so there
+	// is no single provider for this reconciler to keep.
 	//
 	// Connecting lazily rather than at startup is deliberate. Building it in
 	// main() meant a missing storage pool, or a hypervisor that was simply down,
@@ -101,31 +104,24 @@ type HydraMachineReconciler struct {
 	// suite could never observe a Running manager at all. Failing here instead
 	// puts the reason on the object as a terminal condition, where it is visible
 	// and survives being read later.
-	NewProvider func(context.Context) (providers.MachineProvider, error)
-
-	// mu guards lazy construction of Provider.
-	mu sync.Mutex
+	ProviderFor func(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error)
 }
 
-// provider returns the backend, building it on first use.
+// provider returns the backend for a machine's cluster.
 //
-// Only a successful construction is cached, so a hypervisor that was unreachable
-// at first reconcile is retried rather than remembered as broken.
-func (r *HydraMachineReconciler) provider(ctx context.Context) (providers.MachineProvider, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+// A failure is not remembered: the next reconcile asks again, so a hypervisor
+// that was unreachable is retried rather than remembered as broken.
+func (r *HydraMachineReconciler) provider(ctx context.Context, link *linkage) (providers.MachineProvider, error) {
 	if r.Provider != nil {
 		return r.Provider, nil
 	}
-	if r.NewProvider == nil {
+	if r.ProviderFor == nil {
 		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
 	}
-	p, err := r.NewProvider(ctx)
+	p, err := r.ProviderFor(ctx, hydraClusterOf(link))
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the infrastructure backend: %w", err)
 	}
-	r.Provider = p
 	return p, nil
 }
 
@@ -174,7 +170,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	prov, err := r.provider(ctx)
+	prov, err := r.provider(ctx, link)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
 			return ctrl.Result{}, statusErr

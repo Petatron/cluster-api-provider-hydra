@@ -58,6 +58,11 @@ type tlsDialer struct {
 	timeout    time.Duration
 	certDirs   []tlsCertDir
 	caDirs     []string
+
+	// cert and roots, when set, are credentials held in memory
+	// (newTLSDialerWithCredentials), used instead of the directories above.
+	cert  *tls.Certificate
+	roots *x509.CertPool
 }
 
 // tlsCertDir is one place to look for the client certificate and its key.
@@ -102,6 +107,25 @@ func newTLSDialer(host, port, pkiPath string, timeout time.Duration) *tlsDialer 
 		d.caDirs = append([]string{home}, d.caDirs...)
 	}
 	return d
+}
+
+// newTLSDialerWithCredentials returns a dialer for host:port whose client
+// identity and CA come from memory, as a cluster's Secret supplies them
+// (PET-38). They are parsed here, once, so a malformed Secret is reported when
+// the connection is built rather than on every dial.
+func newTLSDialerWithCredentials(host, port string, creds TLSCredentials, timeout time.Duration) (*tlsDialer, error) {
+	cert, err := tls.X509KeyPair(creds.ClientCert, creds.ClientKey)
+	if err != nil {
+		return nil, fmt.Errorf("libvirt: invalid TLS client certificate or key: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(creds.CACert) {
+		return nil, errors.New("libvirt: the TLS CA certificate contains no PEM certificate")
+	}
+	d := newTLSDialer(host, port, "", timeout)
+	d.certDirs, d.caDirs = nil, nil
+	d.cert, d.roots = &cert, roots
+	return d, nil
 }
 
 // Dial implements socket.Dialer.
@@ -151,16 +175,20 @@ func (d *tlsDialer) Dial() (net.Conn, error) {
 // config loads the client certificate and the CA that must have signed the
 // server's certificate.
 func (d *tlsDialer) config() (*tls.Config, error) {
-	cert, err := d.clientCert()
-	if err != nil {
-		return nil, err
-	}
-	roots, err := d.caPool()
-	if err != nil {
-		return nil, err
+	cert, roots := d.cert, d.roots
+	if cert == nil {
+		c, err := d.clientCert()
+		if err != nil {
+			return nil, err
+		}
+		pool, err := d.caPool()
+		if err != nil {
+			return nil, err
+		}
+		cert, roots = &c, pool
 	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{*cert},
 		RootCAs:      roots,
 		// The server certificate is checked against the address actually dialled,
 		// so dialling an IP needs that IP as a SAN on the server's certificate.

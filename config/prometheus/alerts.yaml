@@ -49,14 +49,14 @@ spec:
         runbook_url: https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/alerts.md#hydraproviderdown
     - alert: HydraBackendUnreachable
       expr: |
-        sum by (job) (increase(hydra_provider_operation_duration_seconds_count{outcome="error"}[15m])) > 0
-        unless on (job)
-        sum by (job) (increase(hydra_provider_operation_duration_seconds_count{outcome!="error"}[15m])) > 0
+        sum by (job, hypervisor) (increase(hydra_provider_operation_duration_seconds_count{outcome="error"}[15m])) > 0
+        unless on (job, hypervisor)
+        sum by (job, hypervisor) (increase(hydra_provider_operation_duration_seconds_count{outcome!="error"}[15m])) > 0
       for: 5m
       labels:
         severity: critical
       annotations:
-        summary: Every call the Hydra provider made to its hypervisor in 15 minutes failed
+        summary: Every call the Hydra provider made to hypervisor {{ $labels.hypervisor }} in 15 minutes failed
         description: >-
           The provider reaches its backend at least every 5 minutes per machine,
           and for the last 15 minutes every call ended in a connection error

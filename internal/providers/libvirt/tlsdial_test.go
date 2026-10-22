@@ -490,3 +490,80 @@ func TestNewTLSDialerDefaultsTheTimeout(t *testing.T) {
 		t.Errorf("timeout = %s, want the %s connect default that New also applies", got, defaultConnectTimeout)
 	}
 }
+
+// credentialsFrom reads a test PKI's client files into memory, the way a
+// cluster's Secret supplies them (PET-38).
+func credentialsFrom(t *testing.T, dir string) TLSCredentials {
+	t.Helper()
+	read := func(name string) []byte {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		return b
+	}
+	return TLSCredentials{CACert: read("cacert.pem"), ClientCert: read("clientcert.pem"), ClientKey: read("clientkey.pem")}
+}
+
+func TestTLSDialerConnectsWithCredentialsFromMemory(t *testing.T) {
+	pki := newTestPKI(t)
+	host, port := serveTLS(t, pki, func(c net.Conn) {
+		_, _ = c.Write([]byte{tlsVerificationOK})
+		_, _ = io.Copy(io.Discard, c)
+	})
+
+	d, err := newTLSDialerWithCredentials(host, port, credentialsFrom(t, pki.clientDir), testDialTimeout)
+	if err != nil {
+		t.Fatalf("newTLSDialerWithCredentials: %v", err)
+	}
+	if len(d.certDirs) != 0 || len(d.caDirs) != 0 {
+		t.Errorf("an in-memory dialer still searches directories: %v %v", d.certDirs, d.caDirs)
+	}
+	conn, err := d.Dial()
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	_ = conn.Close()
+}
+
+// Credentials from memory are held to the same check as files: a server
+// certificate from another CA fails the handshake.
+func TestTLSDialerWithCredentialsRejectsAServerFromAnotherCA(t *testing.T) {
+	host, port := serveTLS(t, newTestPKI(t), func(c net.Conn) { _, _ = io.Copy(io.Discard, c) })
+
+	d, err := newTLSDialerWithCredentials(host, port, credentialsFrom(t, newTestPKI(t).clientDir), testDialTimeout)
+	if err != nil {
+		t.Fatalf("newTLSDialerWithCredentials: %v", err)
+	}
+	if _, err := d.Dial(); err == nil || !strings.Contains(err.Error(), "TLS handshake") {
+		t.Fatalf("Dial error = %v, want the handshake to reject the server certificate", err)
+	}
+}
+
+// Malformed credentials are reported when the connection is built, not on every
+// dial against a hypervisor that was never at fault.
+func TestTLSDialerWithCredentialsRejectsMalformedPEM(t *testing.T) {
+	const noCA, badPair = "contains no PEM certificate", "invalid TLS client certificate or key"
+	good := credentialsFrom(t, newTestPKI(t).clientDir)
+	other := credentialsFrom(t, newTestPKI(t).clientDir)
+	cases := map[string]struct {
+		mutate func(*TLSCredentials)
+		want   string
+	}{
+		"no CA":                  {func(c *TLSCredentials) { c.CACert = nil }, noCA},
+		"CA is not PEM":          {func(c *TLSCredentials) { c.CACert = []byte("not a certificate") }, noCA},
+		"no client key":          {func(c *TLSCredentials) { c.ClientKey = nil }, badPair},
+		"key from another pair":  {func(c *TLSCredentials) { c.ClientKey = other.ClientKey }, badPair},
+		"certificate is not PEM": {func(c *TLSCredentials) { c.ClientCert = []byte("junk") }, badPair},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			creds := good
+			tc.mutate(&creds)
+			_, err := newTLSDialerWithCredentials("127.0.0.1", "", creds, testDialTimeout)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}

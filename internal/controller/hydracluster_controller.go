@@ -22,9 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -67,35 +67,41 @@ type HydraClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// Provider is the infrastructure backend. Tests set it directly; in
-	// production it is built on first use from NewProvider, for the same reason
-	// the machine reconciler does it lazily -- a hypervisor that is down at
-	// startup should produce a condition on an object, not a crash loop with no
-	// explanation.
+	// Provider is the infrastructure backend. Tests set it directly. In
+	// production it is nil and each reconcile asks ProviderFor, for the same
+	// reason the machine reconciler does it lazily -- a hypervisor that is down
+	// at startup should produce a condition on an object, not a crash loop with
+	// no explanation.
 	Provider providers.MachineProvider
 
-	// NewProvider builds the backend on first reconcile.
-	NewProvider func(context.Context) (providers.MachineProvider, error)
+	// ProviderFor returns the backend for a HydraCluster's infrastructure. See
+	// HydraMachineReconciler.ProviderFor.
+	ProviderFor func(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error)
 
-	mu sync.Mutex
+	// ReleaseProvider tells whatever holds connections that a HydraCluster is
+	// gone, so a connection only it used can be closed (PET-38). Optional.
+	ReleaseProvider func(ctx context.Context, hydraCluster types.NamespacedName)
 }
 
-func (r *HydraClusterReconciler) provider(ctx context.Context) (providers.MachineProvider, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+func (r *HydraClusterReconciler) provider(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error) {
 	if r.Provider != nil {
 		return r.Provider, nil
 	}
-	if r.NewProvider == nil {
+	if r.ProviderFor == nil {
 		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
 	}
-	p, err := r.NewProvider(ctx)
+	p, err := r.ProviderFor(ctx, hydraCluster)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the infrastructure backend: %w", err)
 	}
-	r.Provider = p
 	return p, nil
+}
+
+// release tells the connection holder a HydraCluster is gone.
+func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types.NamespacedName) {
+	if r.ReleaseProvider != nil {
+		r.ReleaseProvider(ctx, hydraCluster)
+	}
 }
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters,verbs=get;list;watch;create;update;patch;delete
@@ -107,6 +113,9 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	hydraCluster := &infrav1.HydraCluster{}
 	if err := r.Get(ctx, req.NamespacedName, hydraCluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.release(ctx, req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -131,6 +140,7 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !hydraCluster.DeletionTimestamp.IsZero() {
 		log.V(1).Info("HydraCluster is being deleted; any managed network is deliberately left in place",
 			"name", hydraCluster.Name)
+		r.release(ctx, req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 
@@ -147,7 +157,7 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	prov, err := r.provider(ctx)
+	prov, err := r.provider(ctx, hydraCluster)
 	if err != nil {
 		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
 			return ctrl.Result{}, statusErr

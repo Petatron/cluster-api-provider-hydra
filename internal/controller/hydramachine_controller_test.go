@@ -393,7 +393,7 @@ var _ = Describe("HydraMachine Reconciler", func() {
 			lazy := &HydraMachineReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
-				NewProvider: func(context.Context) (providers.MachineProvider, error) {
+				ProviderFor: func(context.Context, *infrav1.HydraCluster) (providers.MachineProvider, error) {
 					attempts++
 					if attempts == 1 {
 						return nil, errors.New("hypervisor unreachable")

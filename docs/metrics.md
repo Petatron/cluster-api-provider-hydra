@@ -19,7 +19,12 @@ Read those first: `controller_runtime_reconcile_total`,
 
 ### `hydra_provider_operation_duration_seconds`
 
-Histogram. Labels: `operation`, `outcome`.
+Histogram. Labels: `operation`, `outcome`, `hypervisor`.
+
+`hypervisor` is the endpoint the call went to: `host:port` for a remote
+daemon, with the transport's default port filled in, or `local` for the local
+socket. It is bounded by the number of hypervisors the manager reaches, not by
+anything that grows at runtime (PET-38).
 
 Time spent inside the infrastructure backend. This is the difference between
 *"the reconcile took 40 seconds"* and *"defining the domain took 39 of them"* —
@@ -49,6 +54,15 @@ be gone. Alerting on it would fire constantly against a healthy provider.
 Buckets run to 160s. Machine creation clones a disk, builds an ISO and defines a
 domain; the client library's defaults top out at 10s and would put every create
 in `+Inf`.
+
+### `hydra_provider_connections`
+
+Gauge. No labels.
+
+Backend connections the manager holds open: one per hypervisor in use, plus
+the one the `--libvirt-*` flags configure. A connection is closed once no
+cluster uses it any more -- the cluster was deleted, or now reaches its
+hypervisor another way -- and this goes down when that happens.
 
 ### `hydra_machine_wait_total`
 
