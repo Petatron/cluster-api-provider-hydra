@@ -59,6 +59,11 @@ jobs:
       - name: Build manager binary
         run: make build
 
+      # The provider's connection code is concurrent; a data race there is a
+      # wedged or crashed manager (PET-67), and `make test` runs without -race.
+      - name: Race-test the libvirt provider
+        run: make test-race
+
       # `make test` already checks every alert is documented and unit-tested;
       # this runs promtool's lint and the unit tests themselves (PET-64).
       - name: Test the shipped alerts

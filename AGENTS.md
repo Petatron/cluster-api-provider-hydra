@@ -80,8 +80,9 @@ make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
 Full local loop before opening a PR: `make manifests generate lint test build`, plus
-`make test-etcd-backup` when `tools/etcd-backup/` changed, and `make test-alerts` when
-`config/prometheus/` or `config/metrics/` changed.
+`make test-etcd-backup` when `tools/etcd-backup/` changed, `make test-alerts` when
+`config/prometheus/` or `config/metrics/` changed, and `make test-race` when
+`internal/providers/libvirt/` changed.
 
 **Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
 it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
