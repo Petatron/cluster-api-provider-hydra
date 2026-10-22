@@ -79,9 +79,10 @@ func startScriptDaemon(t *testing.T) *scriptDaemon {
 	// Libvirt.disconnected while the waitAndDisconnect goroutine it just started
 	// reads it, without a lock. The provider cannot avoid that, and the race
 	// detector would fail the tests for it. The provider's own synchronisation is
-	// covered under -race by the fake-client tests in wedge_test.go.
+	// covered under -race by the fake-client tests in wedge_test.go. Upstream:
+	// https://github.com/digitalocean/go-libvirt/issues/297
 	if raceDetector {
-		t.Skip("go-libvirt races on Libvirt.disconnected when a connection drops right after opening (upstream)")
+		t.Skip("go-libvirt races on Libvirt.disconnected when a connection drops right after opening (digitalocean/go-libvirt#297)")
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

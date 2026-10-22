@@ -501,7 +501,7 @@ func (p *Provider) attemptLimit() time.Duration {
 // succeeded, and their next RPC fails on the closed socket -- one failed call,
 // then a redial.
 //
-// go-libvirt never reports that close (PET-67). Its ConnectToURI replaces its
+// go-libvirt never reports that close (PET-67, digitalocean/go-libvirt#297). Its ConnectToURI replaces its
 // disconnected channel only after the handshake succeeds, so a socket closed
 // between those two statements -- by this, by recycle, or by the daemon -- is a
 // disconnect it never reports, and IsConnected stays true. Detaching marks the
