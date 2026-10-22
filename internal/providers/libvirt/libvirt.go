@@ -196,13 +196,13 @@ type Provider struct {
 	cfg Config
 	uri golibvirt.ConnectURI
 
-	// lv is the go-libvirt client. Read it through client(): a reconnect that
-	// recovers from a disconnect go-libvirt missed replaces it (PET-67).
+	// lv is the go-libvirt client. Read it through client(): every successful
+	// reconnect replaces it (PET-67, see ensureConnected).
 	lvMu sync.RWMutex
 	lv   client
-	// newClient builds a fresh client on the same dialer, for that
-	// replacement. Nil keeps the one client for good, which is what the fakes
-	// in tests want.
+	// newClient builds a fresh client on the same dialer, for each reconnect.
+	// Nil keeps the one client for good, which is what the fakes in tests
+	// want: they have no disconnect watcher to race.
 	newClient func() client
 
 	// mu guards the connection state below.
@@ -390,22 +390,23 @@ func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, contex
 // ConnectToURI running on it: go-libvirt reads and writes its disconnected
 // channel without a lock, so asking during a reconnect is a data race.
 //
-// A reconnect normally reuses the client, as go-libvirt allows once it has seen
-// the disconnect. When it has not -- it still says connected over a dead socket,
-// the PET-67 wedge -- the reconnect dials on a fresh client instead. Reusing
-// that one would race go-libvirt's own disconnect watcher for the old socket
+// Every reconnect dials on a fresh client, never the old one. Reusing a client
+// races go-libvirt's disconnect watcher for its previous socket
 // (waitAndDisconnect), which may not even have started yet: it reads the
 // client's socket and disconnected channel without a lock, could end up
 // watching the new socket alongside the new watcher, and two watchers closing
-// one channel panic the process. A fresh client shares none of that state; the
-// old one is dropped, and its watcher only ever sees the old, dead socket.
+// one channel panic the process. IsConnected being false does not rule that
+// out: after a handshake that failed at once it is false only because the
+// channel started closed, with that handshake's watcher possibly still
+// unscheduled. A fresh client shares none of that state; the old one is
+// dropped, and its watcher only ever sees the old, dead socket. The cost is
+// one allocation per reconnect, of a client that is dead anyway.
 func (p *Provider) ensureConnected(ctx context.Context) error {
 	p.mu.Lock()
 	var stale net.Conn
 	if p.dial == nil {
 		lv := p.client()
-		connected := lv.IsConnected()
-		if connected && !p.dialer.socketLost() {
+		if lv.IsConnected() && !p.dialer.socketLost() {
 			p.mu.Unlock()
 			return nil
 		}
@@ -421,7 +422,7 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 		// open for as long as reconciles keep coming.
 		limit := time.AfterFunc(p.attemptLimit(), func() { p.endAttempt(a) })
 		target := lv
-		if connected && p.newClient != nil {
+		if p.newClient != nil {
 			target = p.newClient()
 		}
 		go func() {
@@ -430,7 +431,7 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 			// p.dial no longer a and does nothing. Stopping it just frees the timer.
 			limit.Stop()
 			p.mu.Lock()
-			if err == nil && target != lv {
+			if err == nil {
 				p.lvMu.Lock()
 				p.lv = target
 				p.lvMu.Unlock()
@@ -501,13 +502,13 @@ func (p *Provider) attemptLimit() time.Duration {
 // succeeded, and their next RPC fails on the closed socket -- one failed call,
 // then a redial.
 //
-// go-libvirt never reports that close (PET-67, digitalocean/go-libvirt#297). Its ConnectToURI replaces its
-// disconnected channel only after the handshake succeeds, so a socket closed
-// between those two statements -- by this, by recycle, or by the daemon -- is a
-// disconnect it never reports, and IsConnected stays true. Detaching marks the
-// socket dead in trackingDialer, and ensureConnected checks that as well as
-// IsConnected, so the next call redials -- on a fresh client -- instead of
-// failing on the dead socket until a restart.
+// go-libvirt never reports that close (PET-67, digitalocean/go-libvirt#297).
+// Its ConnectToURI replaces its disconnected channel only after the handshake
+// succeeds, so a socket closed between those two statements -- by this, by
+// recycle, or by the daemon -- is a disconnect it never reports, and IsConnected
+// stays true. Detaching marks the socket dead in trackingDialer, and
+// ensureConnected checks that as well as IsConnected, so the next call redials
+// -- on a fresh client -- instead of failing on the dead socket until a restart.
 func (p *Provider) abandonDial(a *dialAttempt) {
 	p.mu.Lock()
 	a.waiters--

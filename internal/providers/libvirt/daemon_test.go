@@ -246,7 +246,7 @@ func TestRealGoLibvirtRecoversFromADropRightAfterOpen(t *testing.T) {
 		d.push(dropAfterOpen)
 		p := d.provider(t)
 		waitUntilLost(t, p)
-		if p.lv.IsConnected() {
+		if p.client().IsConnected() {
 			wedged++
 		}
 		if err := lookupOnce(p); err != nil {
@@ -271,13 +271,13 @@ func TestRealGoLibvirtCallerWaitsForTheRecoveryHandshake(t *testing.T) {
 		d.push(dropAfterOpen)
 		p = d.provider(t)
 		waitUntilLost(t, p)
-		if p.lv.IsConnected() {
+		if p.client().IsConnected() {
 			break
 		}
 		p = nil
 	}
 	if p == nil {
-		t.Skip("go-libvirt reported the disconnect in 50 runs; the wedge was not reached")
+		t.Fatal("go-libvirt reported the disconnect in all 50 runs; the test never reached the wedge")
 	}
 
 	d.push(slowOpen)

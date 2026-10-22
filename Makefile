@@ -171,6 +171,14 @@ docker-push: ## Push docker image with the manager.
 # provider rather than inside it, and ships as its own image.
 ETCD_BACKUP_IMG ?= etcd-backup:dev
 
+# The libvirt provider's connection handling is concurrent and races are its
+# failure mode (PET-67), so its tests also run under the race detector. Only
+# that package: the rest of the suite gains little and the envtest packages are
+# slow under -race.
+.PHONY: test-race
+test-race: ## Run the libvirt provider's tests under the race detector.
+	go test -race ./internal/providers/libvirt/ -count=1
+
 .PHONY: test-etcd-backup
 test-etcd-backup: ## Test the etcd-backup tool's naming and pruning logic.
 	sh tools/etcd-backup/etcd-backup_test.sh

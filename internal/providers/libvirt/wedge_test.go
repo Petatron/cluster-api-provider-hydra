@@ -200,9 +200,9 @@ func (w *wedgeFixture) assertRecovers() {
 	if n != 2 {
 		w.t.Errorf("%d sockets dialled, want the first and one redial", n)
 	}
-	// go-libvirt still says connected, so the redial must not reuse its client.
-	if fresh != 1 {
-		w.t.Errorf("%d fresh clients, want the redial on one", fresh)
+	// No connect reuses an old client: the first and the redial each got one.
+	if fresh != 2 {
+		w.t.Errorf("%d fresh clients for 2 connects, want one each", fresh)
 	}
 }
 
