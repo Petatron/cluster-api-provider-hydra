@@ -59,10 +59,13 @@ in `+Inf`.
 
 Gauge. No labels.
 
-Backend connections the manager holds open: one per hypervisor in use, plus
-the one the `--libvirt-*` flags configure. A connection is closed once no
-cluster uses it any more -- the cluster was deleted, or now reaches its
-hypervisor another way -- and this goes down when that happens.
+Backend connections the manager holds open. They open lazily, on the first
+reconcile that needs one, so this reads 0 until then. Today that is only the
+one the `--libvirt-*` flags configure, which stays open for the manager's
+life. Once clusters can name hypervisors of their own (PET-38) it is one per
+hypervisor in use plus that one, and a connection no cluster uses any more is
+closed -- the cluster was deleted, or now reaches its hypervisor another way --
+which brings this down.
 
 ### `hydra_machine_wait_total`
 

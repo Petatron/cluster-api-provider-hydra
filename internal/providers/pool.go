@@ -18,6 +18,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -46,6 +47,8 @@ type Pool struct {
 	mu     sync.Mutex
 	conns  map[string]*poolEntry
 	owners map[types.NamespacedName]string
+	// closed is set by CloseAll; the pool refuses all work afterwards.
+	closed bool
 
 	// afterReserve, when set, runs in Get between reserving an entry and
 	// binding to it -- the window a concurrent Release must not close the entry
@@ -58,8 +61,10 @@ type poolEntry struct {
 	name string
 
 	// open serialises opening, so concurrent callers for one target share one
-	// dial instead of racing several.
-	open sync.Mutex
+	// dial instead of racing several. A channel rather than a mutex, so a
+	// caller queued behind someone else's dial can give up when its own
+	// context ends instead of waiting out that dial's whole timeout.
+	open chan struct{}
 
 	// Guarded by Pool.mu.
 	prov    MachineProvider
@@ -68,6 +73,9 @@ type poolEntry struct {
 	pinned  bool // obtained with no owner: never closed
 	pending int  // callers between reserving this entry and binding to it
 }
+
+// errPoolClosed is returned by Get after CloseAll.
+var errPoolClosed = errors.New("the backend connection pool is closed")
 
 // Opener builds a connection: the provider, and a function that closes it.
 type Opener func(ctx context.Context) (MachineProvider, func() error, error)
@@ -84,13 +92,17 @@ type Opener func(ctx context.Context) (MachineProvider, func() error, error)
 // was down is retried rather than remembered as broken.
 func (p *Pool) Get(ctx context.Context, owner types.NamespacedName, key, name string, open Opener) (MachineProvider, error) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errPoolClosed
+	}
 	if p.conns == nil {
 		p.conns = map[string]*poolEntry{}
 		p.owners = map[types.NamespacedName]string{}
 	}
 	e := p.conns[key]
 	if e == nil {
-		e = &poolEntry{name: name, owners: map[types.NamespacedName]struct{}{}}
+		e = &poolEntry{name: name, owners: map[types.NamespacedName]struct{}{}, open: make(chan struct{}, 1)}
 		p.conns[key] = e
 	}
 	// Reserved before the lock is released, so a Release racing this Get
@@ -109,7 +121,7 @@ func (p *Pool) Get(ctx context.Context, owner types.NamespacedName, key, name st
 	var closeAfter *poolEntry
 	if err == nil {
 		closeAfter = p.bindLocked(owner, key, e)
-	} else if p.idleLocked(e) {
+	} else if p.idleLocked(e) && p.conns[key] == e {
 		delete(p.conns, key)
 	}
 	p.mu.Unlock()
@@ -119,8 +131,12 @@ func (p *Pool) Get(ctx context.Context, owner types.NamespacedName, key, name st
 
 // ensureOpen returns e's provider, opening it if it has none.
 func (p *Pool) ensureOpen(ctx context.Context, e *poolEntry, open Opener) (MachineProvider, error) {
-	e.open.Lock()
-	defer e.open.Unlock()
+	select {
+	case e.open <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-e.open }()
 
 	p.mu.Lock()
 	prov := e.prov
@@ -134,9 +150,17 @@ func (p *Pool) ensureOpen(ctx context.Context, e *poolEntry, open Opener) (Machi
 		return nil, err
 	}
 	p.mu.Lock()
+	if p.closed {
+		// Opened after CloseAll: nothing would ever close it.
+		p.mu.Unlock()
+		if release != nil {
+			go func() { _ = release() }()
+		}
+		return nil, errPoolClosed
+	}
 	e.prov, e.release = prov, release
-	p.mu.Unlock()
 	metrics.ProviderConnections.Inc()
+	p.mu.Unlock()
 	logf.FromContext(ctx).Info("Opened hypervisor connection", "hypervisor", e.name)
 	return prov, nil
 }
@@ -211,11 +235,13 @@ func (p *Pool) closeEntry(e *poolEntry) {
 	release := e.release
 	opened := e.prov != nil
 	e.prov, e.release = nil, nil
+	if opened {
+		metrics.ProviderConnections.Dec()
+	}
 	p.mu.Unlock()
 	if !opened {
 		return
 	}
-	metrics.ProviderConnections.Dec()
 	log := logf.Log.WithName("provider-pool")
 	go func() {
 		if release == nil {
@@ -234,6 +260,7 @@ func (p *Pool) closeEntry(e *poolEntry) {
 // used afterwards.
 func (p *Pool) CloseAll() {
 	p.mu.Lock()
+	p.closed = true
 	var releases []func() error
 	for key, e := range p.conns {
 		if e.prov != nil {

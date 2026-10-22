@@ -103,9 +103,11 @@ var (
 )
 
 // ProviderConnections is the number of backend connections the manager holds
-// open (PET-38). One per hypervisor in use, plus the flag-configured default;
-// a cluster deleted or moved to another hypervisor brings it down once nobody
-// else uses that connection, which is how releasing one is observable.
+// open (PET-38). Connections open lazily, on the first reconcile that needs
+// one, so this reads 0 until then. Once clusters can name hypervisors of their
+// own it is one per hypervisor in use plus the flag-configured default, and a
+// cluster deleted or moved brings it down when nobody else uses that
+// connection, which is how releasing one is observable.
 var ProviderConnections = prometheus.NewGauge(prometheus.GaugeOpts{
 	Namespace: namespace,
 	Name:      "provider_connections",

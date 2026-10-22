@@ -361,3 +361,55 @@ func TestACallerDuringTheRecoveryWaitsForTheHandshake(t *testing.T) {
 		}
 	}
 }
+
+// A provider the pool has closed must not quietly reconnect for a caller still
+// holding it: that connection would be tracked by nothing and never closed
+// (PET-38).
+func TestAClosedProviderDoesNotReconnect(t *testing.T) {
+	w := newWedgeFixture(t)
+	w.established()
+	if err := w.p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := w.p.FindByName(t.Context(), "worker-1"); !errors.Is(err, errProviderClosed) {
+		t.Fatalf("FindByName after Close = %v, want errProviderClosed", err)
+	}
+	if n := w.f.called("ConnectToURI"); n != 1 {
+		t.Errorf("%d connects, want only the first: a closed provider must not redial", n)
+	}
+}
+
+// A reconnect already under way when the provider is closed is closed when it
+// finishes, not installed.
+func TestAReconnectFinishingAfterCloseIsClosed(t *testing.T) {
+	w := newWedgeFixture(t)
+	daemonEnd := w.established()
+	reader := w.currentReader()
+	_ = daemonEnd.Close()
+	w.waitForReader(reader)
+
+	handshake := make(chan struct{})
+	release := make(chan struct{})
+	connect := w.connect
+	w.f.dial = func() error {
+		err := connect()
+		close(handshake)
+		<-release
+		return err
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := w.p.FindByName(t.Context(), "worker-1")
+		result <- err
+	}()
+	<-handshake
+	newReader := w.currentReader()
+	_ = w.p.Close()
+	close(release)
+
+	if err := <-result; !errors.Is(err, errProviderClosed) {
+		t.Fatalf("the caller waiting on the reconnect got %v, want errProviderClosed", err)
+	}
+	// Its socket is closed, so the daemon side sees the connection end.
+	w.waitForReader(newReader)
+}

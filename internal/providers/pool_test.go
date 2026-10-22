@@ -325,3 +325,65 @@ func TestPoolCountsAFailedCloseAsClosed(t *testing.T) {
 		t.Errorf("%d entries kept after a failed close", pool.entries())
 	}
 }
+
+func TestPoolRefusesWorkAfterCloseAll(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	pool.CloseAll()
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, errPoolClosed) {
+		t.Fatalf("Get after CloseAll = %v, want errPoolClosed", err)
+	}
+	if n := f.count(f.opens, "hv1"); n != 0 {
+		t.Errorf("%d opens after CloseAll, want none", n)
+	}
+}
+
+// An open in flight when the manager shuts down finishes after CloseAll has
+// run; its connection must be closed rather than left open with nothing to
+// close it.
+func TestPoolClosesAConnectionThatFinishesOpeningAfterCloseAll(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	before := testutil.ToFloat64(metrics.ProviderConnections)
+	release := make(chan struct{})
+	f.gate["hv1"] = release
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1"))
+		result <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	pool.CloseAll()
+	close(release)
+
+	if err := <-result; !errors.Is(err, errPoolClosed) {
+		t.Fatalf("Get = %v, want errPoolClosed", err)
+	}
+	f.waitClosed(t, "hv1")
+	if got := testutil.ToFloat64(metrics.ProviderConnections) - before; got != 0 {
+		t.Errorf("connections gauge +%v, want back to where it was", got)
+	}
+}
+
+// A caller queued behind someone else's dial gives up when its own context
+// ends, not when that dial does.
+func TestPoolCallerQueuedBehindADialHonoursItsOwnContext(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	release := make(chan struct{})
+	defer close(release)
+	f.gate["hv1"] = release
+	go func() { _, _ = pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")) }()
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := pool.Get(ctx, clusterB, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued Get = %v, want its own deadline", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Errorf("queued Get waited %s, want it to give up at its own 100ms deadline", waited)
+	}
+}
