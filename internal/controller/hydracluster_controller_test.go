@@ -312,29 +312,29 @@ var _ = Describe("HydraCluster Reconciler", func() {
 
 		It("releases a deleted cluster's connection", func() {
 			r := build(owningCluster(nil))
-			var released []types.NamespacedName
-			r.ReleaseProvider = func(_ context.Context, hydraCluster types.NamespacedName) {
-				released = append(released, hydraCluster)
+			var released []providers.Owner
+			r.ReleaseProvider = func(_ context.Context, owner providers.Owner) {
+				released = append(released, owner)
 			}
 
 			// Gone entirely: there is no finalizer, so this is the usual path.
 			Expect(r.Delete(ctx, hc)).To(Succeed())
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(released).To(Equal([]types.NamespacedName{key}))
+			Expect(released).To(Equal([]providers.Owner{{Kind: hydraClusterKind, NamespacedName: key}}))
 		})
 
 		It("releases a cluster's connection once it is being deleted", func() {
 			hc.Finalizers = []string{"test.hydra/hold"}
 			r := build(owningCluster(nil))
-			var released []types.NamespacedName
-			r.ReleaseProvider = func(_ context.Context, hydraCluster types.NamespacedName) {
-				released = append(released, hydraCluster)
+			var released []providers.Owner
+			r.ReleaseProvider = func(_ context.Context, owner providers.Owner) {
+				released = append(released, owner)
 			}
 			Expect(r.Delete(ctx, hc)).To(Succeed())
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(released).To(Equal([]types.NamespacedName{key}))
+			Expect(released).To(Equal([]providers.Owner{{Kind: hydraClusterKind, NamespacedName: key}}))
 			Expect(provider.InfrastructureChecks).To(Equal(0), "a cluster being deleted is not verified")
 		})
 	})

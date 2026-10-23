@@ -48,11 +48,12 @@ var (
 	//
 	// hypervisor names the backend endpoint the call went to (PET-38), so an
 	// unreachable host is identifiable once a manager talks to more than one.
-	// It has one value per hypervisor in use. Once clusters can name their own,
-	// that is whatever HydraClusters name, so anyone who may create one can add
-	// a value; a hypervisor's series are dropped when its last connection
-	// closes. It is a label, not an identity: the same host reached with two
-	// sets of credentials, or by IP and by name, shares or splits values.
+	// The connection pool hands it out and keeps it bounded: at most 16
+	// hypervisors are labelled by name at once, and any more share "other", so
+	// clusters naming hypervisors cannot grow it without limit. A label's
+	// series are dropped once no cluster uses that hypervisor. It is a label,
+	// not an identity: the same host reached with two sets of credentials, or
+	// by IP and by name, shares or splits values.
 	ProviderOperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
@@ -108,9 +109,10 @@ var (
 // ProviderConnections is the number of backend connections the manager holds
 // open (PET-38). Connections open lazily, on the first reconcile that needs
 // one, so this reads 0 until then. Once clusters can name hypervisors of their
-// own it is one per hypervisor in use plus the flag-configured default, and a
-// cluster deleted or moved brings it down when nobody else uses that
-// connection, which is how releasing one is observable.
+// own it is one per target in use -- a hypervisor and the credentials used to
+// reach it, so one host reached with two sets counts twice -- plus the
+// flag-configured default, and a cluster deleted or moved brings it down when
+// nobody else uses that connection, which is how releasing one is observable.
 var ProviderConnections = prometheus.NewGauge(prometheus.GaugeOpts{
 	Namespace: namespace,
 	Name:      "provider_connections",

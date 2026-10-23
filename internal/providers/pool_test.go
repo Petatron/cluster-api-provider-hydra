@@ -44,17 +44,20 @@ type fakeConns struct {
 	// closeErr is what closing returns. The pool logs it; a failed close must
 	// still count as closed.
 	closeErr error
+	// labels is the hypervisor label each key's last open was given.
+	labels map[string]string
 }
 
 func newFakeConns() *fakeConns {
 	return &fakeConns{
 		opens: map[string]int{}, closes: map[string]int{}, closed: make(chan string, 64),
 		fail: map[string]error{}, gate: map[string]chan struct{}{}, started: make(chan string, 64),
+		labels: map[string]string{},
 	}
 }
 
 func (f *fakeConns) opener(key string) Opener {
-	return func(context.Context) (MachineProvider, func() error, error) {
+	return func(_ context.Context, label string) (MachineProvider, func() error, error) {
 		f.started <- key
 		f.mu.Lock()
 		gate := f.gate[key]
@@ -65,7 +68,10 @@ func (f *fakeConns) opener(key string) Opener {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.opens[key]++
+		f.labels[key] = label
 		if err := f.fail[key]; err != nil {
+			// As the manager's opener does: a failed dial is a sample too.
+			ObserveDial(label, time.Now(), err)
 			return nil, nil, err
 		}
 		return &recordingProvider{}, func() error {
@@ -143,11 +149,14 @@ func (f *fakeConns) requireNoClose(t *testing.T) {
 	}
 }
 
-const testNamespace = "default"
+const (
+	testNamespace = "default"
+	clusterKind   = "HydraCluster"
+)
 
 var (
-	clusterA = types.NamespacedName{Namespace: testNamespace, Name: "a"}
-	clusterB = types.NamespacedName{Namespace: testNamespace, Name: "b"}
+	clusterA = Owner{Kind: clusterKind, NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: "a"}}
+	clusterB = Owner{Kind: clusterKind, NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: "b"}}
 )
 
 func TestPoolSharesOneConnectionPerTarget(t *testing.T) {
@@ -192,9 +201,6 @@ func TestPoolDoesNotCacheAFailedOpen(t *testing.T) {
 	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err == nil {
 		t.Fatal("Get succeeded against a failing open")
 	}
-	if n := pool.entries(); n != 0 {
-		t.Errorf("%d entries kept after a failed open, want none: a manager that kept them would grow with every unreachable target", n)
-	}
 	f.mu.Lock()
 	delete(f.fail, "hv1")
 	f.mu.Unlock()
@@ -213,7 +219,7 @@ func TestPoolClosesAConnectionWhenItsLastOwnerLeaves(t *testing.T) {
 	f := newFakeConns()
 	before := testutil.ToFloat64(metrics.ProviderConnections)
 
-	for _, owner := range []types.NamespacedName{clusterA, clusterB} {
+	for _, owner := range []Owner{clusterA, clusterB} {
 		if _, err := pool.Get(t.Context(), owner, "hv1", "hv1", f.opener("hv1")); err != nil {
 			t.Fatal(err)
 		}
@@ -434,12 +440,36 @@ func TestPoolCallerQueuedBehindADialHonoursItsOwnContext(t *testing.T) {
 func TestPoolRefusesAZeroOwner(t *testing.T) {
 	var pool Pool
 	f := newFakeConns()
-	if _, err := pool.Get(t.Context(), types.NamespacedName{}, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, errNoOwner) {
-		t.Fatalf("Get with no owner = %v, want errNoOwner", err)
+	for _, owner := range []Owner{{}, {NamespacedName: clusterA.NamespacedName}, {Kind: clusterKind}} {
+		if _, err := pool.Get(t.Context(), owner, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, errNoOwner) {
+			t.Fatalf("Get with owner %+v = %v, want errNoOwner", owner, err)
+		}
 	}
 	if n := f.count(f.opens, "hv1"); n != 0 {
 		t.Errorf("%d opens for a refused Get, want none", n)
 	}
+}
+
+// seriesFor is how many operation-duration series carry hypervisor label.
+func seriesFor(label string) int {
+	ch := make(chan prometheus.Metric, 1024)
+	metrics.ProviderOperationDuration.Collect(ch)
+	close(ch)
+	n := 0
+	for m := range ch {
+		var out dto.Metric
+		_ = m.Write(&out)
+		for _, l := range out.GetLabel() {
+			if l.GetName() == "hypervisor" && l.GetValue() == label {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func record(label string) {
+	metrics.ProviderOperationDuration.WithLabelValues("Get", outcomeSuccess, label).Observe(0.1)
 }
 
 // A hypervisor's series go with its last connection, so a deleted or moved
@@ -448,42 +478,145 @@ func TestPoolRefusesAZeroOwner(t *testing.T) {
 func TestPoolDropsAHypervisorsSeriesWithItsLastConnection(t *testing.T) {
 	var pool Pool
 	f := newFakeConns()
-	record := func(name string) {
-		metrics.ProviderOperationDuration.WithLabelValues("Get", outcomeSuccess, name).Observe(0.1)
-	}
-	series := func(name string) int {
-		ch := make(chan prometheus.Metric, 256)
-		metrics.ProviderOperationDuration.Collect(ch)
-		close(ch)
-		n := 0
-		for m := range ch {
-			var out dto.Metric
-			_ = m.Write(&out)
-			for _, l := range out.GetLabel() {
-				if l.GetName() == "hypervisor" && l.GetValue() == name {
-					n++
-				}
-			}
-		}
-		return n
-	}
 	const shared = "shared.test:16514"
+	owners := map[string]Owner{}
 	for _, k := range []string{"shared@cred1", "shared@cred2"} {
-		owner := types.NamespacedName{Namespace: testNamespace, Name: k}
-		if _, err := pool.Get(t.Context(), owner, k, shared, f.opener(k)); err != nil {
+		owners[k] = Owner{Kind: clusterKind, NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: k}}
+		if _, err := pool.Get(t.Context(), owners[k], k, shared, f.opener(k)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	record(shared)
 
-	pool.Release(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: "shared@cred1"})
+	pool.Release(t.Context(), owners["shared@cred1"])
 	f.waitClosed(t, "shared@cred1")
-	if series(shared) == 0 {
+	if seriesFor(shared) == 0 {
 		t.Fatal("the series went while another connection to the same hypervisor remained")
 	}
-	pool.Release(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: "shared@cred2"})
+	pool.Release(t.Context(), owners["shared@cred2"])
 	f.waitClosed(t, "shared@cred2")
-	if n := series(shared); n != 0 {
+	if n := seriesFor(shared); n != 0 {
 		t.Errorf("%d series left for a hypervisor with no connection, want none", n)
+	}
+}
+
+// A hypervisor that has never answered keeps its series while a cluster still
+// names it -- HydraBackendUnreachable is judged on them -- and loses them when
+// that cluster goes, though no connection was ever opened to close.
+func TestPoolKeepsAnUnreachableHypervisorsSeriesWhileItIsWanted(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	const down = "down.test:16514"
+	f.fail["down"] = errors.New("unreachable")
+	for range 2 {
+		if _, err := pool.Get(t.Context(), clusterA, "down", down, f.opener("down")); err == nil {
+			t.Fatal("Get succeeded against a failing open")
+		}
+		if n := seriesFor(down); n == 0 {
+			t.Fatal("a failed dial's series went while the cluster still names the hypervisor")
+		}
+	}
+	if n := f.count(f.opens, "down"); n != 2 {
+		t.Errorf("%d opens, want each Get to dial again", n)
+	}
+	pool.Release(t.Context(), clusterA)
+	if n := pool.entries(); n != 0 {
+		t.Errorf("%d entries kept after the only owner left, want none", n)
+	}
+	if n := seriesFor(down); n != 0 {
+		t.Errorf("%d series left for a hypervisor nobody names, want none", n)
+	}
+}
+
+// Past the label limit, hypervisors share OtherHypervisor, so naming more of
+// them cannot grow the series without bound; the shared label's series go when
+// the last hypervisor using it does.
+func TestPoolBoundsTheHypervisorLabel(t *testing.T) {
+	pool := Pool{labelLimit: 1}
+	f := newFakeConns()
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1.test:16514", f.opener("hv1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Get(t.Context(), clusterB, "hv2", "hv2.test:16514", f.opener("hv2")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	got1, got2 := f.labels["hv1"], f.labels["hv2"]
+	f.mu.Unlock()
+	if got1 != "hv1.test:16514" || got2 != OtherHypervisor {
+		t.Fatalf("labels = %q, %q; want the first hypervisor by name and the second as %q", got1, got2, OtherHypervisor)
+	}
+	record(OtherHypervisor)
+	pool.Release(t.Context(), clusterB)
+	f.waitClosed(t, "hv2")
+	if n := seriesFor(OtherHypervisor); n != 0 {
+		t.Errorf("%d %q series left with no hypervisor using it, want none", n, OtherHypervisor)
+	}
+	pool.Release(t.Context(), clusterA)
+	f.waitClosed(t, "hv1")
+}
+
+// A HydraCluster and a HydraMachine may share a namespace and name; they are
+// still two owners, and one leaving must not close the other's connection.
+func TestPoolTellsOwnersOfDifferentKindsApart(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	machineA := Owner{Kind: "HydraMachine", NamespacedName: clusterA.NamespacedName}
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Get(t.Context(), machineA, "hv2", "hv2", f.opener("hv2")); err != nil {
+		t.Fatal(err)
+	}
+	f.requireNoClose(t) // the machine binding to hv2 is not the cluster moving off hv1
+	pool.Release(t.Context(), machineA)
+	f.waitClosed(t, "hv2")
+	f.requireNoClose(t)
+	pool.Release(t.Context(), clusterA)
+	f.waitClosed(t, "hv1")
+}
+
+// CloseAll landing after a Get has its provider but before it binds closes that
+// provider, so the Get must not hand it out.
+func TestPoolDoesNotHandOutAProviderCloseAllClosed(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	pool.beforeBind = func() { pool.CloseAll() }
+	p, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1"))
+	if !errors.Is(err, errPoolClosed) || p != nil {
+		t.Fatalf("Get = (%v, %v), want (nil, errPoolClosed)", p, err)
+	}
+	if n := f.count(f.closes, "hv1"); n != 1 {
+		t.Errorf("%d closes, want CloseAll to have closed the connection", n)
+	}
+}
+
+// A caller queued behind a dial that CloseAll overtakes gives up rather than
+// dialing again into a pool that is closed.
+func TestPoolQueuedCallerDoesNotDialAfterCloseAll(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	release := make(chan struct{})
+	f.gate["hv1"] = release
+	results := make(chan error, 2)
+	go func() {
+		_, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1"))
+		results <- err
+	}()
+	f.waitStarted(t, "hv1")
+	go func() {
+		_, err := pool.Get(t.Context(), clusterB, "hv1", "hv1", f.opener("hv1"))
+		results <- err
+	}()
+	waitReserved(t, &pool, "hv1", 2)
+	pool.CloseAll()
+	close(release)
+	for range 2 {
+		if err := <-results; !errors.Is(err, errPoolClosed) {
+			t.Errorf("Get = %v, want errPoolClosed", err)
+		}
+	}
+	if n := f.count(f.opens, "hv1"); n != 1 {
+		t.Errorf("%d opens, want only the one already in flight", n)
 	}
 }

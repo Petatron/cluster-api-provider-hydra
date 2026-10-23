@@ -23,10 +23,12 @@ Histogram. Labels: `operation`, `outcome`, `hypervisor`.
 
 `hypervisor` is the endpoint the call went to: `host:port` for a remote
 daemon as written, with the transport's default port filled in, or `local` for
-the local socket (PET-38). There is one value per hypervisor in use. Once
-clusters can name their own hypervisor, that is whatever HydraClusters name, so
-anyone allowed to create one can add a value; a hypervisor's series are removed
-when the manager closes its last connection to it.
+the local socket (PET-38). There is one value per hypervisor in use, up to 16
+at once; any hypervisor beyond those is labelled `other`, and keeps that label
+until no cluster uses it. However many hypervisors clusters name, the label has
+at most 17 values. A value's series are removed once no cluster uses that
+hypervisor any more -- including one the manager never managed to reach, whose
+failed dials are what `HydraBackendUnreachable` reads, so those stay until then.
 
 It is a label, not an identity. The same host reached by IP and by hostname gets
 two values, and two connections to one host with different credentials share
@@ -69,7 +71,9 @@ Backend connections the manager holds open. They open lazily, on the first
 reconcile that needs one, so this reads 0 until then. Today that is only the
 one the `--libvirt-*` flags configure, which stays open for the manager's
 life. Once clusters can name hypervisors of their own (PET-38) it is one per
-hypervisor in use plus that one, and a connection no cluster uses any more is
+target in use plus that one -- a target being a hypervisor and the credentials
+used to reach it, so one host reached with two sets counts twice -- and a
+connection no cluster uses any more is
 closed -- the cluster was deleted, or now reaches its hypervisor another way --
 which brings this down.
 

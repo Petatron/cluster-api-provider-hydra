@@ -80,7 +80,7 @@ type HydraClusterReconciler struct {
 
 	// ReleaseProvider tells whatever holds connections that a HydraCluster is
 	// gone, so a connection only it used can be closed (PET-38). Optional.
-	ReleaseProvider func(ctx context.Context, hydraCluster types.NamespacedName)
+	ReleaseProvider func(ctx context.Context, owner providers.Owner)
 }
 
 func (r *HydraClusterReconciler) provider(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error) {
@@ -100,7 +100,7 @@ func (r *HydraClusterReconciler) provider(ctx context.Context, hydraCluster *inf
 // release tells the connection holder a HydraCluster is gone.
 func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types.NamespacedName) {
 	if r.ReleaseProvider != nil {
-		r.ReleaseProvider(ctx, hydraCluster)
+		r.ReleaseProvider(ctx, providers.Owner{Kind: hydraClusterKind, NamespacedName: hydraCluster})
 	}
 }
 

@@ -265,14 +265,16 @@ func main() {
 	// dial timeout, and without this that would be the one operation producing
 	// no sample at all. Wrapped once, here, so every reconciler shares the same
 	// instrumented instance.
-	openDefault := func(ctx context.Context) (providers.MachineProvider, func() error, error) {
+	// The pool chooses the metric label, so it stays bounded however many
+	// hypervisors clusters name.
+	openDefault := func(ctx context.Context, label string) (providers.MachineProvider, func() error, error) {
 		dialStart := time.Now()
 		p, err := libvirtprovider.New(ctx, libvirtCfg)
-		providers.ObserveDial(hypervisor, dialStart, err)
+		providers.ObserveDial(label, dialStart, err)
 		if err != nil {
 			return nil, nil, err
 		}
-		return providers.NewInstrumented(p, hypervisor), p.Close, nil
+		return providers.NewInstrumented(p, label), p.Close, nil
 	}
 	providerFor := func(ctx context.Context, _ *infrastructurev1alpha1.HydraCluster) (providers.MachineProvider, error) {
 		return pool.GetPinned(ctx, "flags", hypervisor, openDefault)

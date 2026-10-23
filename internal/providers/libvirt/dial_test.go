@@ -191,10 +191,22 @@ func TestNewDialerReturnsANilDialerOnError(t *testing.T) {
 func TestTLSCredentialsDoNotPrintTheirKey(t *testing.T) {
 	const secret = "-----BEGIN PRIVATE KEY-----sekrit"
 	creds := TLSCredentials{CACert: []byte("ca"), ClientCert: []byte("cert"), ClientKey: []byte(secret)}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-		for _, v := range []any{creds, &creds, Config{Credentials: &creds}} {
-			if out := fmt.Sprintf(verb, v); strings.Contains(out, "sekrit") {
-				t.Errorf("%s of %T printed the key: %s", verb, v, out)
+	// The key in every form a verb could render it: as text, and as the bytes
+	// %d, %x, %X, %o and %b print a []byte as.
+	byteVerbs := []string{"%d", "%x", "%X", "%o", "%b"}
+	leaks := make([]string, 0, 1+len(byteVerbs))
+	leaks = append(leaks, "sekrit")
+	for _, verb := range byteVerbs {
+		leaks = append(leaks, strings.Trim(fmt.Sprintf(verb, []byte("sekrit")), "[]"))
+	}
+	cfg := Config{Credentials: &creds}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%x", "%X", "%o", "%b"} {
+		for _, v := range []any{creds, &creds, cfg, &cfg} {
+			out := fmt.Sprintf(verb, v)
+			for _, leak := range leaks {
+				if strings.Contains(out, leak) {
+					t.Errorf("%s of %T printed the key: %s", verb, v, out)
+				}
 			}
 		}
 	}
