@@ -56,11 +56,14 @@ func TestClassifyOutcome(t *testing.T) {
 	}
 }
 
+// testHypervisor is the hypervisor label these tests record under.
+const testHypervisor = "hypervisor.test:16514"
+
 // A decorator that quietly changed behaviour would be worse than no metrics at
 // all, so the pass-through is asserted rather than assumed.
 func TestInstrumentedPassesResultsThrough(t *testing.T) {
 	backend := &recordingProvider{state: &MachineState{ID: "abc"}}
-	p := NewInstrumented(backend)
+	p := NewInstrumented(backend, testHypervisor)
 
 	state, err := p.Create(t.Context(), MachineSpec{Name: "worker-1"})
 	if err != nil || state == nil || state.ID != "abc" {
@@ -88,14 +91,14 @@ func TestInstrumentedPassesResultsThrough(t *testing.T) {
 func TestObserveDialRecordsASample(t *testing.T) {
 	// Labelled as a failed reach, not as a refusal: an unreachable hypervisor is
 	// the thing an operator waits out, not the thing they go and fix.
-	obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues("Dial", outcomeError)
+	obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues("Dial", outcomeError, testHypervisor)
 	if err != nil {
 		t.Fatalf("no Dial/%s series: %v", outcomeError, err)
 	}
 	dialBefore := sampleCount(t, obs.(prometheus.Metric))
 	totalBefore := totalSampleCount(t, metrics.ProviderOperationDuration)
 
-	ObserveDial(time.Now(), errors.New("dial unix: connection refused"))
+	ObserveDial(testHypervisor, time.Now(), errors.New("dial unix: connection refused"))
 
 	if after := sampleCount(t, obs.(prometheus.Metric)); after != dialBefore+1 {
 		t.Errorf("Dial/%s samples %d -> %d, want one more", outcomeError, dialBefore, after)
@@ -111,7 +114,7 @@ func TestObserveDialRecordsASample(t *testing.T) {
 // gap in the dashboard exactly where nobody would think to look.
 func TestInstrumentedTimesEveryOperation(t *testing.T) {
 	backend := &recordingProvider{err: fmt.Errorf("%w: gone", ErrNotFound)}
-	p := NewInstrumented(backend)
+	p := NewInstrumented(backend, testHypervisor)
 
 	ops := map[string]func() error{
 		"Create":     func() error { _, err := p.Create(t.Context(), MachineSpec{}); return err },
@@ -136,7 +139,7 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 
 	for op, run := range ops {
 		t.Run(op, func(t *testing.T) {
-			obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues(op, outcomeNotFound)
+			obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues(op, outcomeNotFound, testHypervisor)
 			if err != nil {
 				t.Fatalf("no %s/%s series: %v", op, outcomeNotFound, err)
 			}
@@ -178,7 +181,7 @@ func totalSampleCount(t *testing.T, c prometheus.Collector) uint64 {
 func TestNewInstrumentedTolerantOfNil(t *testing.T) {
 	// The factory in main can fail before a provider exists; wrapping nil must
 	// not turn that into a nil-pointer dereference two layers away.
-	if got := NewInstrumented(nil); got != nil {
+	if got := NewInstrumented(nil, testHypervisor); got != nil {
 		t.Errorf("NewInstrumented(nil) = %v, want nil", got)
 	}
 }
@@ -222,4 +225,30 @@ func (p *recordingProvider) DeleteByName(_ context.Context, _, _ string) error {
 func (p *recordingProvider) EnsureInfrastructure(_ context.Context, _ InfrastructureSpec) error {
 	p.lastOp = "EnsureInfrastructure"
 	return p.err
+}
+
+// Every sample carries the hypervisor its provider was wrapped with, so two
+// providers in one manager never share a series (PET-38).
+func TestInstrumentedLabelsItsHypervisor(t *testing.T) {
+	a := NewInstrumented(&recordingProvider{}, "a.test:16514")
+	b := NewInstrumented(&recordingProvider{}, "b.test:16514")
+	series := func(h string) prometheus.Metric {
+		obs, err := metrics.ProviderOperationDuration.GetMetricWithLabelValues("Get", outcomeSuccess, h)
+		if err != nil {
+			t.Fatalf("no Get/%s/%s series: %v", outcomeSuccess, h, err)
+		}
+		return obs.(prometheus.Metric)
+	}
+	beforeA, beforeB := sampleCount(t, series("a.test:16514")), sampleCount(t, series("b.test:16514"))
+
+	_, _ = a.Get(t.Context(), "abc")
+	_, _ = a.Get(t.Context(), "abc")
+	_, _ = b.Get(t.Context(), "abc")
+
+	if got := sampleCount(t, series("a.test:16514")) - beforeA; got != 2 {
+		t.Errorf("a.test samples +%d, want +2", got)
+	}
+	if got := sampleCount(t, series("b.test:16514")) - beforeB; got != 1 {
+		t.Errorf("b.test samples +%d, want +1", got)
+	}
 }

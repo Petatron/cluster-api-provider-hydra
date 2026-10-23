@@ -273,12 +273,16 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			Expect(failed.Status).To(Equal(metav1.ConditionTrue))
 		})
 
-		It("reports a backend that cannot be built, retries, and keeps the one it built", func() {
+		It("reports a backend that cannot be built, retries, and asks for its own cluster", func() {
 			attempts := 0
 			r := build(owningCluster(nil))
 			r.Provider = nil
-			r.NewProvider = func(context.Context) (providers.MachineProvider, error) {
+			var asked []string
+			r.ProviderFor = func(_ context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error) {
 				attempts++
+				if hydraCluster != nil {
+					asked = append(asked, hydraCluster.Name)
+				}
 				if attempts == 1 {
 					return nil, errors.New("hypervisor unreachable")
 				}
@@ -297,8 +301,41 @@ var _ = Describe("HydraCluster Reconciler", func() {
 				_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 				Expect(err).NotTo(HaveOccurred())
 			}
-			Expect(attempts).To(Equal(2), "a backend that was built is kept, not rebuilt per reconcile")
+			// Connections are held by whatever implements ProviderFor (a pool, in
+			// the manager), so the reconciler asks on every reconcile -- for the
+			// cluster it is reconciling, since clusters may name different
+			// hypervisors (PET-38).
+			Expect(attempts).To(Equal(3))
+			Expect(asked).To(Equal([]string{key.Name, key.Name, key.Name}))
 			Expect(provider.InfrastructureChecks).To(Equal(2))
+		})
+
+		It("releases a deleted cluster's connection", func() {
+			r := build(owningCluster(nil))
+			var released []providers.Owner
+			r.ReleaseProvider = func(_ context.Context, owner providers.Owner) {
+				released = append(released, owner)
+			}
+
+			// Gone entirely: there is no finalizer, so this is the usual path.
+			Expect(r.Delete(ctx, hc)).To(Succeed())
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(released).To(Equal([]providers.Owner{{Kind: hydraClusterKind, NamespacedName: key}}))
+		})
+
+		It("releases a cluster's connection once it is being deleted", func() {
+			hc.Finalizers = []string{"test.hydra/hold"}
+			r := build(owningCluster(nil))
+			var released []providers.Owner
+			r.ReleaseProvider = func(_ context.Context, owner providers.Owner) {
+				released = append(released, owner)
+			}
+			Expect(r.Delete(ctx, hc)).To(Succeed())
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(released).To(Equal([]providers.Owner{{Kind: hydraClusterKind, NamespacedName: key}}))
+			Expect(provider.InfrastructureChecks).To(Equal(0), "a cluster being deleted is not verified")
 		})
 	})
 

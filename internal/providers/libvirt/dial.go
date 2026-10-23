@@ -17,6 +17,7 @@ limitations under the License.
 package libvirt
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -38,6 +39,13 @@ import (
 // otherwise be joined as [hypervisor:16509]:16509 and never connect. The address
 // is split here, and the port is passed with UsePort or to newTLSDialer.
 func newDialer(cfg Config) (socket.Dialer, error) {
+	if cfg.Credentials != nil && (cfg.RemoteAddr == "" || cfg.Insecure) {
+		return nil, errors.New("libvirt: TLS credentials were given for a connection that does not use TLS")
+	}
+	// Two sources for one identity, one of which would silently lose.
+	if cfg.Credentials != nil && cfg.PKIPath != "" {
+		return nil, errors.New("libvirt: both TLS credentials and a PKI path were given; a connection takes one or the other")
+	}
 	if cfg.RemoteAddr == "" {
 		return dialers.NewLocal(dialers.WithLocalTimeout(cfg.DialTimeout)), nil
 	}
@@ -58,6 +66,15 @@ func newDialer(cfg Config) (socket.Dialer, error) {
 	// Not go-libvirt's dialers.NewTLS: it reads libvirtd's post-handshake
 	// verification byte with no deadline, and offers no way to pass DialTimeout,
 	// so its handshake ran on its own 20s default. See tlsDialer.
+	if cfg.Credentials != nil {
+		// Through a nil check rather than returned directly: a nil *tlsDialer
+		// returned as a socket.Dialer would be a non-nil interface.
+		d, err := newTLSDialerWithCredentials(host, port, *cfg.Credentials, cfg.DialTimeout)
+		if err != nil {
+			return nil, err
+		}
+		return d, nil
+	}
 	return newTLSDialer(host, port, cfg.PKIPath, cfg.DialTimeout), nil
 }
 

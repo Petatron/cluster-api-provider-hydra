@@ -133,6 +133,13 @@ type Config struct {
 	// cacert.pem. Empty uses go-libvirt's default search paths.
 	PKIPath string
 
+	// Credentials, when set, is the TLS client PKI itself, held in memory
+	// rather than read from PKIPath -- how a connection named by one cluster
+	// carries credentials of its own (PET-38). It needs RemoteAddr and TLS:
+	// with Insecure, or with no remote address, there is no TLS to use it in,
+	// and New refuses rather than ignore it.
+	Credentials *TLSCredentials
+
 	// StoragePool is the libvirt pool that machine disks are created in.
 	StoragePool string
 
@@ -148,6 +155,62 @@ type Config struct {
 	// set a deadline. Defaults to 30s.
 	RPCTimeout time.Duration
 }
+
+// TLSCredentials is a TLS client identity and the CA its server must chain to,
+// as PEM: the contents of cacert.pem, clientcert.pem and clientkey.pem.
+//
+// It holds a private key, so it never prints one. It implements fmt.Formatter,
+// which fmt consults before anything else for every verb -- %d and %x included,
+// which would otherwise print the key's bytes -- and the same goes for a Config
+// holding it. String, GoString and MarshalLog redact too, for callers that use
+// them directly and for structured logging. fmt cannot call a method through an
+// unexported field, so never hold one by value in one; by pointer it prints as
+// an address.
+type TLSCredentials struct {
+	CACert, ClientCert, ClientKey []byte
+}
+
+const redactedCredentials = "TLSCredentials{<redacted>}"
+
+// String implements fmt.Stringer without the key.
+func (TLSCredentials) String() string { return redactedCredentials }
+
+// GoString implements fmt.GoStringer without the key.
+func (TLSCredentials) GoString() string { return redactedCredentials }
+
+// Format implements fmt.Formatter without the key, whatever the verb.
+func (TLSCredentials) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redactedCredentials) }
+
+// MarshalLog implements logr.Marshaler without the key.
+func (TLSCredentials) MarshalLog() any { return redactedCredentials }
+
+// Hypervisor names the endpoint cfg reaches, for metrics and logs: host:port for
+// a remote daemon as written, with the transport's default port filled in, or
+// "local" for the local socket whatever its URI. It is a label, not an identity:
+// the same daemon reached by IP and by hostname gets two names.
+func (c Config) Hypervisor() string {
+	if c.RemoteAddr == "" {
+		return "local"
+	}
+	host, port, err := splitRemoteAddr(c.RemoteAddr)
+	if err != nil {
+		return c.RemoteAddr
+	}
+	if port == "" {
+		port = defaultTLSPort
+		if c.Insecure {
+			port = defaultTCPPort
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// errProviderClosed is returned by every call on a Provider after Close.
+var errProviderClosed = errors.New("libvirt: the connection was closed")
+
+// defaultTCPPort is libvirtd's plain-TCP port, used when an insecure remote
+// address names none.
+const defaultTCPPort = "16509"
 
 // client is the part of go-libvirt's API this provider calls. *golibvirt.Libvirt
 // is the only production implementation; the interface exists so the failure
@@ -211,6 +274,11 @@ type Provider struct {
 	// it rather than opening a second connection, so a burst of reconciles
 	// against a slow hypervisor produces one dial and not one per machine.
 	dial *dialAttempt
+	// closed is set by Close. A closed provider never reconnects: every call
+	// fails with errProviderClosed. Otherwise a caller still holding it after
+	// the pool closed it would quietly open a connection nothing tracks or
+	// ever closes (PET-38).
+	closed bool
 
 	// dialer is the transport, retained so a stalled connection can be dropped
 	// without waiting on the daemon to acknowledge it.
@@ -316,6 +384,10 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 // indefinitely when run locally. The socket is force-closed if the polite
 // version does not return promptly.
 func (p *Provider) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+
 	done := make(chan error, 1)
 	go func() { done <- p.client().Disconnect() }()
 
@@ -403,6 +475,10 @@ func (p *Provider) withRPCDeadline(ctx context.Context) (context.Context, contex
 // one allocation per reconnect, of a client that is dead anyway.
 func (p *Provider) ensureConnected(ctx context.Context) error {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errProviderClosed
+	}
 	var stale net.Conn
 	if p.dial == nil {
 		lv := p.client()
@@ -431,7 +507,12 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 			// p.dial no longer a and does nothing. Stopping it just frees the timer.
 			limit.Stop()
 			p.mu.Lock()
-			if err == nil {
+			// A reconnect that finished after Close is closed at once rather
+			// than installed: nothing would ever close it otherwise.
+			closedMeanwhile := err == nil && p.closed
+			if closedMeanwhile {
+				err = errProviderClosed
+			} else if err == nil {
 				p.lvMu.Lock()
 				p.lv = target
 				p.lvMu.Unlock()
@@ -439,6 +520,9 @@ func (p *Provider) ensureConnected(ctx context.Context) error {
 			a.err = err
 			p.dial = nil
 			p.mu.Unlock()
+			if closedMeanwhile {
+				p.recycle()
+			}
 			close(a.done)
 		}()
 	}

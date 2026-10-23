@@ -45,17 +45,26 @@ var (
 	// outcome separates a backend that refused from a backend that could not be
 	// reached, because the two call for completely different responses -- the
 	// same distinction ErrTerminal draws in the code.
+	//
+	// hypervisor names the backend endpoint the call went to (PET-38), so an
+	// unreachable host is identifiable once a manager talks to more than one.
+	// The connection pool hands it out and keeps it bounded: at most 16
+	// hypervisors are labelled by name at once, and any more share "other", so
+	// clusters naming hypervisors cannot grow it without limit. A label's
+	// series are dropped once no cluster uses that hypervisor. It is a label,
+	// not an identity: the same host reached with two sets of credentials, or
+	// by IP and by name, shares or splits values.
 	ProviderOperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,
 			Name:      "provider_operation_duration_seconds",
-			Help:      "Time spent in infrastructure backend operations, by operation and outcome.",
+			Help:      "Time spent in infrastructure backend operations, by operation, outcome and hypervisor.",
 			// Machine creation is seconds, not milliseconds: it clones a disk,
 			// builds an ISO and defines a domain. The default buckets top out at
 			// 10s and would put every create in +Inf.
 			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 80, 160},
 		},
-		[]string{"operation", "outcome"},
+		[]string{"operation", "outcome", "hypervisor"},
 	)
 
 	// MachineWaitTotal counts reconciles that ended in a wait rather than an
@@ -97,8 +106,22 @@ var (
 	)
 )
 
+// ProviderConnections is the number of backend connections the manager holds
+// open (PET-38). Connections open lazily, on the first reconcile that needs
+// one, so this reads 0 until then. Once clusters can name hypervisors of their
+// own it is one per target in use -- a hypervisor and the credentials used to
+// reach it, so one host reached with two sets counts twice -- plus the
+// flag-configured default, and a cluster deleted or moved brings it down when
+// nobody else uses that connection, which is how releasing one is observable.
+var ProviderConnections = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Name:      "provider_connections",
+	Help:      "Backend connections the manager holds open.",
+})
+
 func init() {
 	metrics.Registry.MustRegister(
+		ProviderConnections,
 		ProviderOperationDuration,
 		MachineWaitTotal,
 		MachineFailureTotal,

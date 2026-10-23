@@ -83,8 +83,12 @@ permission to read `/metrics`.
 
 ### HydraBackendUnreachable
 
-**critical, 15m window + 5m.** Every call the provider made to its hypervisor in
-the last 15 minutes failed to connect, and none got through.
+**critical, 15m window + 5m.** Every call the provider made to one hypervisor in
+the last 15 minutes failed to connect, and none got through. The `hypervisor`
+label names it; with several, each is judged on its own, so one healthy host
+does not hide another that is down. Past 16 hypervisors the rest share the label
+`other` (see [metrics.md](metrics.md)) and are judged together, so among those a
+healthy one does hide a dead one.
 
 The provider calls the backend at least every 5 minutes per machine, so this is
 not a quiet period. The hypervisor is down, the network to it is, or its TLS

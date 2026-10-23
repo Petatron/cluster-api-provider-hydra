@@ -50,13 +50,13 @@ tests:
 - name: backend unreachable only once nothing gets through
   interval: 1m
   input_series:
-  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="error"}'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="Get", outcome="error"}'
     values: '0+1x40'
   # Calls keep succeeding until 10m, then stop.
-  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="success"}'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="Get", outcome="success"}'
     values: '5+1x10 15x30'
   # A not_found is the backend answering, not failing.
-  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="FindByName", outcome="not_found"}'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="FindByName", outcome="not_found"}'
     values: '2x40'
   alert_rule_test:
   - eval_time: 20m
@@ -70,14 +70,31 @@ tests:
     exp_alerts:
     - exp_labels:
         job: cluster-api-provider-hydra-controller-manager-metrics-service
+        hypervisor: hv1:16514
+        severity: critical
+
+- name: one hypervisor down does not hide behind another that answers
+  interval: 1m
+  input_series:
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="Get", outcome="error"}'
+    values: '0+1x40'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv2:16514", operation="Get", outcome="success"}'
+    values: '0+1x40'
+  alert_rule_test:
+  - eval_time: 25m
+    alertname: HydraBackendUnreachable
+    exp_alerts:
+    - exp_labels:
+        job: cluster-api-provider-hydra-controller-manager-metrics-service
+        hypervisor: hv1:16514
         severity: critical
 
 - name: backend errors while calls also succeed are not an outage
   interval: 1m
   input_series:
-  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="Get", outcome="error"}'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="Get", outcome="error"}'
     values: '0+1x40'
-  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", operation="FindByName", outcome="not_found"}'
+  - series: 'hydra_provider_operation_duration_seconds_count{job="cluster-api-provider-hydra-controller-manager-metrics-service", hypervisor="hv1:16514", operation="FindByName", outcome="not_found"}'
     values: '0+1x40'
   alert_rule_test:
   - eval_time: 35m

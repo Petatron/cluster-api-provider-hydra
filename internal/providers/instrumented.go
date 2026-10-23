@@ -34,17 +34,21 @@ import (
 // publish a different set.
 //
 // The operation label is bounded to MachineProvider method names plus Dial
-// for provider construction; its cardinality cannot grow at runtime.
+// for provider construction; its cardinality cannot grow at runtime. The
+// hypervisor label is the endpoint this provider talks to, fixed when it is
+// wrapped.
 type Instrumented struct {
 	MachineProvider
+	hypervisor string
 }
 
-// NewInstrumented returns p wrapped in timing, or p unchanged if it is nil.
-func NewInstrumented(p MachineProvider) MachineProvider {
+// NewInstrumented returns p wrapped in timing, labelled with the hypervisor it
+// talks to, or nil if p is nil.
+func NewInstrumented(p MachineProvider, hypervisor string) MachineProvider {
 	if p == nil {
 		return nil
 	}
-	return &Instrumented{MachineProvider: p}
+	return &Instrumented{MachineProvider: p, hypervisor: hypervisor}
 }
 
 // The outcome label's values, named so the decorator and its tests cannot
@@ -94,54 +98,58 @@ func ClassifyOutcome(err error) string {
 //
 // Narrowly named on purpose. A general exported observe() would become the
 // escape hatch through which unbounded labels arrive.
-func ObserveDial(start time.Time, err error) {
-	observe("Dial", start, err)
+func ObserveDial(hypervisor string, start time.Time, err error) {
+	observe(hypervisor, "Dial", start, err)
 }
 
-func observe(operation string, start time.Time, err error) {
+func observe(hypervisor, operation string, start time.Time, err error) {
 	metrics.ProviderOperationDuration.
-		WithLabelValues(operation, ClassifyOutcome(err)).
+		WithLabelValues(operation, ClassifyOutcome(err), hypervisor).
 		Observe(time.Since(start).Seconds())
 }
 
 func (p *Instrumented) Create(ctx context.Context, spec MachineSpec) (*MachineState, error) {
 	start := time.Now()
 	state, err := p.MachineProvider.Create(ctx, spec)
-	observe("Create", start, err)
+	p.observe("Create", start, err)
 	return state, err
 }
 
 func (p *Instrumented) Delete(ctx context.Context, id string) error {
 	start := time.Now()
 	err := p.MachineProvider.Delete(ctx, id)
-	observe("Delete", start, err)
+	p.observe("Delete", start, err)
 	return err
 }
 
 func (p *Instrumented) Get(ctx context.Context, id string) (*MachineState, error) {
 	start := time.Now()
 	state, err := p.MachineProvider.Get(ctx, id)
-	observe("Get", start, err)
+	p.observe("Get", start, err)
 	return state, err
 }
 
 func (p *Instrumented) FindByName(ctx context.Context, name string) (*MachineState, error) {
 	start := time.Now()
 	state, err := p.MachineProvider.FindByName(ctx, name)
-	observe("FindByName", start, err)
+	p.observe("FindByName", start, err)
 	return state, err
 }
 
 func (p *Instrumented) DeleteByName(ctx context.Context, name, storagePool string) error {
 	start := time.Now()
 	err := p.MachineProvider.DeleteByName(ctx, name, storagePool)
-	observe("DeleteByName", start, err)
+	p.observe("DeleteByName", start, err)
 	return err
 }
 
 func (p *Instrumented) EnsureInfrastructure(ctx context.Context, spec InfrastructureSpec) error {
 	start := time.Now()
 	err := p.MachineProvider.EnsureInfrastructure(ctx, spec)
-	observe("EnsureInfrastructure", start, err)
+	p.observe("EnsureInfrastructure", start, err)
 	return err
+}
+
+func (p *Instrumented) observe(operation string, start time.Time, err error) {
+	observe(p.hypervisor, operation, start, err)
 }
