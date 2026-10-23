@@ -60,6 +60,15 @@ type Pool struct {
 	labels map[string]int
 	// closed is set by CloseAll; the pool refuses all work afterwards.
 	closed bool
+	// getting counts, per owner, the Gets in flight and the Releases that
+	// landed while they were, so a Get that a Release overtook does not bind
+	// the owner again afterwards. An owner is in it only while a Get is.
+	getting map[Owner]*ownerGets
+	// closes counts connections being closed in the background, so CloseAll
+	// can wait for the ones a Release or a move started too. Added to only
+	// under mu, by removeLocked, and nothing removes an entry once CloseAll has
+	// emptied the pool, so no Add runs concurrently with CloseAll's Wait.
+	closes sync.WaitGroup
 
 	// afterReserve, when set, runs in Get between reserving an entry and
 	// binding to it -- the window a concurrent Release must not close the entry
@@ -81,10 +90,10 @@ type Owner struct {
 func (o Owner) String() string { return o.Kind + " " + o.NamespacedName.String() }
 
 // maxHypervisorLabels is how many hypervisors a pool labels by name at once.
-// internal/metrics, docs/metrics.md and docs/alerts.md state the number; change
-// them with it.
 // Generous for any real site, and it bounds the series an operator can create
 // by naming hypervisors to at most this many plus OtherHypervisor.
+// internal/metrics, docs/metrics.md and docs/alerts.md state the number; change
+// them with it.
 const maxHypervisorLabels = 16
 
 // OtherHypervisor is the hypervisor label shared by every target that entered
@@ -120,6 +129,17 @@ var errPoolClosed = errors.New("the backend connection pool is closed")
 // connection is GetPinned's.
 var errNoOwner = errors.New("a connection must have an owner; use GetPinned for the shared default")
 
+// errOwnerReleased is returned by a Get whose owner was released while it was
+// in flight. The owner is not bound; a caller that still needs the connection
+// asks again.
+var errOwnerReleased = errors.New("the owner was released while its connection was being resolved")
+
+// ownerGets is one owner's entry in Pool.getting.
+type ownerGets struct {
+	inFlight int // Gets for this owner between reserving and binding
+	releases int // Releases of this owner since the first of them began
+}
+
 // Opener builds a connection: the provider, and a function that closes it.
 // hypervisor is the metric label its samples go under, which the pool chooses:
 // the target's name, or OtherHypervisor.
@@ -139,6 +159,10 @@ type Opener func(ctx context.Context, hypervisor string) (MachineProvider, func(
 // HydraBackendUnreachable see a hypervisor that has never answered. Concurrent
 // callers share one successful dial; after a failed one, each queued caller
 // tries for itself.
+//
+// A Release of owner that lands while this Get is in flight wins: the Get
+// returns errOwnerReleased rather than binding the owner again afterwards,
+// which would leave a deleted object holding a connection nobody releases.
 func (p *Pool) Get(ctx context.Context, owner Owner, key, name string, open Opener) (MachineProvider, error) {
 	if owner.Kind == "" || owner.Name == "" {
 		return nil, errNoOwner
@@ -164,6 +188,7 @@ func (p *Pool) get(ctx context.Context, owner Owner, key, name string, open Open
 		p.conns = map[string]*poolEntry{}
 		p.owners = map[Owner]string{}
 		p.labels = map[string]int{}
+		p.getting = map[Owner]*ownerGets{}
 	}
 	e := p.conns[key]
 	created := e == nil
@@ -174,6 +199,7 @@ func (p *Pool) get(ctx context.Context, owner Owner, key, name string, open Open
 	// Reserved before the lock is released, so a Release racing this Get
 	// cannot close the entry out from under it.
 	e.pending++
+	og, releasesBefore := p.startGetLocked(owner)
 	hook, beforeBind := p.afterReserve, p.beforeBind
 	p.mu.Unlock()
 	if created && e.label != name {
@@ -191,17 +217,29 @@ func (p *Pool) get(ctx context.Context, owner Owner, key, name string, open Open
 
 	p.mu.Lock()
 	e.pending--
+	overtaken := p.endGetLocked(owner, og, releasesBefore)
 	if p.closed {
 		// CloseAll ran while this was opening. It has closed whatever was open
 		// and taken the entry out, so prov, if any, is already closed.
 		p.mu.Unlock()
 		return nil, errPoolClosed
 	}
+	if overtaken {
+		// Its owner was released meanwhile: bind nothing, and close what this
+		// Get opened if nobody else wants it.
+		var c *closing
+		if p.idleLocked(e) {
+			c = p.removeLocked(key, e)
+		}
+		p.mu.Unlock()
+		p.closeInBackground(c)
+		return nil, errOwnerReleased
+	}
 	// Bound even after a failed open; see Get. Nothing can have taken e out of
 	// the pool meanwhile: only CloseAll removes an entry someone has reserved.
-	closing := p.bindLocked(owner, key, e)
+	c := p.bindLocked(owner, key, e)
 	p.mu.Unlock()
-	closing.close()
+	p.closeInBackground(c)
 	return prov, err
 }
 
@@ -271,6 +309,9 @@ func (p *Pool) bindLocked(owner Owner, key string, e *poolEntry) *closing {
 // no-op, so it is safe to call for every deleted object.
 func (p *Pool) Release(ctx context.Context, owner Owner) {
 	p.mu.Lock()
+	if og := p.getting[owner]; og != nil {
+		og.releases++
+	}
 	var c *closing
 	if key, ok := p.owners[owner]; ok {
 		delete(p.owners, owner)
@@ -280,7 +321,7 @@ func (p *Pool) Release(ctx context.Context, owner Owner) {
 	if c != nil {
 		logf.FromContext(ctx).Info("Released hypervisor connection", "hypervisor", c.name, "owner", owner.String())
 	}
-	c.close()
+	p.closeInBackground(c)
 }
 
 // unbindLocked removes owner from the target at key, and takes the target out
@@ -311,7 +352,8 @@ type closing struct {
 }
 
 // removeLocked takes e out of the pool, with its connection and its share of
-// its hypervisor label. p.mu must be held.
+// its hypervisor label. The caller must pass the result to closeInBackground.
+// p.mu must be held.
 //
 // A label's series are dropped here, under the lock, so no Get can take the
 // label up again between deciding it is unused and dropping them. A call
@@ -323,6 +365,9 @@ type closing struct {
 func (p *Pool) removeLocked(key string, e *poolEntry) *closing {
 	delete(p.conns, key)
 	c := &closing{name: e.name, release: e.release}
+	if c.release != nil {
+		p.closes.Add(1) // done by closeInBackground, which every caller runs
+	}
 	if e.prov != nil {
 		metrics.ProviderConnections.Dec()
 	}
@@ -362,15 +407,16 @@ func (p *Pool) limit() int {
 	return maxHypervisorLabels
 }
 
-// close closes c's connection, if it had one, in the background: a polite close
-// can wait seconds on a daemon that has stopped answering, and nothing that
-// releases a connection needs to wait for that.
-func (c *closing) close() {
+// closeInBackground closes c's connection, if it had one, without waiting: a
+// polite close can wait seconds on a daemon that has stopped answering, and
+// nothing that releases a connection needs to wait for that. CloseAll does.
+func (p *Pool) closeInBackground(c *closing) {
 	if c == nil || c.release == nil {
 		return
 	}
 	log := logf.Log.WithName("provider-pool")
 	go func() {
+		defer p.closes.Done()
 		if err := c.release(); err != nil {
 			log.Error(err, "Failed to close hypervisor connection cleanly", "hypervisor", c.name)
 			return
@@ -379,30 +425,52 @@ func (c *closing) close() {
 	}()
 }
 
+// startGetLocked records a Get for owner as in flight, and returns how many
+// Releases of owner had landed by then. Nothing for the pinned owner, which is
+// never released. p.mu must be held.
+func (p *Pool) startGetLocked(owner Owner) (*ownerGets, int) {
+	if owner == (Owner{}) {
+		return nil, 0
+	}
+	og := p.getting[owner]
+	if og == nil {
+		og = &ownerGets{}
+		p.getting[owner] = og
+	}
+	og.inFlight++
+	return og, og.releases
+}
+
+// endGetLocked records that Get as finished, and reports whether a Release of
+// its owner landed while it was in flight. p.mu must be held.
+func (p *Pool) endGetLocked(owner Owner, og *ownerGets, releasesBefore int) bool {
+	if og == nil {
+		return false
+	}
+	og.inFlight--
+	if og.inFlight == 0 && p.getting[owner] == og {
+		delete(p.getting, owner)
+	}
+	return og.releases != releasesBefore
+}
+
 // CloseAll closes every connection the pool holds, pinned ones included, and
-// waits for the closes to finish. A dial still in flight is not waited for:
-// its connection is closed in the background once it completes. For manager shutdown; the pool must not be
+// waits for those closes to finish, and for any a Release or a move had already
+// started. A dial still in flight is not waited for: its connection is closed in
+// the background once it completes. For manager shutdown; the pool must not be
 // used afterwards.
 func (p *Pool) CloseAll() {
 	p.mu.Lock()
 	p.closed = true
-	var releases []func() error
+	cs := make([]*closing, 0, len(p.conns))
 	for key, e := range p.conns {
-		if c := p.removeLocked(key, e); c.release != nil {
-			releases = append(releases, c.release)
-		}
+		cs = append(cs, p.removeLocked(key, e))
 	}
 	p.owners = map[Owner]string{}
 	p.mu.Unlock()
 
-	var wg sync.WaitGroup
-	log := logf.Log.WithName("provider-pool")
-	for _, release := range releases {
-		wg.Go(func() {
-			if err := release(); err != nil {
-				log.Error(err, "Failed to close hypervisor connection cleanly at shutdown")
-			}
-		})
+	for _, c := range cs {
+		p.closeInBackground(c)
 	}
-	wg.Wait()
+	p.closes.Wait()
 }

@@ -46,6 +46,8 @@ type fakeConns struct {
 	closeErr error
 	// labels is the hypervisor label each key's last open was given.
 	labels map[string]string
+	// closeGate, when set, holds every close until it is closed.
+	closeGate chan struct{}
 }
 
 func newFakeConns() *fakeConns {
@@ -74,7 +76,11 @@ func (f *fakeConns) opener(key string) Opener {
 			ObserveDial(label, time.Now(), err)
 			return nil, nil, err
 		}
+		closeGate := f.closeGate
 		return &recordingProvider{}, func() error {
+			if closeGate != nil {
+				<-closeGate
+			}
 			f.mu.Lock()
 			f.closes[key]++
 			err := f.closeErr
@@ -136,6 +142,27 @@ func (f *fakeConns) waitClosed(t *testing.T, key string) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("connection %q was never closed", key)
+	}
+}
+
+// waitClosedAll waits for every one of keys to be closed, in any order: closes
+// started together run concurrently.
+func (f *fakeConns) waitClosedAll(t *testing.T, keys ...string) {
+	t.Helper()
+	want := map[string]bool{}
+	for _, k := range keys {
+		want[k] = true
+	}
+	for len(want) > 0 {
+		select {
+		case got := <-f.closed:
+			if !want[got] {
+				t.Fatalf("closed %q, want one of %v", got, keys)
+			}
+			delete(want, got)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("connections %v were never closed", want)
+		}
 	}
 }
 
@@ -619,4 +646,130 @@ func TestPoolQueuedCallerDoesNotDialAfterCloseAll(t *testing.T) {
 	if n := f.count(f.opens, "hv1"); n != 1 {
 		t.Errorf("%d opens, want only the one already in flight", n)
 	}
+}
+
+// A Release that lands while its owner's Get is in flight wins: the Get must
+// not bind the owner again afterwards, or a deleted object would hold a
+// connection nothing ever releases.
+func TestPoolReleaseOvertakesAnInFlightGet(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err != nil {
+		t.Fatal(err)
+	}
+	// clusterA asks for another target, and is released before that Get binds.
+	pool.afterReserve = func() {
+		pool.afterReserve = nil
+		pool.Release(t.Context(), clusterA)
+	}
+	if _, err := pool.Get(t.Context(), clusterA, "hv2", "hv2", f.opener("hv2")); !errors.Is(err, errOwnerReleased) {
+		t.Fatalf("overtaken Get = %v, want errOwnerReleased", err)
+	}
+	// hv1 by the Release itself, hv2 because the overtaken Get opened it for
+	// nobody.
+	f.waitClosedAll(t, "hv1", "hv2")
+	if n := pool.entries(); n != 0 {
+		t.Errorf("%d entries kept for a released owner, want none", n)
+	}
+	pool.mu.Lock()
+	_, bound := pool.owners[clusterA]
+	tracked := len(pool.getting)
+	pool.mu.Unlock()
+	if bound {
+		t.Error("the released owner was bound again by the Get it overtook")
+	}
+	if tracked != 0 {
+		t.Errorf("%d owners still tracked with no Get in flight, want none", tracked)
+	}
+
+	// A Get that starts after the Release is a new request, and binds.
+	if _, err := pool.Get(t.Context(), clusterA, "hv2", "hv2", f.opener("hv2")); err != nil {
+		t.Fatalf("Get after the Release: %v", err)
+	}
+	pool.Release(t.Context(), clusterA)
+	f.waitClosed(t, "hv2")
+}
+
+// A Release of one owner does not overtake another owner's Get.
+func TestPoolReleaseOvertakesOnlyItsOwnersGet(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	pool.afterReserve = func() {
+		pool.afterReserve = nil
+		pool.Release(t.Context(), clusterB)
+	}
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err != nil {
+		t.Fatalf("Get = %v, want clusterB's Release to leave it alone", err)
+	}
+	f.requireNoClose(t)
+	pool.Release(t.Context(), clusterA)
+	f.waitClosed(t, "hv1")
+}
+
+// CloseAll waits for closes a Release started before it, not only its own, so
+// shutdown does not leave a polite close half done.
+func TestPoolCloseAllWaitsForAReleasesClose(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	gate := make(chan struct{})
+	f.closeGate = gate
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err != nil {
+		t.Fatal(err)
+	}
+	pool.Release(t.Context(), clusterA) // its close is now blocked on gate
+
+	done := make(chan struct{})
+	go func() {
+		pool.CloseAll()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("CloseAll returned while a Release's close was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAll never returned")
+	}
+	if n := f.count(f.closes, "hv1"); n != 1 {
+		t.Errorf("%d closes, want 1", n)
+	}
+}
+
+// A Get that begins after a Release binds even while an older Get for the same
+// owner, which that Release overtook, is still in flight: only the older one
+// is stale.
+func TestPoolGetAfterAReleaseBindsWhileAnOvertakenGetIsInFlight(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	var newer error
+	pool.afterReserve = func() {
+		// The older Get is reserved and in flight. clusterA is released, and a
+		// new reconcile asks again before the older Get finishes.
+		pool.afterReserve = nil
+		pool.Release(t.Context(), clusterA)
+		_, newer = pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1"))
+	}
+	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, errOwnerReleased) {
+		t.Fatalf("older Get = %v, want errOwnerReleased", err)
+	}
+	if newer != nil {
+		t.Fatalf("newer Get = %v, want it to bind: it began after the Release", newer)
+	}
+	pool.mu.Lock()
+	key, bound := pool.owners[clusterA]
+	tracked := len(pool.getting)
+	pool.mu.Unlock()
+	if !bound || key != "hv1" {
+		t.Errorf("clusterA bound to %q (%v), want hv1 through the newer Get", key, bound)
+	}
+	if tracked != 0 {
+		t.Errorf("%d owners still tracked with no Get in flight, want none", tracked)
+	}
+	f.requireNoClose(t) // the newer Get's owner keeps the connection open
+	pool.Release(t.Context(), clusterA)
+	f.waitClosed(t, "hv1")
 }
