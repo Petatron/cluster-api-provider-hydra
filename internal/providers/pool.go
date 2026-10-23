@@ -21,6 +21,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -38,9 +39,11 @@ import (
 // Owners are what make closing possible. A cluster that resolves its provider
 // becomes an owner of that target's connection; when it moves to another
 // target, or is gone, it releases the old one, and the last owner to leave
-// closes it. A connection obtained with no owner is never closed: that is the
+// closes it. A connection obtained with GetPinned is never closed: that is the
 // manager-wide connection configured by flags, which clusters naming no
-// hypervisor share, exactly as before the pool existed.
+// hypervisor share, exactly as before the pool existed. Pinning is explicit
+// rather than implied by a missing owner, so a caller that fails to produce an
+// owner gets an error instead of a connection nothing will ever close.
 //
 // The zero value is ready to use.
 type Pool struct {
@@ -70,12 +73,16 @@ type poolEntry struct {
 	prov    MachineProvider
 	release func() error
 	owners  map[types.NamespacedName]struct{}
-	pinned  bool // obtained with no owner: never closed
+	pinned  bool // obtained with GetPinned: never closed
 	pending int  // callers between reserving this entry and binding to it
 }
 
 // errPoolClosed is returned by Get after CloseAll.
 var errPoolClosed = errors.New("the backend connection pool is closed")
+
+// errNoOwner is returned by Get for a zero owner. The pinned connection is
+// GetPinned's.
+var errNoOwner = errors.New("a connection must have an owner; use GetPinned for the shared default")
 
 // Opener builds a connection: the provider, and a function that closes it.
 type Opener func(ctx context.Context) (MachineProvider, func() error, error)
@@ -84,13 +91,29 @@ type Opener func(ctx context.Context) (MachineProvider, func() error, error)
 // open if no connection exists.
 //
 // owner becomes an owner of the connection, releasing whichever connection it
-// owned before if that was a different one. A zero owner records nothing and
-// pins the connection open for the life of the process. name labels the
-// connection in logs.
+// owned before if that was a different one. It must not be zero. name labels
+// the connection in logs and metrics.
 //
 // A failed open is not cached: the next Get tries again, so a hypervisor that
-// was down is retried rather than remembered as broken.
+// was down is retried rather than remembered as broken. Concurrent callers
+// share one successful dial; after a failed one, each queued caller tries for
+// itself.
 func (p *Pool) Get(ctx context.Context, owner types.NamespacedName, key, name string, open Opener) (MachineProvider, error) {
+	if owner == (types.NamespacedName{}) {
+		return nil, errNoOwner
+	}
+	return p.get(ctx, owner, key, name, open)
+}
+
+// GetPinned is Get for a connection that is never closed while the pool is
+// open, whoever comes and goes: the shared default the manager's flags
+// configure.
+func (p *Pool) GetPinned(ctx context.Context, key, name string, open Opener) (MachineProvider, error) {
+	return p.get(ctx, types.NamespacedName{}, key, name, open)
+}
+
+// get is Get, with a zero owner meaning pinned.
+func (p *Pool) get(ctx context.Context, owner types.NamespacedName, key, name string, open Opener) (MachineProvider, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -238,9 +261,23 @@ func (p *Pool) closeEntry(e *poolEntry) {
 	if opened {
 		metrics.ProviderConnections.Dec()
 	}
+	// The hypervisor's series go with its last connection, so a cluster deleted
+	// or moved does not leave dead series until the pod restarts. Two targets
+	// can share a hypervisor name (same host, other credentials); while one
+	// remains, its series stay.
+	lastOfName := true
+	for _, other := range p.conns {
+		if other.name == e.name {
+			lastOfName = false
+			break
+		}
+	}
 	p.mu.Unlock()
 	if !opened {
 		return
+	}
+	if lastOfName {
+		metrics.ProviderOperationDuration.DeletePartialMatch(prometheus.Labels{"hypervisor": e.name})
 	}
 	log := logf.Log.WithName("provider-pool")
 	go func() {

@@ -17,6 +17,7 @@ limitations under the License.
 package libvirt
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -162,5 +163,42 @@ func TestConfigHypervisorNamesTheEndpoint(t *testing.T) {
 		if got := cfg.Hypervisor(); got != want {
 			t.Errorf("Config{RemoteAddr: %q, Insecure: %v}.Hypervisor() = %q, want %q", cfg.RemoteAddr, cfg.Insecure, got, want)
 		}
+	}
+}
+
+// Credentials and a PKI path are two sources for one identity; with both, one
+// would silently lose.
+func TestNewDialerRefusesCredentialsWithAPKIPath(t *testing.T) {
+	cfg := Config{RemoteAddr: "hypervisor:16514", PKIPath: "/etc/pki/libvirt", Credentials: &TLSCredentials{}}
+	if _, err := newDialer(cfg); err == nil || !strings.Contains(err.Error(), "one or the other") {
+		t.Fatalf("newDialer = %v, want the combination refused", err)
+	}
+}
+
+// A failure building the in-memory dialer returns a nil interface, not a nil
+// *tlsDialer wrapped in one.
+func TestNewDialerReturnsANilDialerOnError(t *testing.T) {
+	d, err := newDialer(Config{RemoteAddr: "hypervisor:16514", Credentials: &TLSCredentials{}})
+	if err == nil {
+		t.Fatal("newDialer accepted empty credentials")
+	}
+	if d != nil {
+		t.Fatalf("newDialer returned %#v with its error, want a nil interface", d)
+	}
+}
+
+// Credentials never print their key, however they are formatted or logged.
+func TestTLSCredentialsDoNotPrintTheirKey(t *testing.T) {
+	const secret = "-----BEGIN PRIVATE KEY-----sekrit"
+	creds := TLSCredentials{CACert: []byte("ca"), ClientCert: []byte("cert"), ClientKey: []byte(secret)}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		for _, v := range []any{creds, &creds, Config{Credentials: &creds}} {
+			if out := fmt.Sprintf(verb, v); strings.Contains(out, "sekrit") {
+				t.Errorf("%s of %T printed the key: %s", verb, v, out)
+			}
+		}
+	}
+	if out := fmt.Sprint(creds.MarshalLog()); strings.Contains(out, "sekrit") {
+		t.Errorf("MarshalLog printed the key: %s", out)
 	}
 }

@@ -23,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/Petatron/cluster-api-provider-hydra/internal/metrics"
@@ -37,6 +39,8 @@ type fakeConns struct {
 	closed chan string
 	fail   map[string]error
 	gate   map[string]chan struct{} // an open for this key waits on it
+	// started receives a key each time an open for it begins, before any gate.
+	started chan string
 	// closeErr is what closing returns. The pool logs it; a failed close must
 	// still count as closed.
 	closeErr error
@@ -45,12 +49,13 @@ type fakeConns struct {
 func newFakeConns() *fakeConns {
 	return &fakeConns{
 		opens: map[string]int{}, closes: map[string]int{}, closed: make(chan string, 64),
-		fail: map[string]error{}, gate: map[string]chan struct{}{},
+		fail: map[string]error{}, gate: map[string]chan struct{}{}, started: make(chan string, 64),
 	}
 }
 
 func (f *fakeConns) opener(key string) Opener {
 	return func(context.Context) (MachineProvider, func() error, error) {
+		f.started <- key
 		f.mu.Lock()
 		gate := f.gate[key]
 		f.mu.Unlock()
@@ -80,6 +85,40 @@ func (f *fakeConns) count(m map[string]int, key string) int {
 	return m[key]
 }
 
+// waitStarted waits until an open for key has begun: the dial is in flight.
+func (f *fakeConns) waitStarted(t *testing.T, key string) {
+	t.Helper()
+	select {
+	case got := <-f.started:
+		if got != key {
+			t.Fatalf("an open began for %q, want %q", got, key)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no open for %q ever began", key)
+	}
+}
+
+// waitReserved waits until n callers have reserved key's entry, i.e. are
+// committed to it, whether dialing or queued behind the dial.
+func waitReserved(t *testing.T, pool *Pool, key string, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		pool.mu.Lock()
+		got := 0
+		if e := pool.conns[key]; e != nil {
+			got = e.pending
+		}
+		pool.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d callers reserved %q", got, n, key)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // waitClosed waits for key's connection to be closed; the pool closes in the
 // background.
 func (f *fakeConns) waitClosed(t *testing.T, key string) {
@@ -104,9 +143,11 @@ func (f *fakeConns) requireNoClose(t *testing.T) {
 	}
 }
 
+const testNamespace = "default"
+
 var (
-	clusterA = types.NamespacedName{Namespace: "default", Name: "a"}
-	clusterB = types.NamespacedName{Namespace: "default", Name: "b"}
+	clusterA = types.NamespacedName{Namespace: testNamespace, Name: "a"}
+	clusterB = types.NamespacedName{Namespace: testNamespace, Name: "b"}
 )
 
 func TestPoolSharesOneConnectionPerTarget(t *testing.T) {
@@ -130,7 +171,7 @@ func TestPoolSharesOneConnectionPerTarget(t *testing.T) {
 			got[i] = p
 		})
 	}
-	time.Sleep(50 * time.Millisecond) // let them all queue on the one open
+	waitReserved(t, &pool, "hv1", len(got)) // every caller is committed to the one dial
 	close(release)
 	wg.Wait()
 
@@ -228,7 +269,7 @@ func TestPoolReleasesTheOldTargetWhenAnOwnerMoves(t *testing.T) {
 func TestPoolNeverClosesAConnectionObtainedWithoutAnOwner(t *testing.T) {
 	var pool Pool
 	f := newFakeConns()
-	if _, err := pool.Get(t.Context(), types.NamespacedName{}, "flags", "local", f.opener("flags")); err != nil {
+	if _, err := pool.GetPinned(t.Context(), "flags", "local", f.opener("flags")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Get(t.Context(), clusterA, "flags", "local", f.opener("flags")); err != nil {
@@ -288,7 +329,7 @@ func TestPoolCloseAllClosesEverythingAndWaits(t *testing.T) {
 	var pool Pool
 	f := newFakeConns()
 	before := testutil.ToFloat64(metrics.ProviderConnections)
-	if _, err := pool.Get(t.Context(), types.NamespacedName{}, "flags", "local", f.opener("flags")); err != nil {
+	if _, err := pool.GetPinned(t.Context(), "flags", "local", f.opener("flags")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")); err != nil {
@@ -353,7 +394,7 @@ func TestPoolClosesAConnectionThatFinishesOpeningAfterCloseAll(t *testing.T) {
 		_, err := pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1"))
 		result <- err
 	}()
-	time.Sleep(50 * time.Millisecond)
+	f.waitStarted(t, "hv1") // the open is in flight, past Get's closed check
 	pool.CloseAll()
 	close(release)
 
@@ -375,7 +416,7 @@ func TestPoolCallerQueuedBehindADialHonoursItsOwnContext(t *testing.T) {
 	defer close(release)
 	f.gate["hv1"] = release
 	go func() { _, _ = pool.Get(t.Context(), clusterA, "hv1", "hv1", f.opener("hv1")) }()
-	time.Sleep(50 * time.Millisecond)
+	f.waitStarted(t, "hv1") // the first caller holds the dial
 
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
@@ -385,5 +426,64 @@ func TestPoolCallerQueuedBehindADialHonoursItsOwnContext(t *testing.T) {
 	}
 	if waited := time.Since(start); waited > 2*time.Second {
 		t.Errorf("queued Get waited %s, want it to give up at its own 100ms deadline", waited)
+	}
+}
+
+// A missing owner is an error, not a connection pinned open for good: only
+// GetPinned pins.
+func TestPoolRefusesAZeroOwner(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	if _, err := pool.Get(t.Context(), types.NamespacedName{}, "hv1", "hv1", f.opener("hv1")); !errors.Is(err, errNoOwner) {
+		t.Fatalf("Get with no owner = %v, want errNoOwner", err)
+	}
+	if n := f.count(f.opens, "hv1"); n != 0 {
+		t.Errorf("%d opens for a refused Get, want none", n)
+	}
+}
+
+// A hypervisor's series go with its last connection, so a deleted or moved
+// cluster leaves nothing behind -- unless another connection to the same
+// hypervisor (other credentials) still records under that name.
+func TestPoolDropsAHypervisorsSeriesWithItsLastConnection(t *testing.T) {
+	var pool Pool
+	f := newFakeConns()
+	record := func(name string) {
+		metrics.ProviderOperationDuration.WithLabelValues("Get", outcomeSuccess, name).Observe(0.1)
+	}
+	series := func(name string) int {
+		ch := make(chan prometheus.Metric, 256)
+		metrics.ProviderOperationDuration.Collect(ch)
+		close(ch)
+		n := 0
+		for m := range ch {
+			var out dto.Metric
+			_ = m.Write(&out)
+			for _, l := range out.GetLabel() {
+				if l.GetName() == "hypervisor" && l.GetValue() == name {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	const shared = "shared.test:16514"
+	for _, k := range []string{"shared@cred1", "shared@cred2"} {
+		owner := types.NamespacedName{Namespace: testNamespace, Name: k}
+		if _, err := pool.Get(t.Context(), owner, k, shared, f.opener(k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(shared)
+
+	pool.Release(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: "shared@cred1"})
+	f.waitClosed(t, "shared@cred1")
+	if series(shared) == 0 {
+		t.Fatal("the series went while another connection to the same hypervisor remained")
+	}
+	pool.Release(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: "shared@cred2"})
+	f.waitClosed(t, "shared@cred2")
+	if n := series(shared); n != 0 {
+		t.Errorf("%d series left for a hypervisor with no connection, want none", n)
 	}
 }

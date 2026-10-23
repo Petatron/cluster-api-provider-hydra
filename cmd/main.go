@@ -28,7 +28,6 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -276,7 +275,7 @@ func main() {
 		return providers.NewInstrumented(p, hypervisor), p.Close, nil
 	}
 	providerFor := func(ctx context.Context, _ *infrastructurev1alpha1.HydraCluster) (providers.MachineProvider, error) {
-		return pool.Get(ctx, types.NamespacedName{}, "flags", hypervisor, openDefault)
+		return pool.GetPinned(ctx, "flags", hypervisor, openDefault)
 	}
 
 	if err := (&controller.HydraClusterReconciler{

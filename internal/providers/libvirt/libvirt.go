@@ -158,9 +158,24 @@ type Config struct {
 
 // TLSCredentials is a TLS client identity and the CA its server must chain to,
 // as PEM: the contents of cacert.pem, clientcert.pem and clientkey.pem.
+//
+// It holds a private key, so it never prints one: String, GoString and
+// MarshalLog all redact, which covers fmt's %v, %+v and %#v and structured
+// logging.
 type TLSCredentials struct {
 	CACert, ClientCert, ClientKey []byte
 }
+
+const redactedCredentials = "TLSCredentials{<redacted>}"
+
+// String implements fmt.Stringer without the key.
+func (TLSCredentials) String() string { return redactedCredentials }
+
+// GoString implements fmt.GoStringer without the key.
+func (TLSCredentials) GoString() string { return redactedCredentials }
+
+// MarshalLog implements logr.Marshaler without the key.
+func (TLSCredentials) MarshalLog() any { return redactedCredentials }
 
 // Hypervisor names the endpoint cfg reaches, for metrics and logs: host:port for
 // a remote daemon as written, with the transport's default port filled in, or

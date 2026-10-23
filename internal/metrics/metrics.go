@@ -48,8 +48,11 @@ var (
 	//
 	// hypervisor names the backend endpoint the call went to (PET-38), so an
 	// unreachable host is identifiable once a manager talks to more than one.
-	// Bounded by the number of hypervisors the manager is configured to reach,
-	// not by anything that grows at runtime.
+	// It has one value per hypervisor in use. Once clusters can name their own,
+	// that is whatever HydraClusters name, so anyone who may create one can add
+	// a value; a hypervisor's series are dropped when its last connection
+	// closes. It is a label, not an identity: the same host reached with two
+	// sets of credentials, or by IP and by name, shares or splits values.
 	ProviderOperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: namespace,

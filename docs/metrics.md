@@ -22,9 +22,15 @@ Read those first: `controller_runtime_reconcile_total`,
 Histogram. Labels: `operation`, `outcome`, `hypervisor`.
 
 `hypervisor` is the endpoint the call went to: `host:port` for a remote
-daemon, with the transport's default port filled in, or `local` for the local
-socket. It is bounded by the number of hypervisors the manager reaches, not by
-anything that grows at runtime (PET-38).
+daemon as written, with the transport's default port filled in, or `local` for
+the local socket (PET-38). There is one value per hypervisor in use. Once
+clusters can name their own hypervisor, that is whatever HydraClusters name, so
+anyone allowed to create one can add a value; a hypervisor's series are removed
+when the manager closes its last connection to it.
+
+It is a label, not an identity. The same host reached by IP and by hostname gets
+two values, and two connections to one host with different credentials share
+one -- so `HydraBackendUnreachable`, judged per value, sees those two together.
 
 Time spent inside the infrastructure backend. This is the difference between
 *"the reconcile took 40 seconds"* and *"defining the domain took 39 of them"* —
