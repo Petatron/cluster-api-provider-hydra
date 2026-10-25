@@ -156,33 +156,11 @@ type Config struct {
 	RPCTimeout time.Duration
 }
 
-// TLSCredentials is a TLS client identity and the CA its server must chain to,
-// as PEM: the contents of cacert.pem, clientcert.pem and clientkey.pem.
-//
-// It holds a private key, so it never prints one. It implements fmt.Formatter,
-// which fmt consults before anything else for every verb -- %d and %x included,
-// which would otherwise print the key's bytes -- and the same goes for a Config
-// holding it. String, GoString and MarshalLog redact too, for callers that use
-// them directly and for structured logging. fmt cannot call a method through an
-// unexported field, so never hold one by value in one; by pointer it prints as
-// an address.
-type TLSCredentials struct {
-	CACert, ClientCert, ClientKey []byte
-}
-
-const redactedCredentials = "TLSCredentials{<redacted>}"
-
-// String implements fmt.Stringer without the key.
-func (TLSCredentials) String() string { return redactedCredentials }
-
-// GoString implements fmt.GoStringer without the key.
-func (TLSCredentials) GoString() string { return redactedCredentials }
-
-// Format implements fmt.Formatter without the key, whatever the verb.
-func (TLSCredentials) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redactedCredentials) }
-
-// MarshalLog implements logr.Marshaler without the key.
-func (TLSCredentials) MarshalLog() any { return redactedCredentials }
+// TLSCredentials is the TLS client identity a Config can carry in memory. It
+// lives in providers so a controller can hand credentials over without
+// importing this backend; see providers.TLSCredentials, which never prints its
+// key.
+type TLSCredentials = providers.TLSCredentials
 
 // Hypervisor names the endpoint cfg reaches, for metrics and logs: host:port for
 // a remote daemon as written, with the transport's default port filled in, or

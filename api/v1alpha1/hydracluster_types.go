@@ -30,11 +30,8 @@ import (
 // managed. Moving it onto an object per cluster is the entire point of this
 // type -- the Cluster API contract fields below are the smaller part of its job.
 //
-// Note what is deliberately absent: how to reach the hypervisor. That is still
-// a manager flag, and moving it here is PET-38, bundled with the switch to TLS.
-// It is left out rather than stubbed because a field the provider accepts and
-// ignores is worse than one that does not exist -- see spec.image on
-// HydraMachine before PET-8's review caught it.
+// How to reach the hypervisor joined them with PET-38: a cluster may name its
+// own, and one that does not uses the manager's --libvirt-* flags as before.
 // +kubebuilder:validation:XValidation:rule="has(self.controlPlaneEndpoint) && size(self.controlPlaneEndpoint.host) > 0 && self.controlPlaneEndpoint.port > 0",message="controlPlaneEndpoint requires both a host and a non-zero port"
 // +kubebuilder:validation:XValidation:rule="has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool) || self.storagePool == oldSelf.storagePool)",message="storagePool is fixed when the cluster is created; omitting it selects the manager's pool, which is equally binding"
 // +kubebuilder:validation:XValidation:rule="has(self.managedNetwork) == has(oldSelf.managedNetwork)",message="managedNetwork cannot be added or removed after the cluster is created; machines keep the attachments they were built with, so either change leaves the control-plane endpoint on a network only part of the cluster is attached to"
@@ -148,6 +145,76 @@ type HydraClusterSpec struct {
 	// access and the address they register as Nodes.
 	// +optional
 	ManagedNetwork *HydraManagedNetwork `json:"managedNetwork,omitempty"`
+
+	// hypervisor is the hypervisor this cluster's machines are created on, and
+	// how to reach it. Omitted, they are created on the one the manager's
+	// --libvirt-* flags configure.
+	//
+	// Each machine records the hypervisor it was created on, and every later
+	// operation on it -- teardown included -- goes there, whatever this field
+	// says by then. Naming a hypervisor therefore never moves a machine.
+	//
+	// It may be added to a cluster that already has machines. The controller
+	// then checks that every one of them is already on the named hypervisor
+	// (the same domain, by name and ID), and only then confirms it in
+	// status.hypervisor; until it does, no new machine is created. A machine
+	// found anywhere else is reported as InfrastructureFailed and nothing is
+	// confirmed.
+	//
+	// Until it is confirmed it may be corrected or removed. Once confirmed it is
+	// fixed: it cannot be removed and its address cannot change, because the
+	// cluster's machines are recorded against it. The credentials may change at
+	// any time, to rotate them.
+	// +optional
+	Hypervisor *HydraHypervisor `json:"hypervisor,omitempty"`
+}
+
+// HydraHypervisor names a hypervisor and the credentials to reach it.
+//
+// TLS only, on purpose. Plaintext stays a manager-wide flag for a trusted
+// tunnel: a per-cluster switch would be the easiest way to send privileged
+// RPCs in the clear.
+type HydraHypervisor struct {
+	// address is the hypervisor's libvirt TLS listener: host or host:port, an
+	// IPv6 address in brackets. The port defaults to 16514, libvirt's TLS port.
+	//
+	// The certificate the hypervisor presents must be valid for this host.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=259
+	// +kubebuilder:validation:Pattern=`^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?)(:[0-9]{1,5})?$`
+	Address string `json:"address"`
+
+	// credentialsSecretRef names a Secret in this cluster's namespace holding
+	// the TLS client credentials: cacert.pem (the CA the hypervisor's certificate
+	// is checked against), clientcert.pem and clientkey.pem -- the same files
+	// libvirt reads from its PKI directory.
+	//
+	// Read when connecting, never cached, so replacing the Secret or pointing
+	// this at another one rotates the credentials: the next reconcile opens a
+	// connection with the new ones.
+	// +required
+	CredentialsSecretRef HydraSecretReference `json:"credentialsSecretRef"`
+}
+
+// HydraSecretReference names a Secret in the referring object's namespace.
+type HydraSecretReference struct {
+	// name is the Secret's name.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+}
+
+// HydraHypervisorStatus records the hypervisor a cluster is confirmed on.
+type HydraHypervisorStatus struct {
+	// address is spec.hypervisor.address, as written, once every machine the
+	// cluster had was found on that hypervisor. From then on spec.hypervisor
+	// cannot be removed or pointed elsewhere.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=259
+	Address string `json:"address"`
 }
 
 // HydraManagedNetwork describes a network whose lifecycle Hydra owns.
@@ -235,6 +302,12 @@ type HydraClusterStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// hypervisor is set once the controller has confirmed spec.hypervisor: every
+	// machine of the cluster was found on it. New machines are created there
+	// only after this. See HydraClusterSpec.hypervisor.
+	// +optional
+	Hypervisor *HydraHypervisorStatus `json:"hypervisor,omitempty"`
 }
 
 // Condition types owned by HydraCluster.
@@ -265,7 +338,9 @@ const (
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
 // +kubebuilder:printcolumn:name="Pool",type="string",JSONPath=".spec.storagePool",priority=1
 // +kubebuilder:printcolumn:name="Endpoint",type="string",JSONPath=".spec.controlPlaneEndpoint.host",priority=1
+// +kubebuilder:printcolumn:name="Hypervisor",type="string",JSONPath=".spec.hypervisor.address",priority=1
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.hypervisor) || (has(self.spec.hypervisor) && self.spec.hypervisor.address == oldSelf.status.hypervisor.address)",message="spec.hypervisor is fixed once the controller has confirmed the cluster's machines on it (status.hypervisor): it cannot be removed, and its address cannot change"
 
 // HydraCluster is the Schema for the hydraclusters API.
 //

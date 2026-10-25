@@ -250,34 +250,42 @@ func main() {
 		setupLog.Error(err, "Libvirt backend cannot be reached with this configuration")
 	}
 
-	// Backend connections are held by a pool, one per hypervisor, and closed
-	// when nothing uses them any more (PET-38). Every cluster resolves to the
-	// connection the --libvirt-* flags configure, held with no owner and so
-	// never closed while the manager runs -- the single shared connection this
-	// replaces. The pool is what lets a cluster name a hypervisor of its own.
+	// Backend connections are held by a pool, one per hypervisor and set of
+	// credentials, and closed when nothing uses them any more (PET-38). A
+	// cluster naming no hypervisor resolves to the connection the --libvirt-*
+	// flags configure, pinned open for the manager's life -- the single shared
+	// connection there was before. A cluster naming one gets a TLS connection
+	// with the credentials from its Secret, owned by that cluster and by each of
+	// its machines, and closed after the last of them lets go.
 	var pool providers.Pool
 	defer pool.CloseAll()
 
-	hypervisor := libvirtCfg.Hypervisor()
-	// The flag-configured connection. Timed here rather than in the decorator,
-	// because the dial and handshake happen inside the constructor -- before
-	// there is a provider to wrap. An unreachable hypervisor consumes the whole
-	// dial timeout, and without this that would be the one operation producing
-	// no sample at all. Wrapped once, here, so every reconciler shares the same
-	// instrumented instance.
-	// The pool chooses the metric label, so it stays bounded however many
-	// hypervisors clusters name.
-	openDefault := func(ctx context.Context, label string) (providers.MachineProvider, func() error, error) {
-		dialStart := time.Now()
-		p, err := libvirtprovider.New(ctx, libvirtCfg)
-		providers.ObserveDial(label, dialStart, err)
-		if err != nil {
-			return nil, nil, err
+	// open builds an opener for cfg. The dial is timed here rather than in the
+	// decorator, because it happens inside the constructor -- before there is a
+	// provider to wrap. An unreachable hypervisor consumes the whole dial
+	// timeout, and without this that would be the one operation producing no
+	// sample at all. The pool chooses the metric label, so it stays bounded
+	// however many hypervisors clusters name.
+	open := func(cfg libvirtprovider.Config) providers.Opener {
+		return func(ctx context.Context, label string) (providers.MachineProvider, func() error, error) {
+			dialStart := time.Now()
+			p, err := libvirtprovider.New(ctx, cfg)
+			providers.ObserveDial(label, dialStart, err)
+			if err != nil {
+				return nil, nil, err
+			}
+			return providers.NewInstrumented(p, label), p.Close, nil
 		}
-		return providers.NewInstrumented(p, label), p.Close, nil
 	}
-	providerFor := func(ctx context.Context, _ *infrastructurev1alpha1.HydraCluster) (providers.MachineProvider, error) {
-		return pool.GetPinned(ctx, "flags", hypervisor, openDefault)
+	openDefault := open(libvirtCfg)
+	providerFor := func(
+		ctx context.Context, owner providers.Owner, hypervisor *providers.Hypervisor,
+	) (providers.MachineProvider, error) {
+		if hypervisor == nil {
+			return pool.GetPinned(ctx, "flags", libvirtCfg.Hypervisor(), openDefault)
+		}
+		cfg, key := hypervisorConfig(libvirtCfg, hypervisor)
+		return pool.Get(ctx, owner, key, cfg.Hypervisor(), open(cfg))
 	}
 
 	if err := (&controller.HydraClusterReconciler{
@@ -285,6 +293,9 @@ func main() {
 		Scheme:          mgr.GetScheme(),
 		ProviderFor:     providerFor,
 		ReleaseProvider: pool.Release,
+		// Uncached, and only used for hypervisor credentials Secrets; see the
+		// machine reconciler's.
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydracluster")
 		os.Exit(1)
@@ -305,11 +316,13 @@ func main() {
 	if err := (&controller.HydraMachineReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		// Uncached, and only used for bootstrap data Secrets. A cached read would
+		// Uncached, and only used for Secrets: bootstrap data, and hypervisor
+		// credentials. A cached read would
 		// start a cluster-wide Secret informer and hold every Secret in the
 		// cluster in this process's memory.
-		APIReader:   mgr.GetAPIReader(),
-		ProviderFor: providerFor,
+		APIReader:       mgr.GetAPIReader(),
+		ProviderFor:     providerFor,
+		ReleaseProvider: pool.Release,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "hydramachine")
 		os.Exit(1)

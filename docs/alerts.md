@@ -126,10 +126,14 @@ condition carries the message; see
 
 **warning, 5m.** A HydraCluster's `InfrastructureFailed` condition is `True`: a
 cluster-scoped prerequisite is missing and will not appear by itself, such as a
-storage pool that does not exist or a base image missing from it.
+storage pool that does not exist or a base image missing from it. For a cluster
+that names its own hypervisor, it is also a credentials Secret that is missing
+or broken, or a hypervisor that cannot be confirmed because some of the
+cluster's machines are not on it (see [hypervisors.md](hypervisors.md)).
 
 No new machine can be created in that cluster until it is fixed. Existing
-machines are unaffected. The condition's message names what is missing.
+machines are unaffected. The condition's message names what is missing, or
+which machines are not where the cluster says.
 
 ### HydraClusterNotReady
 

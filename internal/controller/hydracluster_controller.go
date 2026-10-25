@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -74,15 +75,22 @@ type HydraClusterReconciler struct {
 	// no explanation.
 	Provider providers.MachineProvider
 
-	// ProviderFor returns the backend for a HydraCluster's infrastructure. See
+	// ProviderFor returns a connection, held for owner. See
 	// HydraMachineReconciler.ProviderFor.
-	ProviderFor func(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error)
+	ProviderFor func(ctx context.Context, owner providers.Owner, hypervisor *providers.Hypervisor) (providers.MachineProvider, error)
 
-	// ReleaseProvider tells whatever holds connections that a HydraCluster is
-	// gone, so a connection only it used can be closed (PET-38). Optional.
+	// ReleaseProvider tells whatever holds connections that owner no longer
+	// uses one, so a connection nobody else uses can be closed (PET-38).
+	// Optional.
 	ReleaseProvider func(ctx context.Context, owner providers.Owner)
+
+	// APIReader reads hypervisor credentials Secrets, uncached, for the reason
+	// HydraMachineReconciler.APIReader gives.
+	APIReader client.Reader
 }
 
+// provider returns the connection to the hypervisor a HydraCluster names, or
+// the manager's flag connection when it names none.
 func (r *HydraClusterReconciler) provider(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error) {
 	if r.Provider != nil {
 		return r.Provider, nil
@@ -90,14 +98,25 @@ func (r *HydraClusterReconciler) provider(ctx context.Context, hydraCluster *inf
 	if r.ProviderFor == nil {
 		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
 	}
-	p, err := r.ProviderFor(ctx, hydraCluster)
+	hypervisor, err := hypervisorOf(ctx, r.APIReader, hydraCluster)
+	if err != nil {
+		return nil, err
+	}
+	key := client.ObjectKeyFromObject(hydraCluster)
+	if hypervisor == nil {
+		// Named none, or no longer: a hypervisor removed before it was confirmed
+		// is no longer this cluster's to hold open.
+		r.release(ctx, key)
+	}
+	p, err := r.ProviderFor(ctx, providers.Owner{Kind: hydraClusterKind, NamespacedName: key}, hypervisor)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the infrastructure backend: %w", err)
 	}
 	return p, nil
 }
 
-// release tells the connection holder a HydraCluster is gone.
+// release tells the connection holder a HydraCluster no longer uses a
+// connection of its own.
 func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types.NamespacedName) {
 	if r.ReleaseProvider != nil {
 		r.ReleaseProvider(ctx, providers.Owner{Kind: hydraClusterKind, NamespacedName: hydraCluster})
@@ -106,6 +125,10 @@ func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters/status,verbs=get;update;patch
+// Confirming a hypervisor lists the cluster's machines and records it on them.
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;patch
+// Hypervisor credentials, read one at a time through the uncached APIReader.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // Reconcile verifies a HydraCluster's infrastructure and reports it.
 func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -181,6 +204,23 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
 	}
 
+	// A confirmation still pending is not a reason to stop machines: the one it
+	// waits for is a machine being created on the flag connection, which needs
+	// this cluster Ready to get there. New machines wait for confirmation on
+	// their own. So it is only noted, and verification carries on.
+	var pending string
+	if err := r.confirmHypervisor(ctx, prov, hydraCluster, cluster); errors.Is(err, errHypervisorPending) {
+		pending = err.Error()
+	} else if err != nil {
+		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if errors.Is(err, providers.ErrTerminal) {
+			return ctrl.Result{RequeueAfter: requeueClusterHealthy}, nil
+		}
+		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
+	}
+
 	if err := prov.EnsureInfrastructure(ctx, infrastructureSpecFor(hydraCluster)); err != nil {
 		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -195,8 +235,11 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
 	}
 
-	if err := r.recordVerified(ctx, hydraCluster); err != nil {
+	if err := r.recordVerified(ctx, hydraCluster, pending); err != nil {
 		return ctrl.Result{}, err
+	}
+	if pending != "" {
+		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
 	}
 	// Re-check periodically. Verification is point-in-time and the things it
 	// checks can be removed while the cluster is running.
@@ -222,8 +265,9 @@ func infrastructureSpecFor(hydraCluster *infrav1.HydraCluster) providers.Infrast
 	return spec
 }
 
-// recordVerified reports that the cluster's infrastructure is usable.
-func (r *HydraClusterReconciler) recordVerified(ctx context.Context, hydraCluster *infrav1.HydraCluster) error {
+// recordVerified reports that the cluster's infrastructure is usable, with a
+// note when its hypervisor is not confirmed yet.
+func (r *HydraClusterReconciler) recordVerified(ctx context.Context, hydraCluster *infrav1.HydraCluster, note string) error {
 	patch := client.MergeFrom(hydraCluster.DeepCopy())
 
 	provisioned := true
@@ -235,6 +279,9 @@ func (r *HydraClusterReconciler) recordVerified(ctx context.Context, hydraCluste
 	message := "storage pool is running"
 	if hydraCluster.Spec.BaseImage != nil {
 		message = "storage pool is running and the base image is present in it"
+	}
+	if note != "" {
+		message += "; " + note
 	}
 
 	apimeta.SetStatusCondition(&hydraCluster.Status.Conditions, metav1.Condition{
@@ -454,4 +501,142 @@ func broadcastOf(subnet *net.IPNet) net.IP {
 		out[i] = ip[i] | ^mask[i]
 	}
 	return out
+}
+
+// errHypervisorPending reports that a cluster's hypervisor cannot be confirmed
+// yet, for a reason that is not the cluster's to fix: a machine is still being
+// created on the flag connection.
+var errHypervisorPending = errors.New("hypervisor not confirmed yet")
+
+// confirmHypervisor checks that every machine a cluster already has lives on
+// the hypervisor its spec names, then confirms that hypervisor in
+// status.hypervisor and records it on those machines (PET-38).
+//
+// It is what makes adding spec.hypervisor to a running cluster safe. A machine
+// is only ever operated on through the hypervisor it records, and one made
+// before the cluster named a hypervisor records none, so it lives on the
+// manager's flag connection. Recording the named hypervisor on it is the one
+// moment a machine's hypervisor changes, and it happens only after that
+// machine's domain -- the same name and the same ID -- was found there.
+//
+// Read-only until every machine has been checked. A machine found elsewhere,
+// or recording another hypervisor, refuses confirmation terminally and nothing
+// is written: the operator named the wrong hypervisor, or the machines are not
+// where the provider thinks, and either needs a person. Machines not made yet
+// are skipped: they place themselves on the confirmed hypervisor, and they
+// wait until there is one. A machine whose Create on the flag connection has
+// begun -- it records a storage pool, but has no providerID yet -- makes the
+// guard wait for it rather than skip it. Machines being deleted are skipped
+// too: their teardown goes wherever they record, and moving it mid-way would
+// not help.
+//
+// Confirming comes before recording, so a spec edit can never land between the
+// two and leave machines recorded against a hypervisor the cluster no longer
+// names: confirmation fixes the spec (see the CEL rule on HydraCluster), and it
+// is written with an optimistic lock, so it cannot confirm a spec that changed
+// since it was read. It runs on every reconcile, which is how a machine that
+// gained its providerID after confirmation is checked and recorded too.
+func (r *HydraClusterReconciler) confirmHypervisor(ctx context.Context, prov providers.MachineProvider, hydraCluster *infrav1.HydraCluster, cluster *clusterv1.Cluster) error {
+	if hydraCluster.Spec.Hypervisor == nil {
+		return nil
+	}
+	address, err := canonicalHypervisor(hydraCluster.Spec.Hypervisor.Address)
+	if err != nil {
+		return err
+	}
+	if cluster == nil {
+		// Its machines are found through the Cluster's name, and there is no
+		// telling which machines are its own until Cluster API sets the owner.
+		return errors.New("waiting for the owning Cluster before confirming the hypervisor")
+	}
+
+	machines := &infrav1.HydraMachineList{}
+	if err := r.List(ctx, machines, client.InNamespace(hydraCluster.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: cluster.Name}); err != nil {
+		return fmt.Errorf("listing the cluster's machines: %w", err)
+	}
+	var unrecorded []*infrav1.HydraMachine
+	var refused []string
+	for i := range machines.Items {
+		machine := &machines.Items[i]
+		if !machine.DeletionTimestamp.IsZero() {
+			continue
+		}
+		switch recorded := machine.Annotations[infrav1.HypervisorAnnotation]; {
+		case recorded == address:
+			continue
+		case recorded != "":
+			refused = append(refused, fmt.Sprintf("%s records hypervisor %s", machine.Name, recorded))
+			continue
+		}
+		if machine.Spec.ProviderID == nil || *machine.Spec.ProviderID == "" {
+			if mayBeMadeOnFlags(machine) {
+				// A Create on the flag connection has begun and not finished, or
+				// finished without its providerID being recorded. Confirming now
+				// would let it come back as a machine elsewhere with no record, so
+				// wait for it to be made, and checked like any other.
+				return fmt.Errorf("%w: waiting for HydraMachine %s, which is being created on the manager's flag connection",
+					errHypervisorPending, machine.Name)
+			}
+			continue
+		}
+		refusal, err := machineOnHypervisor(ctx, prov, machine)
+		if err != nil {
+			return err
+		}
+		if refusal != "" {
+			refused = append(refused, refusal)
+			continue
+		}
+		unrecorded = append(unrecorded, machine)
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("%w: hypervisor %s cannot be confirmed for this cluster, because not all its machines are there (%s); "+
+			"machines never move between hypervisors, so name the one they are on",
+			providers.ErrTerminal, address, strings.Join(refused, "; "))
+	}
+
+	if !confirmedHypervisor(hydraCluster) {
+		patch := client.MergeFromWithOptions(hydraCluster.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		hydraCluster.Status.Hypervisor = &infrav1.HydraHypervisorStatus{Address: hydraCluster.Spec.Hypervisor.Address}
+		if err := r.Status().Patch(ctx, hydraCluster, patch); err != nil {
+			return fmt.Errorf("confirming hypervisor %s: %w", address, err)
+		}
+		logf.FromContext(ctx).Info("Confirmed hypervisor", "hypervisor", address, "machines", len(machines.Items))
+	}
+	for _, machine := range unrecorded {
+		// Optimistic, so a stale copy cannot overwrite an annotation the machine
+		// reconciler has just written.
+		patch := client.MergeFromWithOptions(machine.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[infrav1.HypervisorAnnotation] = address
+		if err := r.Patch(ctx, machine, patch); err != nil {
+			return fmt.Errorf("recording hypervisor %s on HydraMachine %s: %w", address, machine.Name, err)
+		}
+		logf.FromContext(ctx).Info("Recorded hypervisor on machine", "hypervisor", address, "hydraMachine", machine.Name)
+	}
+	return nil
+}
+
+// machineOnHypervisor checks that a machine's domain is on the hypervisor prov
+// reaches: found by name, and with the ID its providerID records, so a domain
+// that merely shares the name is not mistaken for it. It returns why not, or
+// an error when the hypervisor could not be asked.
+func machineOnHypervisor(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (string, error) {
+	backend, id, err := providers.ParseProviderID(*machine.Spec.ProviderID)
+	if err != nil || backend != prov.Name() {
+		return fmt.Sprintf("%s has providerID %q, which this backend cannot look up", machine.Name, *machine.Spec.ProviderID), nil
+	}
+	state, err := prov.FindByName(ctx, backendName(machine))
+	switch {
+	case errors.Is(err, providers.ErrNotFound):
+		return fmt.Sprintf("%s has no domain named %s there", machine.Name, backendName(machine)), nil
+	case err != nil:
+		return "", fmt.Errorf("looking for HydraMachine %s on the hypervisor: %w", machine.Name, err)
+	case state.ID != id:
+		return fmt.Sprintf("%s's domain %s there has ID %s, not the recorded %s", machine.Name, backendName(machine), state.ID, id), nil
+	}
+	return "", nil
 }

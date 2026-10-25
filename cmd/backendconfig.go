@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 	libvirtprovider "github.com/Petatron/cluster-api-provider-hydra/internal/providers/libvirt"
 )
 
@@ -169,4 +170,24 @@ func runningInCluster() bool {
 func socketExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// hypervisorConfig is the backend configuration for a hypervisor a cluster
+// names (PET-38), and the pool key that identifies its connection.
+//
+// It starts from the manager's flags so the defaults that are only names --
+// the storage pool, the base image -- and the timeouts carry over, and then
+// replaces every setting that says how to connect: a named hypervisor is always
+// TLS, with the cluster's own credentials, on qemu:///system. Leaving one of
+// those to the flags would let a manager-wide plaintext or PKI-directory
+// setting leak into a connection a cluster configured for itself.
+//
+// The key includes the credentials' version, so rotating them opens a new
+// connection instead of reusing one built with the old.
+func hypervisorConfig(base libvirtprovider.Config, hypervisor *providers.Hypervisor) (libvirtprovider.Config, string) {
+	cfg := base
+	cfg.URI, cfg.Insecure, cfg.PKIPath = "", false, ""
+	cfg.RemoteAddr = hypervisor.Address
+	cfg.Credentials = hypervisor.Credentials
+	return cfg, "tls|" + hypervisor.Address + "|" + hypervisor.CredentialsVersion
 }

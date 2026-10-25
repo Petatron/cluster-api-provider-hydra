@@ -82,8 +82,11 @@ which brings this down.
 Counter. Label: `reason`.
 
 Reconciles that ended waiting for something rather than failing. The values are
-the provider's four wait states: `WaitingForOwnerMachine`, `WaitingForCluster`,
-`WaitingForClusterInfrastructure`, `WaitingForBootstrapData`.
+the provider's wait states: `WaitingForOwnerMachine`, `WaitingForCluster`,
+`WaitingForHydraCluster`, `WaitingForClusterInfrastructure`,
+`WaitingForBootstrapData`, and, for a cluster that names its own hypervisor
+(see [hypervisors.md](hypervisors.md)), `WaitingForHypervisor` and
+`WaitingForHypervisorCredentials`.
 
 A counter rather than a gauge of machines currently waiting, because a gauge
 would need state the controller does not keep and would go stale the moment a

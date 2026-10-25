@@ -278,11 +278,10 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			r := build(owningCluster(nil))
 			r.Provider = nil
 			var asked []string
-			r.ProviderFor = func(_ context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error) {
+			r.ProviderFor = func(_ context.Context, owner providers.Owner, hypervisor *providers.Hypervisor) (providers.MachineProvider, error) {
 				attempts++
-				if hydraCluster != nil {
-					asked = append(asked, hydraCluster.Name)
-				}
+				Expect(hypervisor).To(BeNil(), "a cluster naming no hypervisor uses the manager's flag connection")
+				asked = append(asked, owner.Name)
 				if attempts == 1 {
 					return nil, errors.New("hypervisor unreachable")
 				}

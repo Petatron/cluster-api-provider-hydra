@@ -46,6 +46,8 @@ func TestMachineMetricsRequirePersistedStatus(t *testing.T) {
 		{name: "infrastructure wait", wait: errWaitingForClusterInfra},
 		{name: "hydra cluster wait", wait: errWaitingForHydraCluster},
 		{name: "bootstrap wait", wait: errWaitingForBootstrap},
+		{name: "hypervisor wait", wait: errWaitingForHypervisor},
+		{name: "hypervisor credentials wait", wait: errWaitingForHypervisorCredentials},
 		{name: "retryable failure", cause: errors.New("connection refused")},
 		{name: "terminal failure", cause: providers.ErrTerminal},
 		{name: "not found failure", cause: providers.ErrNotFound},

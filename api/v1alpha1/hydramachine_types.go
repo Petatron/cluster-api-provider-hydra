@@ -253,6 +253,22 @@ const StandaloneAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/stand
 // controller.
 const StoragePoolAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/storage-pool"
 
+// HypervisorAnnotation records the hypervisor a machine lives on, as host:port,
+// when that is a hypervisor its HydraCluster names (PET-38). A machine without
+// it that may have been made -- it has a providerID, or records a storage pool,
+// which is written just before Create -- lives on the manager's flag-configured
+// connection.
+//
+// The controller writes it before the first Create, beside the storage pool,
+// and every later operation on the machine -- teardown included -- goes to the
+// hypervisor it names, never to whatever the cluster names by then. The
+// HydraCluster controller also writes it onto a machine made before its
+// cluster named a hypervisor, once it has found that machine there.
+//
+// It is honoured wherever it came from, like the storage pool's. Leave it to
+// the controller: pointing it elsewhere points teardown elsewhere.
+const HypervisorAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/hypervisor"
+
 const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady
 	// condition by Cluster API.
