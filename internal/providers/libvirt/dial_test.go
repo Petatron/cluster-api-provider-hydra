@@ -187,7 +187,9 @@ func TestNewDialerReturnsANilDialerOnError(t *testing.T) {
 	}
 }
 
-// Credentials never print their key, however they are formatted or logged.
+// A Config never prints the key its credentials hold. The redaction itself is
+// tested beside TLSCredentials in providers; this checks it still applies
+// through the alias and a Config's pointer field.
 func TestTLSCredentialsDoNotPrintTheirKey(t *testing.T) {
 	const secret = "-----BEGIN PRIVATE KEY-----sekrit"
 	creds := TLSCredentials{CACert: []byte("ca"), ClientCert: []byte("cert"), ClientKey: []byte(secret)}

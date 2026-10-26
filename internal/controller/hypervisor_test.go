@@ -34,12 +34,15 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
@@ -466,19 +469,24 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		key types.NamespacedName
 	)
 
-	build := func(objs ...client.Object) *HydraClusterReconciler {
+	buildWith := func(funcs *interceptor.Funcs, objs ...client.Object) *HydraClusterReconciler {
 		s := linkScheme()
 		all := append([]client.Object{hc, credentialsSecret()}, objs...)
-		c := fakeclient.NewClientBuilder().
+		b := fakeclient.NewClientBuilder().
 			WithScheme(s).
 			WithObjects(all...).
-			WithStatusSubresource(&infrav1.HydraCluster{}, &infrav1.HydraMachine{}).
-			Build()
+			WithStatusSubresource(&infrav1.HydraCluster{}, &infrav1.HydraMachine{})
+		if funcs != nil {
+			b = b.WithInterceptorFuncs(*funcs)
+		}
+		c := b.Build()
 		return &HydraClusterReconciler{
 			Client: c, APIReader: c, Scheme: s,
 			ProviderFor: hvs.providerFor, ReleaseProvider: hvs.release,
 		}
 	}
+
+	build := func(objs ...client.Object) *HydraClusterReconciler { return buildWith(nil, objs...) }
 
 	reload := func(r *HydraClusterReconciler) *infrav1.HydraCluster {
 		out := &infrav1.HydraCluster{}
@@ -650,6 +658,84 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reload(clusters).Status.Hypervisor).NotTo(BeNil())
 		Expect(machineIn(clusters, linkMachineName).Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
+	})
+
+	It("does not confirm a hypervisor that lacks the cluster's infrastructure, so the address can still be corrected", func() {
+		// With no machines there is nothing else to check an address against,
+		// and confirming fixes it. A host that answers but has none of this
+		// cluster's pool or image is the likeliest typo.
+		hvs.hv2.InfrastructureErr = fmt.Errorf("%w: storage pool %q does not exist", providers.ErrTerminal, linkPool)
+		r := build(owningCluster(nil))
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reload(r).Status.Hypervisor).To(BeNil())
+
+		hvs.hv2.InfrastructureErr = nil
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reload(r).Status.Hypervisor).NotTo(BeNil())
+	})
+
+	It("retries a conflicting machine patch soon, recording the rest and keeping the cluster Ready", func() {
+		// The machine reconciler rewrites a provisioning machine's status every
+		// 15s, so a stale cached copy is ordinary. It must not report the
+		// cluster unready -- that stops every new machine -- nor hold up the
+		// other machines.
+		w1 := made("worker-1", hvs.hv2)
+		w2 := made("worker-2", hvs.hv2)
+		var once sync.Once
+		r := buildWith(&interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				conflict := false
+				if obj.GetName() == "worker-1" {
+					once.Do(func() { conflict = true })
+				}
+				if conflict {
+					return apierrors.NewConflict(schema.GroupResource{Resource: "hydramachines"}, obj.GetName(), errors.New("stale"))
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		}, owningCluster(nil), w1, w2)
+
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(requeueAfterConflict))
+		out := reload(r)
+		Expect(out.Status.Hypervisor).NotTo(BeNil())
+		Expect(apimeta.FindStatusCondition(out.Status.Conditions, infrav1.ClusterReadyCondition).Status).To(Equal(metav1.ConditionTrue))
+		Expect(machineIn(r, "worker-2").Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
+		Expect(machineIn(r, "worker-1").Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation))
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(machineIn(r, "worker-1").Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
+	})
+
+	It("retries a conflicting confirmation soon, confirming nothing and keeping the cluster Ready", func() {
+		var once sync.Once
+		r := buildWith(&interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				conflict := false
+				if hc, ok := obj.(*infrav1.HydraCluster); ok && hc.Status.Hypervisor != nil {
+					once.Do(func() { conflict = true })
+				}
+				if conflict {
+					return apierrors.NewConflict(schema.GroupResource{Resource: "hydraclusters"}, obj.GetName(), errors.New("stale"))
+				}
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		}, owningCluster(nil))
+
+		res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(requeueAfterConflict))
+		out := reload(r)
+		Expect(out.Status.Hypervisor).To(BeNil(), "a lost race confirms nothing")
+		Expect(apimeta.FindStatusCondition(out.Status.Conditions, infrav1.ClusterReadyCondition).Status).To(Equal(metav1.ConditionTrue))
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reload(r).Status.Hypervisor).NotTo(BeNil())
 	})
 
 	It("waits, without confirming, until the cluster has an owning Cluster", func() {

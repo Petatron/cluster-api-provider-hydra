@@ -22,6 +22,13 @@ manager-wide, through `--libvirt-insecure`, for a trusted tunnel. A per-cluster
 switch would make it too easy to send privileged RPCs in the clear. The
 hypervisor's certificate must be valid for the host in `address`.
 
+**Who may name a hypervisor.** Anyone who can create or edit a HydraCluster can
+make the manager dial a host and port of their choosing, and the dial's error
+appears in the cluster's status. That is fine while HydraClusters are written
+by the operators who run the hypervisors, which is the model today. If that
+ever changes, restrict who may write the field (an admission policy, say)
+before handing out HydraCluster write access.
+
 The Secret holds the same three files libvirt reads from its PKI directory:
 
 ```bash
@@ -31,8 +38,8 @@ kubectl create secret generic hv2-libvirt-pki \
 
 It is read uncached on every reconcile that connects, so the manager holds no
 Secret informer. A Secret that is missing, lacks a key, or holds a certificate
-and key that don't match is reported terminally (`InfrastructureFailed` on the
-cluster, `ProvisioningFailed` on a machine) and names the Secret.
+and key that don't match is reported terminally on the cluster, as
+`InfrastructureFailed` naming the Secret. Its machines only wait; see below.
 
 **Rotating credentials:** replace the Secret's contents, or point
 `credentialsSecretRef` at a new Secret. The next reconcile opens a connection
@@ -107,6 +114,13 @@ there and recorded like the rest.
 **Until it is confirmed, `spec.hypervisor` can be corrected or removed.** After
 that it is fixed: it can't be removed and its address can't change, because the
 cluster's machines are recorded against it. Only the credentials may change.
+
+Confirmation also waits for the cluster's infrastructure check (its storage
+pool, and base image if it names one) to pass on the named hypervisor. That is
+the only check a cluster with no machines gets, so an address that answers but
+is not the hypervisor you meant stays correctable as long as it lacks the pool.
+If it does have the pool, confirmation happens on the first reconcile, so
+check `status.hypervisor` right after naming one.
 
 The typical use is the hypervisor the flags already reach, now with credentials
 of its own. That way the cluster stops depending on the manager's flags without
