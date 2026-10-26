@@ -482,6 +482,14 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		logf.FromContext(ctx).Info("Adopting a machine whose providerID was never recorded",
 			"name", backendName(machine))
 		spec = providers.MachineSpec{Name: backendName(machine)}
+		// Found on a named hypervisor, it has to say so before it gains a
+		// providerID: a providerID with no hypervisor recorded means the flag
+		// connection, and every later operation -- teardown included -- would
+		// go there instead. Only the hypervisor: the storage pool is whatever
+		// the domain already uses, and a pool resolved now could be wrong.
+		if _, err := r.recordPlacement(ctx, machine, "", placement); err != nil {
+			return nil, err
+		}
 	case errors.Is(findErr, providers.ErrNotFound):
 		// Nothing exists, so this really is a create. Every gate belongs here and
 		// not earlier: an existing machine being adopted above must not be blocked

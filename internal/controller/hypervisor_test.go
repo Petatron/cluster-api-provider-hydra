@@ -432,6 +432,30 @@ var _ = Describe("Machines on a named hypervisor", func() {
 		Expect(reload(r).Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation))
 	})
 
+	It("records the hypervisor when it adopts a domain it finds there, so it stays there", func() {
+		// A domain already carries the machine's name on hv2 -- an earlier
+		// attempt that recorded nothing. Adopting it without recording hv2
+		// would leave a providerID and no record, which means the flags.
+		found, err := hvs.hv2.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+		Expect(err).NotTo(HaveOccurred())
+		r := build(confirmedHV2)
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		adopted := reload(r)
+		Expect(*adopted.Spec.ProviderID).To(Equal(providers.ProviderID("fake", found.ID)))
+		Expect(adopted.Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
+		Expect(adopted.Annotations).NotTo(HaveKey(infrav1.StoragePoolAnnotation),
+			"adoption takes the domain as it is; it resolves no pool")
+
+		hvs.asked = nil
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hvs.asked).To(HaveLen(1))
+		Expect(hvs.asked[0]).NotTo(BeNil(), "still hv2, not the flags")
+		Expect(touched(hvs.flags)).To(BeFalse())
+	})
+
 	It("tears a machine nothing was ever attempted for down on the confirmed hypervisor, not the flags", func() {
 		// Deleted while waiting for its bootstrap data: it has nothing anywhere.
 		// Looking on the flag connection would make its deletion depend on a
