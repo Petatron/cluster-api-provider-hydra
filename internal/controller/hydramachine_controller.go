@@ -179,49 +179,54 @@ func (r *HydraMachineReconciler) hypervisorFor(ctx context.Context, link *linkag
 	return hypervisor, err
 }
 
-// hydraClusterByLabel finds a machine's HydraCluster through its own
-// cluster-name label, for teardown when the owner Machine cannot lead there.
-// Nil when the label, the Cluster or the HydraCluster is not there.
-func (r *HydraMachineReconciler) hydraClusterByLabel(ctx context.Context, machine *infrav1.HydraMachine) (*infrav1.HydraCluster, error) {
+// clusterByLabel finds a machine's Cluster, and the HydraCluster that Cluster
+// names, through the machine's own cluster-name label, for teardown when the
+// owner Machine cannot lead there. Either is nil when it is not there.
+func (r *HydraMachineReconciler) clusterByLabel(ctx context.Context, machine *infrav1.HydraMachine) (*clusterv1.Cluster, *infrav1.HydraCluster, error) {
 	name := machine.Labels[clusterv1.ClusterNameLabel]
 	if name == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	cluster := &clusterv1.Cluster{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: name}, cluster); err != nil {
-		return nil, client.IgnoreNotFound(err)
+		return nil, nil, client.IgnoreNotFound(err)
 	}
 	ref := cluster.Spec.InfrastructureRef
 	if ref.Kind != hydraClusterKind || ref.APIGroup != infrav1.GroupVersion.Group || ref.Name == "" {
-		return nil, nil
+		return cluster, nil, nil
 	}
 	hydraCluster := &infrav1.HydraCluster{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: ref.Name}, hydraCluster); err != nil {
-		return nil, client.IgnoreNotFound(err)
+		return cluster, nil, client.IgnoreNotFound(err)
 	}
-	return hydraCluster, nil
+	return cluster, hydraCluster, nil
 }
 
-// withClusterByLabelForDeletion returns link with its HydraCluster found
-// through the machine's own cluster-name label, when the machine is being
-// deleted and its owner Machine could not lead there -- its finalizer removed by
-// hand, or its name reused. Otherwise link unchanged.
+// withClusterByLabelForDeletion returns link with its Cluster and HydraCluster
+// found through the machine's own cluster-name label, for whichever the owner
+// Machine could not lead to, when the machine is being deleted. Otherwise link
+// unchanged.
 //
-// A machine deleted before its first Create has nothing anywhere, and its
-// placement is its cluster's confirmed hypervisor; without the cluster it would
-// be the flag connection, which a cluster that left the flags may not reach,
-// and the deletion would wait on a hypervisor the machine never used. Teardown
-// also sweeps the cluster's storage pool rather than the backend's default.
+// The Cluster is what the pause check reads: a paused Cluster must stop this
+// teardown however the Cluster was found. The HydraCluster gives a machine
+// deleted before its first Create its placement -- the cluster's confirmed
+// hypervisor; without it that would be the flag connection, which a cluster
+// that left the flags may not reach -- and the storage pool teardown sweeps.
 func (r *HydraMachineReconciler) withClusterByLabelForDeletion(ctx context.Context, machine *infrav1.HydraMachine, link *linkage) (*linkage, error) {
-	if machine.DeletionTimestamp.IsZero() || link.hydraCluster != nil {
+	if machine.DeletionTimestamp.IsZero() || (link.cluster != nil && link.hydraCluster != nil) {
 		return link, nil
 	}
-	hydraCluster, err := r.hydraClusterByLabel(ctx, machine)
-	if err != nil || hydraCluster == nil {
+	cluster, hydraCluster, err := r.clusterByLabel(ctx, machine)
+	if err != nil {
 		return link, err
 	}
 	found := *link
-	found.hydraCluster = hydraCluster
+	if found.cluster == nil {
+		found.cluster = cluster
+	}
+	if found.hydraCluster == nil {
+		found.hydraCluster = hydraCluster
+	}
 	return &found, nil
 }
 
@@ -319,6 +324,19 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	// Deleting is the one case where the Cluster and HydraCluster may be needed
+	// though the owner Machine cannot lead there -- its finalizer removed by
+	// hand, or its name reused -- so teardown finds them by the machine's own
+	// cluster-name label instead. Before the pause check, which has to see a
+	// paused Cluster found that way too. Creation keeps its gates: only
+	// teardown looks the cluster up by label.
+	if link, err = r.withClusterByLabelForDeletion(ctx, machine, link); err != nil {
+		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
+	}
+
 	// Cluster API's pause signals mean "do not touch this object". That covers
 	// deletion as well as creation: an operator pausing a machine to investigate
 	// it would not expect the controller to keep destroying infrastructure
@@ -332,14 +350,7 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Deleting is the one case where the HydraCluster may be needed though the
-	// owner Machine cannot lead there. Creation keeps its gates: only teardown
-	// looks the cluster up by label.
-	link, err = r.withClusterByLabelForDeletion(ctx, machine, link)
-	var placement string
-	if err == nil {
-		placement, err = placementFor(machine, link)
-	}
+	placement, err := placementFor(machine, link)
 	var prov providers.MachineProvider
 	if err == nil {
 		prov, err = r.provider(ctx, machine, link, placement)

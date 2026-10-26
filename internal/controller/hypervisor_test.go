@@ -486,6 +486,37 @@ var _ = Describe("Machines on a named hypervisor", func() {
 		Expect(touched(hvs.flags)).To(BeFalse())
 	})
 
+	It("keeps an ownerless machine's teardown paused when the Cluster it finds by label is paused", func() {
+		// Pausing covers deletion. A Cluster found through the machine's label
+		// rather than its owner Machine is still the Cluster, and its pause
+		// still holds.
+		created, err := hvs.hv2.Create(ctx, providers.MachineSpec{Name: backendName(hm)})
+		Expect(err).NotTo(HaveOccurred())
+		providerID := providers.ProviderID("fake", created.ID)
+		hm.Spec.ProviderID = &providerID
+		hm.Annotations = map[string]string{infrav1.HypervisorAnnotation: hv2Address}
+		hm.Finalizers = []string{MachineFinalizer}
+		r := build(confirmedHV2)
+		cluster := owningCluster(nil)
+		Expect(r.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)).To(Succeed())
+		paused := true
+		cluster.Spec.Paused = &paused
+		Expect(r.Update(ctx, cluster)).To(Succeed())
+		secretName := linkSecretName
+		Expect(r.Delete(ctx, ownerMachine(&secretName))).To(Succeed())
+		Expect(r.Delete(ctx, hm)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hvs.hv2.Count()).To(Equal(1), "the VM is still there")
+		Expect(hvs.hv2.DeleteCalls).To(BeZero())
+		out := reload(r)
+		Expect(out.Finalizers).To(ContainElement(MachineFinalizer))
+		pausedCond := apimeta.FindStatusCondition(out.Status.Conditions, infrav1.MachinePausedCondition)
+		Expect(pausedCond).NotTo(BeNil())
+		Expect(pausedCond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
 	It("finds its credentials through its cluster-name label when its owner Machine is gone", func() {
 		// The owner Machine's finalizer removed by hand, say. The HydraCluster is
 		// still there; teardown must not wedge over how it was found.
