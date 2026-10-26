@@ -127,7 +127,7 @@ func (r *HydraMachineReconciler) provider(ctx context.Context, machine *infrav1.
 	if r.ProviderFor == nil {
 		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
 	}
-	hypervisor, err := r.hypervisorFor(ctx, machine, link, placement)
+	hypervisor, err := r.hypervisorFor(ctx, link, placement)
 	if err != nil {
 		return nil, err
 	}
@@ -150,27 +150,20 @@ func (r *HydraMachineReconciler) provider(ctx context.Context, machine *infrav1.
 // or names another hypervisor leaves it waiting, never falling back.
 //
 // The HydraCluster is normally found through the owner Machine. During
-// teardown that Machine may be gone -- its finalizer removed by hand, or its
-// name reused -- so it is then found through the machine's own cluster-name
-// label instead: a teardown that can still reach its credentials must not wedge
-// over how they were found.
+// teardown, when that Machine is gone, Reconcile has already found it through
+// the machine's own cluster-name label instead: see
+// withClusterByLabelForDeletion.
 //
 // A Secret that is missing or broken is a wait here, not a failure. It is the
 // HydraCluster's problem, reported terminally there, and an operator may be in
 // the middle of replacing it; marking every machine of the cluster
 // ProvisioningFailed -- running ones included -- would invite remediation of
 // machines that are fine.
-func (r *HydraMachineReconciler) hypervisorFor(ctx context.Context, machine *infrav1.HydraMachine, link *linkage, placement string) (*providers.Hypervisor, error) {
+func (r *HydraMachineReconciler) hypervisorFor(ctx context.Context, link *linkage, placement string) (*providers.Hypervisor, error) {
 	if placement == "" {
 		return nil, nil
 	}
 	hydraCluster := hydraClusterOf(link)
-	if hydraCluster == nil {
-		var err error
-		if hydraCluster, err = r.hydraClusterByLabel(ctx, machine); err != nil {
-			return nil, err
-		}
-	}
 	if hydraCluster == nil || hydraCluster.Spec.Hypervisor == nil {
 		return nil, fmt.Errorf("%w: it lives on %s, and its HydraCluster cannot be read or names no hypervisor",
 			errWaitingForHypervisorCredentials, placement)
@@ -187,8 +180,8 @@ func (r *HydraMachineReconciler) hypervisorFor(ctx context.Context, machine *inf
 }
 
 // hydraClusterByLabel finds a machine's HydraCluster through its own
-// cluster-name label, for when the owner Machine cannot lead there. Nil when
-// the label, the Cluster or the HydraCluster is not there.
+// cluster-name label, for teardown when the owner Machine cannot lead there.
+// Nil when the label, the Cluster or the HydraCluster is not there.
 func (r *HydraMachineReconciler) hydraClusterByLabel(ctx context.Context, machine *infrav1.HydraMachine) (*infrav1.HydraCluster, error) {
 	name := machine.Labels[clusterv1.ClusterNameLabel]
 	if name == "" {
@@ -207,6 +200,29 @@ func (r *HydraMachineReconciler) hydraClusterByLabel(ctx context.Context, machin
 		return nil, client.IgnoreNotFound(err)
 	}
 	return hydraCluster, nil
+}
+
+// withClusterByLabelForDeletion returns link with its HydraCluster found
+// through the machine's own cluster-name label, when the machine is being
+// deleted and its owner Machine could not lead there -- its finalizer removed by
+// hand, or its name reused. Otherwise link unchanged.
+//
+// A machine deleted before its first Create has nothing anywhere, and its
+// placement is its cluster's confirmed hypervisor; without the cluster it would
+// be the flag connection, which a cluster that left the flags may not reach,
+// and the deletion would wait on a hypervisor the machine never used. Teardown
+// also sweeps the cluster's storage pool rather than the backend's default.
+func (r *HydraMachineReconciler) withClusterByLabelForDeletion(ctx context.Context, machine *infrav1.HydraMachine, link *linkage) (*linkage, error) {
+	if machine.DeletionTimestamp.IsZero() || link.hydraCluster != nil {
+		return link, nil
+	}
+	hydraCluster, err := r.hydraClusterByLabel(ctx, machine)
+	if err != nil || hydraCluster == nil {
+		return link, err
+	}
+	found := *link
+	found.hydraCluster = hydraCluster
+	return &found, nil
 }
 
 // placementFor decides which hypervisor a machine's operations go to, as
@@ -316,7 +332,14 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	placement, err := placementFor(machine, link)
+	// Deleting is the one case where the HydraCluster may be needed though the
+	// owner Machine cannot lead there. Creation keeps its gates: only teardown
+	// looks the cluster up by label.
+	link, err = r.withClusterByLabelForDeletion(ctx, machine, link)
+	var placement string
+	if err == nil {
+		placement, err = placementFor(machine, link)
+	}
 	var prov providers.MachineProvider
 	if err == nil {
 		prov, err = r.provider(ctx, machine, link, placement)

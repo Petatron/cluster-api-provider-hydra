@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,7 @@ const (
 	hv2Secret    = "wl0-libvirt-pki"
 	hv3Address   = "hv3.lab.test:16514"
 	hvIPv6       = "[fd00::13]:16514"
+	worker2      = "worker-2"
 	testDataPEM  = "#cloud-config\n"
 	waitingReady = "WaitingForHypervisor"
 )
@@ -173,6 +175,19 @@ var _ = Describe("Hypervisor addresses", func() {
 			_, err := canonicalHypervisor(in)
 			Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), in)
 		}
+	})
+})
+
+var _ = Describe("Summaries in condition messages", func() {
+	It("names a few and counts the rest", func() {
+		Expect(summarize([]string{"a", "b"}, ", ")).To(Equal("a, b"))
+		many := make([]string, 0, 1000)
+		for i := range 1000 {
+			many = append(many, fmt.Sprintf("worker-%04d has no domain named default-worker-%04d there", i, i))
+		}
+		out := summarize(many, "; ")
+		Expect(out).To(HaveSuffix("; and 995 more, 1000 in all"))
+		Expect(strings.Count(out, "worker-")).To(Equal(2 * maxListed))
 	})
 })
 
@@ -431,6 +446,22 @@ var _ = Describe("Machines on a named hypervisor", func() {
 		Expect(touched(hvs.flags)).To(BeFalse())
 	})
 
+	It("tears down an ownerless machine nothing was attempted for on its cluster's hypervisor, found by label", func() {
+		// Deleted before its first Create, with its owner Machine gone too. The
+		// cluster has left the flags, which may be unreachable; the deletion
+		// must not wait on a hypervisor the machine never used.
+		hm.Finalizers = []string{MachineFinalizer}
+		r := build(confirmedHV2)
+		secretName := linkSecretName
+		Expect(r.Delete(ctx, ownerMachine(&secretName))).To(Succeed())
+		Expect(r.Delete(ctx, hm)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hvs.hv2.DeleteByNamePools).To(Equal([]string{linkPool}), "the cluster's pool, found by label")
+		Expect(touched(hvs.flags)).To(BeFalse())
+	})
+
 	It("finds its credentials through its cluster-name label when its owner Machine is gone", func() {
 		// The owner Machine's finalizer removed by hand, say. The HydraCluster is
 		// still there; teardown must not wedge over how it was found.
@@ -542,20 +573,20 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		// The lab's case: the flag connection already reaches hv2, so the
 		// machines made through it are on hv2.
 		w1 := made("worker-1", hvs.hv2)
-		w2 := made("worker-2", hvs.hv2)
+		w2 := made(worker2, hvs.hv2)
 		r := build(owningCluster(nil), w1, w2)
 
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reload(r).Status.Hypervisor).NotTo(BeNil())
-		for _, name := range []string{"worker-1", "worker-2"} {
+		for _, name := range []string{"worker-1", worker2} {
 			Expect(machineIn(r, name).Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address), name)
 		}
 	})
 
 	It("refuses, recording nothing, when a machine is not there", func() {
 		on := made("worker-1", hvs.hv2)
-		off := made("worker-2", hvs.flags)
+		off := made(worker2, hvs.flags)
 		r := build(owningCluster(nil), on, off)
 		expectRefused(r, "worker-2 has no domain named")
 		Expect(machineIn(r, "worker-1").Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation),
@@ -581,7 +612,7 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 
 	It("skips machines not made yet, and machines being deleted", func() {
 		unmade := linkedMachine("worker-1")
-		leaving := made("worker-2", hvs.flags)
+		leaving := made(worker2, hvs.flags)
 		leaving.Finalizers = []string{MachineFinalizer}
 		now := metav1.Now()
 		leaving.DeletionTimestamp = &now
@@ -592,7 +623,7 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		Expect(reload(r).Status.Hypervisor).NotTo(BeNil())
 		Expect(machineIn(r, "worker-1").Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation),
 			"it records its hypervisor itself, before Create")
-		Expect(machineIn(r, "worker-2").Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation),
+		Expect(machineIn(r, worker2).Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation),
 			"its teardown keeps going where it was made")
 	})
 
@@ -682,7 +713,7 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		// cluster unready -- that stops every new machine -- nor hold up the
 		// other machines.
 		w1 := made("worker-1", hvs.hv2)
-		w2 := made("worker-2", hvs.hv2)
+		w2 := made(worker2, hvs.hv2)
 		var once sync.Once
 		r := buildWith(&interceptor.Funcs{
 			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
@@ -703,7 +734,7 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		out := reload(r)
 		Expect(out.Status.Hypervisor).NotTo(BeNil())
 		Expect(apimeta.FindStatusCondition(out.Status.Conditions, infrav1.ClusterReadyCondition).Status).To(Equal(metav1.ConditionTrue))
-		Expect(machineIn(r, "worker-2").Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
+		Expect(machineIn(r, worker2).Annotations).To(HaveKeyWithValue(infrav1.HypervisorAnnotation, hv2Address))
 		Expect(machineIn(r, "worker-1").Annotations).NotTo(HaveKey(infrav1.HypervisorAnnotation))
 
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
@@ -736,6 +767,34 @@ var _ = Describe("Confirming a cluster's hypervisor", func() {
 		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reload(r).Status.Hypervisor).NotTo(BeNil())
+	})
+
+	It("reports a refusal even when another machine is still being created, whichever comes first", func() {
+		// A pending machine must not hide a machine that is elsewhere: the
+		// refusal is terminal, and it is what stops new machines.
+		for _, order := range [][2]string{{linkMachineName, worker2}, {worker2, linkMachineName}} {
+			hvs = newHypervisors()
+			hc = hydraCluster(namingHV2)
+			begun := linkedMachine(order[0])
+			begun.Annotations = map[string]string{infrav1.StoragePoolAnnotation: linkPool}
+			elsewhere := made(order[1], hvs.flags)
+			r := build(owningCluster(nil), begun, elsewhere)
+			expectRefused(r, order[1]+" has no domain named")
+		}
+	})
+
+	It("keeps a refusal about a large cluster short enough to record", func() {
+		// A condition message over 32768 characters is refused by the API
+		// server, and then nothing says what is wrong.
+		objs := make([]client.Object, 0, 13)
+		objs = append(objs, owningCluster(nil))
+		for i := range 12 {
+			objs = append(objs, made(fmt.Sprintf("worker-%02d", i), hvs.flags))
+		}
+		r := build(objs...)
+		expectRefused(r, "and 7 more, 12 in all")
+		failed := apimeta.FindStatusCondition(reload(r).Status.Conditions, infrav1.ClusterInfrastructureFailedCondition)
+		Expect(len(failed.Message)).To(BeNumerically("<", 4096))
 	})
 
 	It("waits, without confirming, until the cluster has an owning Cluster", func() {

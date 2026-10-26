@@ -577,7 +577,7 @@ func (r *HydraClusterReconciler) checkHypervisor(
 		return nil, fmt.Errorf("listing the cluster's machines: %w", err)
 	}
 	var unrecorded []*infrav1.HydraMachine
-	var refused []string
+	var refused, pending []string
 	for i := range machines.Items {
 		machine := &machines.Items[i]
 		if !machine.DeletionTimestamp.IsZero() {
@@ -595,9 +595,10 @@ func (r *HydraClusterReconciler) checkHypervisor(
 				// A Create on the flag connection has begun and not finished, or
 				// finished without its providerID being recorded. Confirming now
 				// would let it come back as a machine elsewhere with no record, so
-				// wait for it to be made, and checked like any other.
-				return nil, fmt.Errorf("%w: waiting for HydraMachine %s, which is being created on the manager's flag connection",
-					errHypervisorPending, machine.Name)
+				// wait for it to be made, and checked like any other. Collected,
+				// not returned: a refusal elsewhere in the cluster still has to be
+				// found, and it outranks this.
+				pending = append(pending, machine.Name)
 			}
 			continue
 		}
@@ -614,7 +615,11 @@ func (r *HydraClusterReconciler) checkHypervisor(
 	if len(refused) > 0 {
 		return nil, fmt.Errorf("%w: hypervisor %s cannot be confirmed for this cluster, because not all its machines are there (%s); "+
 			"machines never move between hypervisors, so name the one they are on",
-			providers.ErrTerminal, address, strings.Join(refused, "; "))
+			providers.ErrTerminal, address, summarize(refused, "; "))
+	}
+	if len(pending) > 0 {
+		return nil, fmt.Errorf("%w: waiting for HydraMachine %s, being created on the manager's flag connection",
+			errHypervisorPending, summarize(pending, ", "))
 	}
 
 	return &hypervisorCheck{address: address, unrecorded: unrecorded}, nil
@@ -677,7 +682,7 @@ func (r *HydraClusterReconciler) commitHypervisor(ctx context.Context, hydraClus
 		logf.FromContext(ctx).Info("Recorded hypervisor on machine", "hypervisor", address, "hydraMachine", machine.Name)
 	}
 	if len(conflicted) > 0 {
-		return fmt.Errorf("%w: recording hypervisor %s on %s", errHypervisorConflict, address, strings.Join(conflicted, ", "))
+		return fmt.Errorf("%w: recording hypervisor %s on %s", errHypervisorConflict, address, summarize(conflicted, ", "))
 	}
 	return nil
 }
@@ -701,4 +706,19 @@ func machineOnHypervisor(ctx context.Context, prov providers.MachineProvider, ma
 		return fmt.Sprintf("%s's domain %s there has ID %s, not the recorded %s", machine.Name, backendName(machine), state.ID, id), nil
 	}
 	return "", nil
+}
+
+// maxListed is how many machines a condition message names before it only
+// counts the rest.
+const maxListed = 5
+
+// summarize joins items, naming at most maxListed and counting the rest, so a
+// message about a large cluster stays far inside a condition message's
+// 32768-character limit -- past which the status write itself is refused, and
+// the condition that should say what is wrong is never recorded.
+func summarize(items []string, sep string) string {
+	if len(items) <= maxListed {
+		return strings.Join(items, sep)
+	}
+	return fmt.Sprintf("%s%sand %d more, %d in all", strings.Join(items[:maxListed], sep), sep, len(items)-maxListed, len(items))
 }
