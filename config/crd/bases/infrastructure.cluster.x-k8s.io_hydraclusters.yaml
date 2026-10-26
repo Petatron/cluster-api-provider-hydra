@@ -32,6 +32,10 @@ spec:
       name: Endpoint
       priority: 1
       type: string
+    - jsonPath: .spec.hypervisor.address
+      name: Hypervisor
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -140,6 +144,61 @@ spec:
                   rule: '!has(oldSelf.host) || (has(self.host) && self.host == oldSelf.host)'
                 - message: controlPlaneEndpoint.port is immutable once set
                   rule: '!has(oldSelf.port) || (has(self.port) && self.port == oldSelf.port)'
+              hypervisor:
+                description: |-
+                  hypervisor is the hypervisor this cluster's machines are created on, and
+                  how to reach it. Omitted, they are created on the one the manager's
+                  --libvirt-* flags configure.
+
+                  Each machine records the hypervisor it was created on, and every later
+                  operation on it -- teardown included -- goes there, whatever this field
+                  says by then. Naming a hypervisor therefore never moves a machine.
+
+                  It may be added to a cluster that already has machines. The controller
+                  then checks that every one of them is already on the named hypervisor
+                  (the same domain, by name and ID), and only then confirms it in
+                  status.hypervisor; until it does, no new machine is created. A machine
+                  found anywhere else is reported as InfrastructureFailed and nothing is
+                  confirmed.
+
+                  Until it is confirmed it may be corrected or removed. Once confirmed it is
+                  fixed: it cannot be removed and its address cannot change, because the
+                  cluster's machines are recorded against it. The credentials may change at
+                  any time, to rotate them.
+                properties:
+                  address:
+                    description: |-
+                      address is the hypervisor's libvirt TLS listener: host or host:port, an
+                      IPv6 address in brackets. The port defaults to 16514, libvirt's TLS port.
+
+                      The certificate the hypervisor presents must be valid for this host.
+                    maxLength: 259
+                    minLength: 1
+                    pattern: ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([-A-Za-z0-9.]*[A-Za-z0-9])?)(:[0-9]{1,5})?$
+                    type: string
+                  credentialsSecretRef:
+                    description: |-
+                      credentialsSecretRef names a Secret in this cluster's namespace holding
+                      the TLS client credentials: cacert.pem (the CA the hypervisor's certificate
+                      is checked against), clientcert.pem and clientkey.pem -- the same files
+                      libvirt reads from its PKI directory.
+
+                      Read when connecting, never cached, so replacing the Secret or pointing
+                      this at another one rotates the credentials: the next reconcile opens a
+                      connection with the new ones.
+                    properties:
+                      name:
+                        description: name is the Secret's name.
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - address
+                - credentialsSecretRef
+                type: object
               managedNetwork:
                 description: |-
                   managedNetwork asks Hydra to create and own a network for this cluster,
@@ -367,6 +426,23 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              hypervisor:
+                description: |-
+                  hypervisor is set once the controller has confirmed spec.hypervisor: every
+                  machine of the cluster was found on it. New machines are created there
+                  only after this. See HydraClusterSpec.hypervisor.
+                properties:
+                  address:
+                    description: |-
+                      address is spec.hypervisor.address, as written, once every machine the
+                      cluster had was found on that hypervisor. From then on spec.hypervisor
+                      cannot be removed or pointed elsewhere.
+                    maxLength: 259
+                    minLength: 1
+                    type: string
+                required:
+                - address
+                type: object
               initialization:
                 description: |-
                   initialization reports whether the cluster's infrastructure is ready.
@@ -389,6 +465,12 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'spec.hypervisor is fixed once the controller has confirmed the
+            cluster''s machines on it (status.hypervisor): it cannot be removed, and
+            its address cannot change'
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.hypervisor) || (has(self.spec.hypervisor)
+            && self.spec.hypervisor.address == oldSelf.status.hypervisor.address)'
     served: true
     storage: true
     subresources:

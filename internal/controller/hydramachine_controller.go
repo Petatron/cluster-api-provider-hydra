@@ -25,9 +25,11 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -91,11 +93,13 @@ type HydraMachineReconciler struct {
 	// it is left nil and each reconcile asks ProviderFor.
 	Provider providers.MachineProvider
 
-	// ProviderFor returns the backend for the machines of a HydraCluster, or of
-	// no cluster when hydraCluster is nil (a standalone machine, or one whose
-	// cluster cannot be read). Connections are held by whatever implements it,
-	// not here: a manager can reach more than one hypervisor (PET-38), so there
-	// is no single provider for this reconciler to keep.
+	// ProviderFor returns a connection to hypervisor, held for owner, or the
+	// manager's flag-configured connection when hypervisor is nil. Connections
+	// are held by whatever implements it, not here: a manager can reach more than
+	// one hypervisor (PET-38), so there is no single provider for this reconciler
+	// to keep. Each machine is an owner of the connection it records, so a
+	// connection outlives its cluster's release for as long as a machine still
+	// needs it for teardown.
 	//
 	// Connecting lazily rather than at startup is deliberate. Building it in
 	// main() meant a missing storage pool, or a hypervisor that was simply down,
@@ -104,25 +108,185 @@ type HydraMachineReconciler struct {
 	// suite could never observe a Running manager at all. Failing here instead
 	// puts the reason on the object as a terminal condition, where it is visible
 	// and survives being read later.
-	ProviderFor func(ctx context.Context, hydraCluster *infrav1.HydraCluster) (providers.MachineProvider, error)
+	ProviderFor func(ctx context.Context, owner providers.Owner, hypervisor *providers.Hypervisor) (providers.MachineProvider, error)
+
+	// ReleaseProvider tells whatever holds connections that owner no longer
+	// uses one: a machine that is gone. Optional.
+	ReleaseProvider func(ctx context.Context, owner providers.Owner)
 }
 
-// provider returns the backend for a machine's cluster.
+// provider returns the connection to the hypervisor a machine lives on: the one
+// placement names, or the manager's flag connection when it names none.
 //
 // A failure is not remembered: the next reconcile asks again, so a hypervisor
 // that was unreachable is retried rather than remembered as broken.
-func (r *HydraMachineReconciler) provider(ctx context.Context, link *linkage) (providers.MachineProvider, error) {
+func (r *HydraMachineReconciler) provider(ctx context.Context, machine *infrav1.HydraMachine, link *linkage, placement string) (providers.MachineProvider, error) {
 	if r.Provider != nil {
 		return r.Provider, nil
 	}
 	if r.ProviderFor == nil {
 		return nil, fmt.Errorf("%w: no infrastructure backend is configured", providers.ErrTerminal)
 	}
-	p, err := r.ProviderFor(ctx, hydraClusterOf(link))
+	hypervisor, err := r.hypervisorFor(ctx, link, placement)
+	if err != nil {
+		return nil, err
+	}
+	owner := machineOwner(client.ObjectKeyFromObject(machine))
+	if hypervisor == nil {
+		// The flag connection has no owners. Release in case this machine held
+		// another, which only a hand-edited annotation can cause.
+		r.release(ctx, owner)
+	}
+	p, err := r.ProviderFor(ctx, owner, hypervisor)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the infrastructure backend: %w", err)
 	}
 	return p, nil
+}
+
+// hypervisorFor resolves placement into a connection request, with credentials
+// from the machine's HydraCluster -- which must name that same hypervisor. A
+// machine records where it lives, but not how to get in; a cluster that is gone
+// or names another hypervisor leaves it waiting, never falling back.
+//
+// The HydraCluster is normally found through the owner Machine. During
+// teardown, when that Machine is gone, Reconcile has already found it through
+// the machine's own cluster-name label instead: see
+// withClusterByLabelForDeletion.
+//
+// A Secret that is missing or broken is a wait here, not a failure. It is the
+// HydraCluster's problem, reported terminally there, and an operator may be in
+// the middle of replacing it; marking every machine of the cluster
+// ProvisioningFailed -- running ones included -- would invite remediation of
+// machines that are fine.
+func (r *HydraMachineReconciler) hypervisorFor(ctx context.Context, link *linkage, placement string) (*providers.Hypervisor, error) {
+	if placement == "" {
+		return nil, nil
+	}
+	hydraCluster := hydraClusterOf(link)
+	if hydraCluster == nil || hydraCluster.Spec.Hypervisor == nil {
+		return nil, fmt.Errorf("%w: it lives on %s, and its HydraCluster cannot be read or names no hypervisor",
+			errWaitingForHypervisorCredentials, placement)
+	}
+	if named, err := canonicalHypervisor(hydraCluster.Spec.Hypervisor.Address); err != nil || named != placement {
+		return nil, fmt.Errorf("%w: it lives on %s, and HydraCluster %s names %s",
+			errWaitingForHypervisorCredentials, placement, hydraCluster.Name, hydraCluster.Spec.Hypervisor.Address)
+	}
+	hypervisor, err := hypervisorOf(ctx, r.APIReader, hydraCluster)
+	if errors.Is(err, providers.ErrTerminal) {
+		return nil, fmt.Errorf("%w: %v", errWaitingForHypervisorCredentials, err)
+	}
+	return hypervisor, err
+}
+
+// clusterByLabel finds a machine's Cluster, and the HydraCluster that Cluster
+// names, through the machine's own cluster-name label, for teardown when the
+// owner Machine cannot lead there. Either is nil when it is not there.
+func (r *HydraMachineReconciler) clusterByLabel(ctx context.Context, machine *infrav1.HydraMachine) (*clusterv1.Cluster, *infrav1.HydraCluster, error) {
+	name := machine.Labels[clusterv1.ClusterNameLabel]
+	if name == "" {
+		return nil, nil, nil
+	}
+	cluster := &clusterv1.Cluster{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: name}, cluster); err != nil {
+		return nil, nil, client.IgnoreNotFound(err)
+	}
+	ref := cluster.Spec.InfrastructureRef
+	if ref.Kind != hydraClusterKind || ref.APIGroup != infrav1.GroupVersion.Group || ref.Name == "" {
+		return cluster, nil, nil
+	}
+	hydraCluster := &infrav1.HydraCluster{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: machine.Namespace, Name: ref.Name}, hydraCluster); err != nil {
+		return cluster, nil, client.IgnoreNotFound(err)
+	}
+	return cluster, hydraCluster, nil
+}
+
+// withClusterByLabelForDeletion returns link with its Cluster and HydraCluster
+// found through the machine's own cluster-name label, for whichever the owner
+// Machine could not lead to, when the machine is being deleted. Otherwise link
+// unchanged.
+//
+// The Cluster is what the pause check reads: a paused Cluster must stop this
+// teardown however the Cluster was found. The HydraCluster gives a machine
+// deleted before its first Create its placement -- the cluster's confirmed
+// hypervisor; without it that would be the flag connection, which a cluster
+// that left the flags may not reach -- and the storage pool teardown sweeps.
+func (r *HydraMachineReconciler) withClusterByLabelForDeletion(ctx context.Context, machine *infrav1.HydraMachine, link *linkage) (*linkage, error) {
+	if machine.DeletionTimestamp.IsZero() || (link.cluster != nil && link.hydraCluster != nil) {
+		return link, nil
+	}
+	cluster, hydraCluster, err := r.clusterByLabel(ctx, machine)
+	if err != nil {
+		return link, err
+	}
+	found := *link
+	if found.cluster == nil {
+		found.cluster = cluster
+	}
+	if found.hydraCluster == nil {
+		found.hydraCluster = hydraCluster
+	}
+	return &found, nil
+}
+
+// placementFor decides which hypervisor a machine's operations go to, as
+// host:port, or "" for the manager's flag connection.
+//
+// A machine that records one lives there, whatever its cluster says now. One
+// that records none but may have been made was made on the flag connection,
+// because a hypervisor is always recorded before Create, in the same patch as
+// the storage pool. It may have been made if it has a providerID, or if it
+// records a storage pool -- written just before a Create that may have left a
+// domain or volumes behind without the providerID ever being recorded.
+//
+// Only a machine nothing was ever attempted for takes its cluster's
+// hypervisor, and only once the cluster has confirmed it; until then a new
+// machine waits, while one being deleted looks on the flag connection, where
+// it would have been made.
+func placementFor(machine *infrav1.HydraMachine, link *linkage) (string, error) {
+	if recorded := machine.Annotations[infrav1.HypervisorAnnotation]; recorded != "" {
+		return recorded, nil
+	}
+	if mayBeMadeOnFlags(machine) {
+		return "", nil
+	}
+	// A HydraCluster that cannot be read leaves this on the flag connection, but
+	// only for looking: a machine made there whose providerID was never recorded
+	// is found and adopted, which must not depend on the cluster, and nothing is
+	// created, because clusterReadyForCreate waits for an unreadable HydraCluster.
+	hydraCluster := link.hydraCluster
+	if hydraCluster == nil || hydraCluster.Spec.Hypervisor == nil {
+		return "", nil
+	}
+	if !confirmedHypervisor(hydraCluster) {
+		if !machine.DeletionTimestamp.IsZero() {
+			return "", nil
+		}
+		return "", errWaitingForHypervisor
+	}
+	return canonicalHypervisor(hydraCluster.Spec.Hypervisor.Address)
+}
+
+// mayBeMadeOnFlags reports whether a machine that records no hypervisor may
+// have a domain or volumes on the manager's flag connection: it has a
+// providerID, or it records a storage pool, which is written just before
+// Create. See placementFor.
+func mayBeMadeOnFlags(machine *infrav1.HydraMachine) bool {
+	return (machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "") ||
+		machine.Annotations[infrav1.StoragePoolAnnotation] != ""
+}
+
+// machineOwner is how a machine is known to the connection holder.
+func machineOwner(key types.NamespacedName) providers.Owner {
+	return providers.Owner{Kind: hydraMachineKind, NamespacedName: key}
+}
+
+// release tells the connection holder a machine no longer uses a connection.
+func (r *HydraMachineReconciler) release(ctx context.Context, owner providers.Owner) {
+	if r.ReleaseProvider != nil {
+		r.ReleaseProvider(ctx, owner)
+	}
 }
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;create;update;patch;delete
@@ -141,7 +305,10 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	machine := &infrav1.HydraMachine{}
 	if err := r.Get(ctx, req.NamespacedName, machine); err != nil {
 		// Not found is normal: the object was deleted and its finalizer already
-		// removed. Nothing left to do.
+		// removed. All that is left is its share of a connection.
+		if apierrors.IsNotFound(err) {
+			r.release(ctx, machineOwner(req.NamespacedName))
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -152,6 +319,19 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	link, err := r.resolveLinkage(ctx, machine)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Deleting is the one case where the Cluster and HydraCluster may be needed
+	// though the owner Machine cannot lead there -- its finalizer removed by
+	// hand, or its name reused -- so teardown finds them by the machine's own
+	// cluster-name label instead. Before the pause check, which has to see a
+	// paused Cluster found that way too. Creation keeps its gates: only
+	// teardown looks the cluster up by label.
+	if link, err = r.withClusterByLabelForDeletion(ctx, machine, link); err != nil {
+		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{}, err
@@ -170,9 +350,23 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	prov, err := r.provider(ctx, link)
+	placement, err := placementFor(machine, link)
+	var prov providers.MachineProvider
+	if err == nil {
+		prov, err = r.provider(ctx, machine, link, placement)
+	}
+	if reason := waitReasonFor(err); reason != "" {
+		if statusErr := r.recordWaiting(ctx, machine, reason, err.Error()); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueWhileProvisioning}, nil
+	}
 	if err != nil {
-		if statusErr := r.recordError(ctx, machine, "Provisioning", err); statusErr != nil {
+		phase := "Provisioning"
+		if !machine.DeletionTimestamp.IsZero() {
+			phase = "Deleting"
+		}
+		if statusErr := r.recordError(ctx, machine, phase, err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{}, err
@@ -182,10 +376,10 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.reconcileDelete(ctx, prov, machine, link)
 	}
 	log.V(1).Info("Reconciling machine", "name", machine.Name)
-	return r.reconcileNormal(ctx, prov, machine, link)
+	return r.reconcileNormal(ctx, prov, machine, link, placement)
 }
 
-func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (ctrl.Result, error) {
+func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage, placement string) (ctrl.Result, error) {
 	// The finalizer must be persisted before any infrastructure exists.
 	// Registering it afterwards leaves a window where a delete would remove the
 	// object and strand the VM.
@@ -197,7 +391,7 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 		}
 	}
 
-	state, err := r.ensureMachine(ctx, prov, machine, link)
+	state, err := r.ensureMachine(ctx, prov, machine, link, placement)
 	if reason := waitReasonFor(err); reason != "" {
 		// Not a failure. Cluster API populates a machine's owner, its cluster's
 		// infrastructure and its bootstrap Secret asynchronously, so every machine
@@ -237,7 +431,7 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 
 // ensureMachine returns the machine's current state, creating it if it does not
 // exist yet.
-func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage) (*providers.MachineState, error) {
+func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage, placement string) (*providers.MachineState, error) {
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
@@ -299,6 +493,14 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		logf.FromContext(ctx).Info("Adopting a machine whose providerID was never recorded",
 			"name", backendName(machine))
 		spec = providers.MachineSpec{Name: backendName(machine)}
+		// Found on a named hypervisor, it has to say so before it gains a
+		// providerID: a providerID with no hypervisor recorded means the flag
+		// connection, and every later operation -- teardown included -- would
+		// go there instead. Only the hypervisor: the storage pool is whatever
+		// the domain already uses, and a pool resolved now could be wrong.
+		if _, err := r.recordPlacement(ctx, machine, "", placement); err != nil {
+			return nil, err
+		}
 	case errors.Is(findErr, providers.ErrNotFound):
 		// Nothing exists, so this really is a create. Every gate belongs here and
 		// not earlier: an existing machine being adopted above must not be blocked
@@ -322,7 +524,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		// retry after the manager's default changed would otherwise put volumes
 		// in the new default while teardown protects only the recorded one.
 		resolved := prov.StoragePoolFor(spec.StoragePool)
-		pool, err := r.recordStoragePool(ctx, machine, resolved)
+		pool, err := r.recordPlacement(ctx, machine, resolved, placement)
 		if err != nil {
 			return nil, err
 		}
@@ -407,6 +609,9 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 	if err := r.Patch(ctx, machine, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 	}
+	// Teardown is done, so this machine needs no connection any more. The
+	// reconcile that sees it gone releases too; this one just does not wait.
+	r.release(ctx, machineOwner(client.ObjectKeyFromObject(machine)))
 	return ctrl.Result{}, nil
 }
 
@@ -577,6 +782,10 @@ func waitReasonFor(err error) string {
 		return "WaitingForHydraCluster"
 	case errors.Is(err, errWaitingForBootstrap):
 		return "WaitingForBootstrapData"
+	case errors.Is(err, errWaitingForHypervisor):
+		return "WaitingForHypervisor"
+	case errors.Is(err, errWaitingForHypervisorCredentials):
+		return "WaitingForHypervisorCredentials"
 	default:
 		return ""
 	}
@@ -813,21 +1022,29 @@ func resolveNetworks(machine *infrav1.HydraMachine, link *linkage) []providers.N
 	return out
 }
 
-// recordStoragePool writes the pool Create is about to build in onto the
-// machine, if nothing is recorded yet, and returns the recorded pool -- the one
-// Create must use.
+// recordPlacement writes where Create is about to build onto the machine --
+// the storage pool, and the hypervisor when it is not the manager's flag
+// connection -- for whichever is not recorded yet, and returns the recorded
+// pool: the one Create must use. The hypervisor needs no such return, because
+// placement already came from its record when there was one.
+//
+// Both are teardown's only way to find what Create may have left: see
+// infrav1.StoragePoolAnnotation and infrav1.HypervisorAnnotation.
 //
 // An existing value is kept, and wins. It was written before an earlier Create
 // that may have left volumes in it, and a later attempt resolving a different
 // pool -- the manager's default changed -- must neither erase that record nor
 // build somewhere else, or the machine's volumes would be split across two
 // pools with teardown watching only one.
-func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine *infrav1.HydraMachine, pool string) (string, error) {
-	if recorded := machine.Annotations[infrav1.StoragePoolAnnotation]; recorded != "" {
-		return recorded, nil
+func (r *HydraMachineReconciler) recordPlacement(ctx context.Context, machine *infrav1.HydraMachine, pool, hypervisor string) (string, error) {
+	recordedPool := machine.Annotations[infrav1.StoragePoolAnnotation]
+	writePool := recordedPool == "" && pool != ""
+	writeHypervisor := hypervisor != "" && machine.Annotations[infrav1.HypervisorAnnotation] == ""
+	if recordedPool != "" {
+		pool = recordedPool
 	}
-	if pool == "" {
-		return "", nil
+	if !writePool && !writeHypervisor {
+		return pool, nil
 	}
 	// Optimistic: a stale cached copy must not overwrite a record another
 	// reconcile has just written.
@@ -835,9 +1052,14 @@ func (r *HydraMachineReconciler) recordStoragePool(ctx context.Context, machine 
 	if machine.Annotations == nil {
 		machine.Annotations = map[string]string{}
 	}
-	machine.Annotations[infrav1.StoragePoolAnnotation] = pool
+	if writePool {
+		machine.Annotations[infrav1.StoragePoolAnnotation] = pool
+	}
+	if writeHypervisor {
+		machine.Annotations[infrav1.HypervisorAnnotation] = hypervisor
+	}
 	if err := r.Patch(ctx, machine, patch); err != nil {
-		return "", fmt.Errorf("recording storage pool %q: %w", pool, err)
+		return "", fmt.Errorf("recording storage pool %q and hypervisor %q: %w", pool, hypervisor, err)
 	}
 	return pool, nil
 }

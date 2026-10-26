@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
 	libvirtprovider "github.com/Petatron/cluster-api-provider-hydra/internal/providers/libvirt"
 )
 
@@ -175,4 +176,34 @@ func TestBackendWarning(t *testing.T) {
 			t.Fatalf("warning %q mentions the ConfigMap outside the cluster", err)
 		}
 	})
+}
+
+// A named hypervisor connects only as its cluster configured it: none of the
+// manager's connection settings carry over, while its defaults and timeouts do.
+func TestHypervisorConfigReplacesEveryConnectionSetting(t *testing.T) {
+	const hv2 = "hv2.lab.test:16514"
+	base := libvirtprovider.Config{
+		URI: "qemu:///session", RemoteAddr: "192.168.15.13:16509", Insecure: true, PKIPath: "/etc/pki/libvirt",
+		StoragePool: "k8s-workers", BaseImage: "ubuntu.img",
+	}
+	creds := &providers.TLSCredentials{CACert: []byte("ca")}
+	cfg, key := hypervisorConfig(base, &providers.Hypervisor{
+		Address: hv2, Credentials: creds, CredentialsVersion: "uid-1/7",
+	})
+	if cfg.URI != "" || cfg.Insecure || cfg.PKIPath != "" {
+		t.Errorf("connection settings carried over from the flags: URI %q, Insecure %v, PKIPath %q",
+			cfg.URI, cfg.Insecure, cfg.PKIPath)
+	}
+	if cfg.RemoteAddr != hv2 || cfg.Credentials != creds {
+		t.Errorf("RemoteAddr %q, Credentials %p; want the cluster's", cfg.RemoteAddr, cfg.Credentials)
+	}
+	if cfg.StoragePool != "k8s-workers" || cfg.BaseImage != "ubuntu.img" {
+		t.Errorf("the manager's defaults were dropped: pool %q, image %q", cfg.StoragePool, cfg.BaseImage)
+	}
+	_, rotated := hypervisorConfig(base, &providers.Hypervisor{
+		Address: hv2, Credentials: creds, CredentialsVersion: "uid-1/8",
+	})
+	if rotated == key {
+		t.Errorf("rotated credentials share the key %q, so the old connection would be reused", key)
+	}
 }

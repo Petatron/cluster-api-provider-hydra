@@ -254,6 +254,91 @@ var _ = Describe("HydraCluster API", func() {
 		})
 	})
 
+	Context("hypervisor", func() {
+		withHypervisor := func(address string) func(*infrav1.HydraCluster) {
+			return func(hc *infrav1.HydraCluster) {
+				hc.Spec.Hypervisor = &infrav1.HydraHypervisor{
+					Address:              address,
+					CredentialsSecretRef: infrav1.HydraSecretReference{Name: "wl0-libvirt-pki"},
+				}
+			}
+		}
+		// confirm does what the controller does once it has found every machine
+		// on the named hypervisor.
+		confirm := func(hc *infrav1.HydraCluster) {
+			hc.Status.Hypervisor = &infrav1.HydraHypervisorStatus{Address: hc.Spec.Hypervisor.Address}
+			Expect(k8sClient.Status().Update(ctx, hc)).To(Succeed())
+		}
+
+		It("admits a host, a host and port, and a bracketed IPv6 address", func() {
+			for _, address := range []string{hv2Written, "192.168.15.13:16514", hvIPv6, "[fd00::13]"} {
+				Expect(k8sClient.Create(ctx, newHydraCluster(withHypervisor(address)))).To(Succeed(), address)
+			}
+		})
+
+		It("rejects an address that is not a host or host:port", func() {
+			for _, address := range []string{"qemu+tls://hv2/system", "hv2:", "-hv2", "fd00::13"} {
+				Expect(k8sClient.Create(ctx, newHydraCluster(withHypervisor(address)))).NotTo(Succeed(), address)
+			}
+		})
+
+		It("requires the credentials Secret", func() {
+			err := k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
+				hc.Spec.Hypervisor = &infrav1.HydraHypervisor{Address: hv2Written}
+			}))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("may be added to an existing cluster, and corrected or removed until confirmed", func() {
+			// The guard, not admission, decides whether the cluster's machines are
+			// there; until it has, a typo must be fixable without recreating the
+			// HydraCluster.
+			hc := newHydraCluster(nil)
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+			withHypervisor("hv2.lab.tset")(hc)
+			Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+			hc.Spec.Hypervisor.Address = hv2Written
+			Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+			hc.Spec.Hypervisor = nil
+			Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+		})
+
+		It("is fixed once confirmed: the address cannot change and it cannot be removed", func() {
+			hc := newHydraCluster(withHypervisor(hv2Written))
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+			confirm(hc)
+
+			moved := hc.DeepCopy()
+			moved.Spec.Hypervisor.Address = "hv3.lab.test"
+			err := k8sClient.Update(ctx, moved)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spec.hypervisor is fixed once the controller has confirmed"))
+
+			removed := hc.DeepCopy()
+			removed.Spec.Hypervisor = nil
+			Expect(k8sClient.Update(ctx, removed)).NotTo(Succeed())
+		})
+
+		It("lets the credentials rotate after it is confirmed", func() {
+			hc := newHydraCluster(withHypervisor(hv2Written))
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+			confirm(hc)
+
+			hc.Spec.Hypervisor.CredentialsSecretRef.Name = "wl0-libvirt-pki-2026-11"
+			Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+		})
+
+		It("still admits the controller's own status writes once confirmed", func() {
+			hc := newHydraCluster(withHypervisor(hv2Written))
+			Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+			confirm(hc)
+
+			provisioned := true
+			hc.Status.Initialization.Provisioned = &provisioned
+			Expect(k8sClient.Status().Update(ctx, hc)).To(Succeed())
+		})
+	})
+
 	It("reports provisioned and the endpoint through printer columns", func() {
 		// The columns are how someone reads a stuck cluster with kubectl, so a
 		// typo in a JSONPath is worth catching here rather than in anger.
