@@ -183,6 +183,13 @@ test-race: ## Run the libvirt provider's tests under the race detector.
 test-etcd-backup: ## Test the etcd-backup tool's naming and pruning logic.
 	sh tools/etcd-backup/etcd-backup_test.sh
 
+# The adopted-cluster join-token scripts (PET-61) are run by hand against a
+# management cluster, so they are tested against a real kube-apiserver: the
+# envtest binaries, with bootstrap-token authentication on.
+.PHONY: test-adopted-join
+test-adopted-join: setup-envtest ## Test the adopted-cluster join-token scripts against a real kube-apiserver.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" sh tools/adopted-join/join-token_test.sh
+
 # The alerts in config/prometheus/alerts.yaml (PET-64). promtool checks and
 # unit-tests them; the Go test also holds every alert to a severity, a summary
 # and a runbook section in docs/alerts.md.

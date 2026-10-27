@@ -80,9 +80,9 @@ make test                 # unit tests (envtest: real kube-apiserver + etcd)
 ```
 
 Full local loop before opening a PR: `make manifests generate lint test build`, plus
-`make test-etcd-backup` when `tools/etcd-backup/` changed, `make test-alerts` when
-`config/prometheus/` or `config/metrics/` changed, and `make test-race` when
-`internal/providers/libvirt/` changed.
+`make test-etcd-backup` when `tools/etcd-backup/` changed, `make test-adopted-join` when
+`tools/adopted-join/` changed, `make test-alerts` when `config/prometheus/` or
+`config/metrics/` changed, and `make test-race` when `internal/providers/libvirt/` changed.
 
 **Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
 it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
@@ -107,6 +107,17 @@ shares this repository's build and release only. It is the one thing here that *
 `make test-etcd-backup` (POSIX `sh`, needs `jq` and `openssl`) after any change, and keep the tests
 able to catch a planner that would delete the new backup or another cluster's files. The
 manifests that run it live in hydra-gitops, `clusters/<cluster>/management-cluster/`.
+
+**`tools/adopted-join/` handles a join credential (PET-61).** An adopted cluster's workers join
+with a hand-made bootstrap Secret instead of CABPK (see
+`docs/examples/machinedeployment-adopted-cluster.yaml`), and these scripts check and renew its
+kubeadm token by hand. They mint a credential to join a cluster as a node, so they never print a
+token or put one on a command line, and every write is conditional on the version they read.
+`make test-adopted-join` runs them against a real kube-apiserver from the envtest binaries; every
+guard in them is mutation-checked, so keep the tests able to catch one going missing. Write the
+Secret with a JSON patch, not server-side apply: on a Secret made by client-side apply, kubectl's
+server-side apply migrates every field to the new manager, `type` included, and the next run
+removes it.
 
 **Alerts ship as config, not in the release manifest (PET-64).** `config/prometheus/alerts.yaml`
 is a `PrometheusRule` over the provider's metrics and kube-state-metrics' Cluster API series;

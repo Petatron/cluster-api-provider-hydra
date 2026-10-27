@@ -69,6 +69,11 @@ jobs:
       - name: Test the shipped alerts
         run: make test-alerts
 
+      # The scripts that renew an adopted cluster's join token mint a node
+      # credential; this runs them against a real kube-apiserver (PET-61).
+      - name: Test the adopted-cluster join-token scripts
+        run: make test-adopted-join
+
       # The runner's sh is dash, a stricter POSIX shell than a laptop's, which
       # is the point: the image runs the script under busybox ash.
       - name: Test the etcd-backup tool

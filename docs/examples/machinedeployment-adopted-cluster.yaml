@@ -73,7 +73,27 @@ spec:
         #
         # The join token expires. A Secret whose token has aged out produces a
         # VM that boots perfectly and fails to join as unauthorized, which reads
-        # like a provider bug and is not.
+        # like a provider bug and is not. So before anything creates a machine
+        # from it -- replacing one, a rollout, a scale-up -- give it a fresh one
+        # (PET-61):
+        #
+        #   tools/adopted-join/join-token-check.sh  hydra-worker-0-bootstrap  # would it join now?
+        #   tools/adopted-join/join-token-renew.sh  hydra-worker-0-bootstrap  # dry run
+        #   tools/adopted-join/join-token-renew.sh --apply hydra-worker-0-bootstrap
+        #
+        # The token lasts two hours. Do not make one that never expires:
+        # anyone holding it can join this cluster as a node, and copies outlive
+        # the join, in every machine's cidata image and in the guest.
+        #
+        # The cloud-init must also `systemctl enable kubelet`. CABPK templates
+        # get that from the bootstrap provider config; a hand-written Secret
+        # has to say so, or its nodes do not come back after a reboot.
+        #
+        # Expect this cluster's Machines to stay at NodeHealthy=Unknown, and
+        # the MachineDeployment at 0 ready, for the same reason CABPK cannot
+        # help: Cluster API inspects node health only once the control plane is
+        # initialized. The nodes themselves are fine. It clears only when
+        # management moves to a cluster Cluster API built (PET-74).
         # ---------------------------------------------------------------------
         dataSecretName: hydra-worker-0-bootstrap
       infrastructureRef:
