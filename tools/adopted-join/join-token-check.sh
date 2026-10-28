@@ -17,7 +17,7 @@
 #
 # Checks, in the order kubeadm join would trip over them:
 #   - the Secret holds exactly one flag-form `kubeadm join` token;
-#   - kube-system/bootstrap-token-<id> exists, matches, can authenticate, puts
+#   - kube-system/bootstrap-token-<id> exists, matches (id and secret), can authenticate, puts
 #     the joiner in the kubeadm node group, and has not expired;
 #   - cluster-info is signed for that id, which token discovery requires;
 #   - the CA hash the join pins is the cluster's CA;
@@ -88,6 +88,9 @@ else
 	type=$(kubectl -n kube-system get secret "$ts" -o jsonpath='{.type}') ||
 		die "could not read kube-system/$ts (kubectl's error is above)"
 	[ "$type" = bootstrap.kubernetes.io/token ] || bad "kube-system/$ts has type \"$type\", so the API server does not treat it as a token"
+	# The authenticator, and the signer, also require token-id to match the name.
+	field token-id
+	[ "$f" = "$id" ] || bad "kube-system/$ts has token-id \"$f\", not $id, so the API server refuses the token"
 	# Compared in the shell; neither value is passed to another process.
 	field token-secret
 	[ "$f" = "${token#*.}" ] || bad "kube-system/$ts holds a different secret than $NAMESPACE/$SECRET"

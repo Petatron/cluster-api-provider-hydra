@@ -372,8 +372,68 @@ expect "the token it minted is kept" [ "$(tokens)" = $((n + 1)) ]
 expect "says so, and how to tidy up" says "$out" "^Kept token .* in case it did"
 expect "never prints a token's secret" lacks "$out" "[a-z0-9]\{6\}\.[a-z0-9]\{16\}"
 
-section "check: a token with a different secret, then an unsigned cluster-info"
+section "renew --apply when kube-system's Secrets cannot be read: nothing created"
+cat >"$t/shim/kubectl" <<EOF
+#!/bin/sh
+case "\$*" in *"get secret bootstrap-token-"*) echo 'Error from server (Forbidden): secrets is forbidden' >&2; exit 1 ;; esac
+exec "$real" "\$@"
+EOF
+n=$(tokens)
+before=$(rv)
+out=$(PATH=$t/shim:$PATH sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+c=0
+[ "$rc" != 0 ] && [ "$(tokens)" = "$n" ] && [ "$(rv)" = "$before" ] && c=1
+expect "refused, nothing created or written" [ "$c" = 1 ]
+expect "says why" says "$out" "could not read kube-system's Secrets to pick an unused token id"
+
+section "renew --apply when cluster-info cannot be read while waiting for the signature"
+cat >"$t/shim/kubectl" <<EOF
+#!/bin/sh
+case "\$*" in *"jws-kubeconfig-"*) echo 'Error from server (Forbidden): configmaps "cluster-info" is forbidden' >&2; exit 1 ;; esac
+exec "$real" "\$@"
+EOF
+n=$(tokens)
+before=$(rv)
+out=$(SIGN_TIMEOUT=2 PATH=$t/shim:$PATH sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+c=0
+[ "$rc" != 0 ] && [ "$(tokens)" = "$n" ] && [ "$(rv)" = "$before" ] && c=1
+expect "rolled back, the Secret unchanged" [ "$c" = 1 ]
+expect "reports the failed read, not a missing signature" says "$out" "^could not read kube-public/cluster-info to see whether"
+
+section "renew --apply when the Secret changes again right after the write: the token is kept"
+cat >"$t/shim/kubectl" <<EOF
+#!/bin/sh
+# Let the write through, then change the Secret before it is read back.
+case "\$*" in *"patch secret"*)
+	"$real" "\$@" || exit
+	"$real" patch secret hydra-worker-0-bootstrap --type=merge -p '{"data":{"value":"Y2hhbmdlZAo="}}' >/dev/null
+	exit 0 ;;
+esac
+exec "$real" "\$@"
+EOF
+n=$(tokens)
+out=$(PATH=$t/shim:$PATH sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+expect "exits non-zero" [ "$rc" != 0 ]
+expect "the token it wrote is kept" [ "$(tokens)" = $((n + 1)) ]
+expect "says so" says "$out" "^Kept token [a-z0-9]\{6\}\. Run join-token-check.sh"
+# Back to a Secret naming a live, signed token for the cases below.
+fixture
+sh "$RENEW" --apply >/dev/null 2>&1
+
+section "check: a token whose token-id does not match, one with a different secret, then an unsigned cluster-info"
 id=$(current_token | cut -d. -f1)
+$K -n kube-system patch secret "bootstrap-token-$id" --type=merge -p '{"stringData":{"token-id":"zzzzzz"}}' >/dev/null
+out=$(sh "$CHECK" 2>&1)
+rc=$?
+expect "different token-id: exits 1" [ "$rc" = 1 ]
+expect "different token-id: says so" says "$out" "^FAIL  kube-system/bootstrap-token-$id has token-id \"zzzzzz\""
+$K -n kube-system patch secret "bootstrap-token-$id" --type=merge -p "{\"stringData\":{\"token-id\":\"$id\"}}" >/dev/null
 $K -n kube-system patch secret "bootstrap-token-$id" --type=merge -p '{"stringData":{"token-secret":"ffffffffffffffff"}}' >/dev/null
 out=$(sh "$CHECK" 2>&1)
 rc=$?

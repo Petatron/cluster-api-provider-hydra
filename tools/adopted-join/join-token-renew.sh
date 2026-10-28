@@ -120,7 +120,11 @@ fi
 rand() { LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$1"; }
 for _ in 1 2 3 4 5; do
 	id=$(rand 6)
-	[ -n "$(kubectl -n kube-system get secret "bootstrap-token-$id" --ignore-not-found -o name)" ] || break
+	taken=$(kubectl -n kube-system get secret "bootstrap-token-$id" --ignore-not-found -o name) || {
+		echo "could not read kube-system's Secrets to pick an unused token id (kubectl's error is above); nothing was created" >&2
+		exit 1
+	}
+	[ -n "$taken" ] || break
 done
 secret=$(rand 16)
 [ ${#id} = 6 ] && [ ${#secret} = 16 ] || {
@@ -142,9 +146,17 @@ kubectl create ${dry:+"$dry"} -f "$d/token.yaml" >/dev/null
 if $apply; then
 	minted=bootstrap-token-$id
 	waited=0
-	until [ -n "$(kubectl -n kube-public get configmap cluster-info -o jsonpath="{.data.jws-kubeconfig-$id}")" ]; do
+	# A failed read is retried like an unsigned one, but reported as what it is.
+	until sig=$(kubectl -n kube-public get configmap cluster-info -o jsonpath="{.data.jws-kubeconfig-$id}" 2>"$d/sign.err") &&
+		[ -n "$sig" ]; do
 		[ "$waited" -lt "$SIGN_TIMEOUT" ] || {
-			echo "cluster-info was not signed for token $id within ${SIGN_TIMEOUT}s (is the bootstrapsigner controller running?); deleted it, the Secret is unchanged" >&2
+			if [ -s "$d/sign.err" ]; then
+				echo "could not read kube-public/cluster-info to see whether token $id was signed:" >&2
+				cat "$d/sign.err" >&2
+			else
+				echo "cluster-info was not signed for token $id within ${SIGN_TIMEOUT}s (is the bootstrapsigner controller running?)" >&2
+			fi
+			echo "Deleted token $id again; the Secret is unchanged." >&2
 			exit 1
 		}
 		sleep 1
@@ -224,8 +236,11 @@ if ! $apply; then
 	exit 0
 fi
 
-[ "$(kubectl -n "$NAMESPACE" get secret "$SECRET" -o jsonpath='{.data.value}')" = "$value" ] || {
-	echo "read-back of $NAMESPACE/$SECRET does not match what was written -- check it by hand" >&2
+# The write succeeded, so the token stays even if this fails: something may
+# have changed the Secret since, and it may still name the token.
+now=$(kubectl -n "$NAMESPACE" get secret "$SECRET" -o jsonpath='{.data.value}') && [ "$now" = "$value" ] || {
+	echo "$NAMESPACE/$SECRET was written, but reading it back failed or did not match (changed again since?)." >&2
+	echo "Kept token $id. Run join-token-check.sh $SECRET; if the Secret does not use $id, delete kube-system/bootstrap-token-$id." >&2
 	exit 1
 }
 echo "Stored $NAMESPACE/$SECRET: it now joins with token $id (was $old_id), valid until $until_text."
