@@ -73,7 +73,43 @@ spec:
         #
         # The join token expires. A Secret whose token has aged out produces a
         # VM that boots perfectly and fails to join as unauthorized, which reads
-        # like a provider bug and is not.
+        # like a provider bug and is not. So before anything creates a machine
+        # from it -- replacing one, a rollout, a scale-up -- give it a fresh one
+        # (PET-61):
+        #
+        #   tools/adopted-join/join-token-check.sh  hydra-worker-0-bootstrap  # would it join now?
+        #   tools/adopted-join/join-token-renew.sh  hydra-worker-0-bootstrap  # dry run
+        #   tools/adopted-join/join-token-renew.sh --apply hydra-worker-0-bootstrap
+        #
+        # The token lasts two hours. Do not make one that never expires:
+        # anyone holding it can join this cluster as a node, and copies outlive
+        # the join, in every machine's cidata image and in the guest.
+        #
+        # The cloud-init must also `systemctl enable kubelet`. CABPK templates
+        # get that from the bootstrap provider config; a hand-written Secret
+        # has to say so, or its nodes do not come back after a reboot.
+        #
+        # Expect this cluster's Machines to stay at NodeHealthy=Unknown, and
+        # the MachineDeployment at 0 ready, for the same reason CABPK cannot
+        # help: Cluster API inspects node health only once the control plane is
+        # initialized. The nodes themselves are fine. It clears only when
+        # management moves to a cluster Cluster API built (PET-74).
+        #
+        # Removing a machine is not graceful here either. Cluster API drains a
+        # Machine's Node, and deletes it, only when it may delete the Node, and
+        # with no control-plane Machines it may not. So it skips both: deleting
+        # the Machine, or scaling down, powers the VM off with its pods still
+        # running and leaves the Node object behind. Drain first, and delete
+        # the Node once the VM is gone:
+        #
+        #   kubectl drain NODE --ignore-daemonsets
+        #   kubectl annotate machine MACHINE cluster.x-k8s.io/delete-machine=yes  # picks which one a scale-down removes
+        #   kubectl scale machinedeployment hydra-md-0 --replicas=N
+        #   kubectl delete node NODE
+        #
+        # Seen on hardware in PET-61: a replacement joined with a renewed token
+        # and came back from a reboot; the Machine it replaced was deleted in
+        # 9s, its Node never cordoned and still listed.
         # ---------------------------------------------------------------------
         dataSecretName: hydra-worker-0-bootstrap
       infrastructureRef:
