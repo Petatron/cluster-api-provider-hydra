@@ -76,7 +76,14 @@ mkdir -p "$t/certs" "$t/etcd"
 openssl genrsa -out "$t/certs/sa.key" 2048 2>/dev/null
 openssl rsa -in "$t/certs/sa.key" -pubout -out "$t/certs/sa.pub" 2>/dev/null
 admin=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 32)
-printf '%s,admin,admin,"system:masters"\n' "$admin" >"$t/certs/tokens.csv"
+# Two users with less than admin, given just enough RBAC below to show how the
+# check reads a refusal.
+reader=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 32)
+reader2=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 32)
+{
+	printf '%s,admin,admin,"system:masters"\n' "$admin"
+	printf '%s,reader,reader\n%s,reader2,reader2\n' "$reader" "$reader2"
+} >"$t/certs/tokens.csv"
 "$KUBEBUILDER_ASSETS/etcd" --data-dir "$t/etcd" --listen-client-urls "http://127.0.0.1:$ETCD_PORT" \
 	--advertise-client-urls "http://127.0.0.1:$ETCD_PORT" --listen-peer-urls "http://127.0.0.1:$((ETCD_PORT + 1))" \
 	>"$t/etcd.log" 2>&1 &
@@ -97,6 +104,10 @@ contexts: [{name: t, context: {cluster: t, user: admin}}]
 current-context: t
 EOF
 export KUBECONFIG="$t/kubeconfig"
+sed "s/$admin/$reader/" "$t/kubeconfig" >"$t/kubeconfig-reader"
+sed "s/$admin/$reader2/" "$t/kubeconfig" >"$t/kubeconfig-reader2"
+# Nothing listens on port 1: an API server that cannot be reached.
+sed "s|127.0.0.1:$PORT|127.0.0.1:1|" "$t/kubeconfig" >"$t/kubeconfig-unreachable"
 K="kubectl --request-timeout=10s"
 waited=0
 until [ "$($K get --raw /readyz 2>/dev/null)" = ok ]; do
@@ -130,6 +141,7 @@ expect() {
 }
 # says OUTPUT PATTERN: OUTPUT has a line matching the basic regex PATTERN.
 says() { printf '%s\n' "$1" | grep -q -- "$2"; }
+lacks() { ! says "$1" "$2"; }
 show() { printf '%s\n' "$1" | sed 's/^/    | /'; }
 
 tokens() { $K -n kube-system get secrets --field-selector type=bootstrap.kubernetes.io/token -o name | wc -l | tr -d ' '; }
@@ -177,6 +189,18 @@ done
 $K create clusterrolebinding kubeadm:kubelet-bootstrap --clusterrole=system:node-bootstrapper --group="$G" >/dev/null
 $K create clusterrolebinding kubeadm:node-autoapprove-bootstrap \
 	--clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient --group="$G" >/dev/null
+$K create clusterrole kubeadm:get-nodes --verb=get --resource=nodes >/dev/null
+$K create clusterrolebinding kubeadm:get-nodes --clusterrole=kubeadm:get-nodes --group="$G" >/dev/null
+# reader can read the Secret and cluster-info but not kube-system's Secrets;
+# reader2 can read those too, but cannot list RBAC bindings.
+for u in reader reader2; do
+	$K create role "$u-secrets" --verb=get --resource=secrets >/dev/null
+	$K create rolebinding "$u-secrets" --role="$u-secrets" --user="$u" >/dev/null
+	$K -n kube-public create role "$u-cluster-info" --verb=get --resource=configmaps >/dev/null
+	$K -n kube-public create rolebinding "$u-cluster-info" --role="$u-cluster-info" --user="$u" >/dev/null
+done
+$K -n kube-system create role reader2-tokens --verb=get --resource=secrets >/dev/null
+$K -n kube-system create rolebinding reader2-tokens --role=reader2-tokens --user=reader2 >/dev/null
 
 # --- check ----------------------------------------------------------------------
 section "check: the token is gone"
@@ -195,6 +219,19 @@ section "check: no warning when the cloud-init enables the kubelet"
 fixture "$OLD" "$ca_hash" "  - systemctl enable kubelet"
 out=$(sh "$CHECK" 2>&1)
 expect "no kubelet warning" sh -c '! printf "%s\n" "$1" | grep -q "never enables the kubelet"' _ "$out"
+fixture "$OLD" "$ca_hash" "  - systemctl enable --now kubelet"
+out=$(sh "$CHECK" 2>&1)
+expect "none for enable --now either" lacks "$out" "never enables the kubelet"
+fixture "$OLD" "$ca_hash" "  - systemctl enable containerd && systemctl restart kubelet"
+out=$(sh "$CHECK" 2>&1)
+expect "warns when another unit is enabled and the kubelet only restarted" says "$out" "never enables the kubelet"
+
+section "check: an API server it cannot reach"
+out=$(KUBECONFIG=$t/kubeconfig-unreachable sh "$CHECK" 2>&1)
+rc=$?
+show "$out"
+expect "exits 2, not 1" [ "$rc" = 2 ]
+expect "says it could not read the Secret" says "$out" "^FAIL  could not read Secret"
 
 # --- renew ----------------------------------------------------------------------
 section "renew: a dry run stores nothing"
@@ -243,6 +280,31 @@ rc=$?
 show "$out"
 expect "check now exits 0" [ "$rc" = 0 ]
 
+section "check: the bootstrap group cannot get Nodes"
+$K delete clusterrolebinding kubeadm:get-nodes >/dev/null
+out=$(sh "$CHECK" 2>&1)
+rc=$?
+expect "exits 1" [ "$rc" = 1 ]
+expect "names the missing binding" says "$out" "^FAIL  $G is not bound to ClusterRole kubeadm:get-nodes"
+$K create clusterrolebinding kubeadm:get-nodes --clusterrole=kubeadm:get-nodes --group="$G" >/dev/null
+
+section "check: a kubeconfig that cannot read kube-system's Secrets"
+out=$(KUBECONFIG=$t/kubeconfig-reader sh "$CHECK" 2>&1)
+rc=$?
+show "$out"
+expect "exits 2, not 1" [ "$rc" = 2 ]
+expect "does not call the token missing" lacks "$out" "does not exist"
+expect "says it could not read the token" says "$out" "^FAIL  could not read kube-system/bootstrap-token-"
+
+section "check: a kubeconfig that cannot list RBAC bindings"
+out=$(KUBECONFIG=$t/kubeconfig-reader2 sh "$CHECK" 2>&1)
+rc=$?
+show "$out"
+expect "exits 2, not 0 or 1" [ "$rc" = 2 ]
+expect "says the roles were not checked" says "$out" "^warn  could not list ClusterRoleBindings"
+expect "reports no binding as missing" lacks "$out" "is not bound to"
+expect "still checks the token" says "$out" "^ok    token .* is valid"
+
 section "renew --apply twice more: each run works, earlier tokens are left to expire"
 out=$(sh "$RENEW" --apply 2>&1)
 rc=$?
@@ -273,6 +335,42 @@ show "$out"
 expect "exits non-zero" [ "$rc" != 0 ]
 expect "the Secret keeps its previous token" [ "$(current_token)" = "$before" ]
 expect "the token it minted is deleted" [ "$(tokens)" = "$n" ]
+
+section "renew --apply when the write lands but its response is lost: the token is kept"
+cat >"$t/shim/kubectl" <<EOF
+#!/bin/sh
+# Make the write, then fail as if the response had never arrived.
+case "\$*" in *"patch secret"*) "$real" "\$@"; exit 1 ;; esac
+exec "$real" "\$@"
+EOF
+n=$(tokens)
+before=$(current_token)
+out=$(PATH=$t/shim:$PATH sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+expect "exits 0" [ "$rc" = 0 ]
+expect "the Secret names the new token" [ "$(current_token)" != "$before" ]
+expect "the token it names exists" [ -n "$($K -n kube-system get secret "bootstrap-token-$(current_token | cut -d. -f1)" --ignore-not-found -o name)" ]
+expect "says the write landed" says "$out" "holds what was written"
+
+section "renew --apply when the write's outcome cannot be read back: the token is kept"
+cat >"$t/shim/kubectl" <<EOF
+#!/bin/sh
+# Make the write and fail; from then on, every read of the Secret fails too.
+case "\$*" in
+*"patch secret"*) "$real" "\$@"; : >"$t/shim/written"; exit 1 ;;
+*"get secret hydra-worker-0-bootstrap"*) [ ! -e "$t/shim/written" ] || { echo "error: connection lost" >&2; exit 1; } ;;
+esac
+exec "$real" "\$@"
+EOF
+n=$(tokens)
+out=$(PATH=$t/shim:$PATH sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+expect "exits non-zero" [ "$rc" != 0 ]
+expect "the token it minted is kept" [ "$(tokens)" = $((n + 1)) ]
+expect "says so, and how to tidy up" says "$out" "^Kept token .* in case it did"
+expect "never prints a token's secret" lacks "$out" "[a-z0-9]\{6\}\.[a-z0-9]\{16\}"
 
 section "check: a token with a different secret, then an unsigned cluster-info"
 id=$(current_token | cut -d. -f1)
@@ -313,6 +411,20 @@ rc=$?
 show "$out"
 expect "check exits 0" [ "$rc" = 0 ]
 expect "check warns it never expires" says "$out" "never expires"
+
+section "renew --apply on a cloud-init with no final newline: every byte kept"
+fixture
+printf '%s' "$(cat "$t/cloud-init")" >"$t/no-newline"
+$K create secret generic hydra-worker-0-bootstrap --type=cluster.x-k8s.io/secret --from-file=value="$t/no-newline" \
+	--dry-run=client -o yaml | $K apply -f - >/dev/null
+userdata >"$t/before"
+out=$(sh "$RENEW" --apply 2>&1)
+rc=$?
+show "$out"
+userdata >"$t/after"
+expect "exits 0" [ "$rc" = 0 ]
+expect "the size is unchanged" [ "$(wc -c <"$t/before")" = "$(wc -c <"$t/after")" ]
+expect "it still has no final newline" [ -n "$(tail -c 1 "$t/after")" ]
 
 # The signer stays on below, so a refusal can only come from the guard tested.
 section "renew refuses what a new token would not fix"

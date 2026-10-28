@@ -10,9 +10,9 @@
 #   2. waits for the bootstrapsigner to sign cluster-info for it, which token
 #      discovery needs, and deletes the token again if that never happens;
 #   3. in one write, which fails if the Secret changed since it was read,
-#      replaces the token in its `kubeadm join` line -- nothing else in the
-#      cloud-init -- and removes its client-side-apply annotation, which holds
-#      a full copy of the old data; and
+#      replaces the token in its `kubeadm join` line -- every other byte of
+#      the cloud-init is kept -- and removes its client-side-apply annotation,
+#      which holds a full copy of the old data; and
 #   4. reads the Secret back and checks it holds exactly what was written.
 #
 # No Machine is touched, and running machines are unaffected: the provider
@@ -61,7 +61,8 @@ done
 chmod 700 "$d"
 umask 077
 # A token minted but not yet referenced by the Secret is deleted on any exit,
-# so a failure part-way never leaves a working credential nobody uses.
+# so a failure part-way never leaves a working credential nobody uses. The one
+# exception is a write whose outcome cannot be read back: see below.
 minted=""
 cleanup() {
 	if [ -n "$minted" ]; then
@@ -157,8 +158,17 @@ OLD=$old NEW=$id.$secret awk '{
 	if (i) $0 = substr($0, 1, i - 1) ENVIRON["NEW"] substr($0, i + length(ENVIRON["OLD"]))
 	print
 }' "$d/old" >"$d/new"
+# awk ends its output with a newline whether or not its input did; a Secret
+# made with --from-literal usually has none. Keep the old file's last byte.
+if [ -n "$(tail -c 1 "$d/old")" ]; then
+	head -c "$(($(wc -c <"$d/new") - 1))" "$d/new" >"$d/new.trimmed"
+	mv "$d/new.trimmed" "$d/new"
+fi
+# The tokens are the same length, so only one line may differ and the size may
+# not change at all.
 changed=$(awk 'NR == FNR { a[FNR] = $0; n = FNR; next } a[FNR] != $0 { c++; line = FNR } END { if (FNR != n) print "length"; else print c + 0 ":" line }' "$d/old" "$d/new")
-if [ "${changed%%:*}" != 1 ] || [ "$(occurrences "$old" "$d/new")" != 0 ] || [ "$(occurrences "$id.$secret" "$d/new")" != 1 ]; then
+if [ "${changed%%:*}" != 1 ] || [ $(($(wc -c <"$d/old"))) != $(($(wc -c <"$d/new"))) ] ||
+	[ "$(occurrences "$old" "$d/new")" != 0 ] || [ "$(occurrences "$id.$secret" "$d/new")" != 1 ]; then
 	echo "the rewritten cloud-init is not the old one with just the token replaced; nothing written" >&2
 	exit 1
 fi
@@ -178,11 +188,28 @@ value=$(base64 <"$d/new" | tr -d '\n')
 	[ -z "$annotated" ] || printf ',{"op":"remove","path":"/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration"}'
 	printf ']\n'
 } >"$d/patch.json"
-kubectl -n "$NAMESPACE" patch secret "$SECRET" --type=json --patch-file="$d/patch.json" \
-	--field-manager=join-token-renew ${dry:+"$dry"} >/dev/null || {
-	echo "could not write $NAMESPACE/$SECRET -- changed since it was read? Nothing was written" >&2
-	exit 1
-}
+if ! kubectl -n "$NAMESPACE" patch secret "$SECRET" --type=json --patch-file="$d/patch.json" \
+	--field-manager=join-token-renew ${dry:+"$dry"} >/dev/null; then
+	$apply || {
+		echo "the API server refused the write to $NAMESPACE/$SECRET (dry run; nothing was stored either way)" >&2
+		exit 1
+	}
+	# A failed patch does not prove nothing was written: the request can commit
+	# and its response be lost. Look before deciding what to do with the token.
+	if ! now=$(kubectl -n "$NAMESPACE" get secret "$SECRET" -o jsonpath='{.data.value}'); then
+		# Cannot tell. Deleting a token the Secret may reference is the worse
+		# mistake; one left unused expires on its own.
+		minted=""
+		echo "could not write $NAMESPACE/$SECRET, nor read it back to see whether the write landed." >&2
+		echo "Kept token $id (valid until ${expiration:-never}) in case it did. Run join-token-check.sh $SECRET; if the Secret does not use $id, delete kube-system/bootstrap-token-$id." >&2
+		exit 1
+	fi
+	[ "$now" = "$value" ] || {
+		echo "could not write $NAMESPACE/$SECRET -- changed since it was read? It does not hold the new token, so token $id is deleted again" >&2
+		exit 1
+	}
+	echo "kubectl reported an error, but $NAMESPACE/$SECRET holds what was written." >&2
+fi
 minted=""
 
 old_id=${old%%.*}

@@ -112,7 +112,9 @@ manifests that run it live in hydra-gitops, `clusters/<cluster>/management-clust
 with a hand-made bootstrap Secret instead of CABPK (see
 `docs/examples/machinedeployment-adopted-cluster.yaml`), and these scripts check and renew its
 kubeadm token by hand. They mint a credential to join a cluster as a node, so they never print a
-token or put one on a command line, and every write is conditional on the version they read.
+token or put one on a command line, and every write is conditional on the version they read. A
+read that fails is never taken to mean "absent", and a write that fails is read back before the
+minted token is deleted, because the request may have committed.
 `make test-adopted-join` runs them against a real kube-apiserver from the envtest binaries; every
 guard in them is mutation-checked, so keep the tests able to catch one going missing. Write the
 Secret with a JSON patch, not server-side apply: on a Secret made by client-side apply, kubectl's
