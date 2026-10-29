@@ -83,8 +83,13 @@ another.
 `controlPlaneEndpoint` is supplied by whoever writes the object rather than
 produced by the provider. Providers that create the endpoint themselves — with a
 load balancer or a VIP — are the ones expected to fill it in; Hydra creates
-neither, so it only reports back what it is told. Immutable once set: moving a
-live cluster's API endpoint is not something a reconcile can carry out.
+neither, so on a site network it only reports back what it is told. On a
+`managedNetwork` the host may be left out: Hydra owns that network's DHCP range,
+so it chooses the first address outside the range that is not the network,
+gateway or broadcast address, and records it on the spec before reporting the
+infrastructure provisioned. Immutable once set, whoever set it, and it cannot be
+removed: moving a live cluster's API endpoint is not something a reconcile can
+carry out.
 
 Its controller **verifies what it does not own, and creates only what the cluster
 asked it to own**. The storage pool and the base image were there before it

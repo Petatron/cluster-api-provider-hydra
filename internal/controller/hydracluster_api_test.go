@@ -61,10 +61,10 @@ var _ = Describe("HydraCluster API", func() {
 	})
 
 	Context("controlPlaneEndpoint", func() {
-		// Hydra creates no load balancer or VIP, so nothing will ever fill this
-		// in later. Admitting a cluster without it means reporting infrastructure
-		// provisioned while Cluster API has no endpoint to copy and kubeadm has
-		// nowhere to join.
+		// Off a managed network Hydra creates no load balancer or VIP and owns no
+		// addressing, so nothing will ever fill this in later. Admitting a cluster
+		// without it means reporting infrastructure provisioned while Cluster API
+		// has no endpoint to copy and kubeadm has nowhere to join.
 		It("rejects an object with no endpoint at all", func() {
 			err := k8sClient.Create(ctx, newHydraCluster(func(hc *infrav1.HydraCluster) {
 				hc.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{}
@@ -96,6 +96,73 @@ var _ = Describe("HydraCluster API", func() {
 
 			hc.Spec.ControlPlaneEndpoint.Host = linkOtherIP
 			Expect(k8sClient.Update(ctx, hc)).NotTo(Succeed())
+		})
+
+		// On a managed network Hydra owns the DHCP range, so it can choose the
+		// address itself (PET-42). The rules have to let the host be left out,
+		// let the controller write it in, and then hold it there.
+		Context("on a managed network", func() {
+			managed := func(endpoint clusterv1.APIEndpoint) func(*infrav1.HydraCluster) {
+				return func(hc *infrav1.HydraCluster) {
+					hc.Spec.ControlPlaneEndpoint = endpoint
+					hc.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
+						Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
+					}
+				}
+			}
+
+			It("may be left out for Hydra to choose", func() {
+				Expect(k8sClient.Create(ctx, newHydraCluster(managed(clusterv1.APIEndpoint{})))).To(Succeed())
+			})
+
+			It("may state just a port", func() {
+				Expect(k8sClient.Create(ctx, newHydraCluster(managed(clusterv1.APIEndpoint{Port: 7443})))).To(Succeed())
+			})
+
+			It("still refuses a host with no port", func() {
+				err := k8sClient.Create(ctx, newHydraCluster(managed(clusterv1.APIEndpoint{Host: testStatedHost})))
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("a controlPlaneEndpoint host needs a non-zero port"))
+			})
+
+			It("admits the controller recording the chosen address, then holds it", func() {
+				hc := newHydraCluster(managed(clusterv1.APIEndpoint{}))
+				Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+				hc.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: testDerivedHost, Port: 6443}
+				Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+
+				// Immutability applies to the recorded value, so a later change to
+				// how the address is chosen cannot move this cluster's API.
+				hc.Spec.ControlPlaneEndpoint.Host = "192.168.60.3"
+				err := k8sClient.Update(ctx, hc)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("controlPlaneEndpoint.host is immutable"))
+			})
+
+			It("keeps a stated port while the host is filled in", func() {
+				hc := newHydraCluster(managed(clusterv1.APIEndpoint{Port: 7443}))
+				Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+				hc.Spec.ControlPlaneEndpoint.Host = testDerivedHost
+				Expect(k8sClient.Update(ctx, hc)).To(Succeed())
+
+				hc.Spec.ControlPlaneEndpoint.Port = 6443
+				Expect(k8sClient.Update(ctx, hc)).NotTo(Succeed())
+			})
+
+			It("cannot be removed once recorded, so it cannot be chosen again", func() {
+				// The field-level rules do not run when the whole field disappears,
+				// and leaving it out is otherwise legal here. Without the spec-level
+				// rule a cleared endpoint would simply be derived afresh.
+				hc := newHydraCluster(managed(clusterv1.APIEndpoint{Host: testDerivedHost, Port: 6443}))
+				Expect(k8sClient.Create(ctx, hc)).To(Succeed())
+
+				hc.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{}
+				err := k8sClient.Update(ctx, hc)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("controlPlaneEndpoint cannot be removed once set"))
+			})
 		})
 	})
 
