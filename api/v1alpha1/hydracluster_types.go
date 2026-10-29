@@ -56,16 +56,23 @@ type HydraClusterSpec struct {
 	// so it is what gets recorded here instead -- checked the same way -- and
 	// nothing is recorded until the owning Cluster is known.
 	//
+	// Leave it out only on a network this cluster has to itself, as one Hydra
+	// creates for it is. The choice depends on the declaration alone, so a
+	// network shared with another cluster, or an existing one with static
+	// addresses outside its DHCP range, can be handed an address that is
+	// already in use -- and two clusters declaring the same network get the
+	// same one. State the endpoint on those.
+	//
 	// Immutable once set, whoever set it: recording the derived address is what
 	// keeps a live cluster on it if the way it is chosen ever changes. Nor can it
 	// be removed. Moving a live cluster's API endpoint is not something a
 	// reconcile can carry out; it is a new cluster.
 	//
 	// Required in practice off a managed network, and enforced by rules on the
-	// spec rather than by +required on this field. The contract types make host
-	// and port individually optional and the struct itself omitempty, so
-	// +required would still admit {host: "x"} with no port -- an endpoint that
-	// satisfies the schema and cannot be dialled. Reporting infrastructure
+	// spec rather than by marking this field required. The contract types make
+	// host and port individually optional and the struct itself omitempty, so a
+	// required marker would still admit {host: "x"} with no port -- an endpoint
+	// that satisfies the schema and cannot be dialled. Reporting infrastructure
 	// provisioned with no usable endpoint leaves Cluster API with nothing to copy
 	// and kubeadm with nowhere to join.
 	//

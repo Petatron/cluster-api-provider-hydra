@@ -44,11 +44,16 @@
 #     dhcpEnd: 192.168.60.200
 #
 # and leave controlPlaneEndpoint out: it becomes 192.168.60.2:6443, recorded on
-# the HydraCluster before Cluster API reads it. The VIP then lives on the managed
-# network's interface, the machine's second NIC, so kube-vip's `vip_interface`
-# becomes enp2s0 while --node-ip keeps reading enp1s0, the site network the Node
-# registers on. A managed network is local to its hypervisor: the endpoint is
-# reachable from that host, and from elsewhere only through it.
+# the HydraCluster before Cluster API reads it. Only do that on a network the
+# cluster has to itself, as one Hydra creates for it is: the choice depends on
+# the declaration alone, so two clusters declaring one network would get one
+# address, and an adopted network may already use it.
+#
+# The VIP then lives on the managed network's interface, the machine's second
+# NIC, so kube-vip's `vip_interface` becomes enp2s0 while --node-ip keeps
+# reading enp1s0, the site network the Node registers on. A managed network is
+# local to its hypervisor: the endpoint is reachable from that host, and from
+# elsewhere only through it.
 #
 # The CNI is not here. After the first control-plane node registers it stays
 # NotReady until one is installed; this cluster used:
@@ -336,16 +341,22 @@ spec:
       # chose on a managed network just the same. If no endpoint is found this
       # stops cloud-init before kubeadm, which would otherwise wait on a VIP
       # nobody claims; the reason is in /var/log/cloud-init-output.log.
+      # Handles an IPv4 address or a DNS name, quoted or not. An IPv6 endpoint
+      # loses its brackets here, but would also need vip_cidr 128 above.
       - |
         if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
           for f in /run/kubeadm/kubeadm.yaml /run/kubeadm/kubeadm-join-config.yaml; do
-            [ -f "$f" ] && ENDPOINT=$(awk '$1 == "controlPlaneEndpoint:" || $1 == "apiServerEndpoint:" { gsub(/"/, "", $2); print $2; exit }' "$f")
+            [ -z "${ENDPOINT:-}" ] && [ -f "$f" ] &&
+              ENDPOINT=$(awk '$1 == "controlPlaneEndpoint:" || $1 == "apiServerEndpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' "$f")
           done
           case "${ENDPOINT:-}" in
             ?*:?*) ;;
             *) echo "kube-vip: no control-plane endpoint in /run/kubeadm" >&2; exit 1 ;;
           esac
-          sed -i -e "s/@CONTROL_PLANE_HOST@/${ENDPOINT%:*}/" -e "s/@CONTROL_PLANE_PORT@/${ENDPOINT##*:}/" \
+          HOST=${ENDPOINT%:*}
+          HOST=${HOST#\[}
+          HOST=${HOST%\]}
+          sed -i -e "s/@CONTROL_PLANE_HOST@/$HOST/" -e "s/@CONTROL_PLANE_PORT@/${ENDPOINT##*:}/" \
             /etc/kubernetes/manifests/kube-vip.yaml
         fi
       # kubeadm 1.29+ writes an admin.conf that is NOT cluster-admin, and creates

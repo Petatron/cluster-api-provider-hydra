@@ -87,9 +87,11 @@ neither, so on a site network it only reports back what it is told. On a
 `managedNetwork` the host may be left out: Hydra owns that network's DHCP range,
 so it chooses the first address outside the range that is not the network,
 gateway or broadcast address, and records it on the spec before reporting the
-infrastructure provisioned. Immutable once set, whoever set it, and it cannot be
-removed: moving a live cluster's API endpoint is not something a reconcile can
-carry out.
+infrastructure provisioned. That choice assumes the network is this cluster's
+alone, as one Hydra creates for it is; on a network shared with another cluster,
+or an adopted one with static addresses outside its range, state the endpoint.
+Immutable once set, whoever set it, and it cannot be removed: moving a live
+cluster's API endpoint is not something a reconcile can carry out.
 
 Its controller **verifies what it does not own, and creates only what the cluster
 asked it to own**. The storage pool and the base image were there before it

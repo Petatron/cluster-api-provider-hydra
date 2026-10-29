@@ -619,6 +619,14 @@ func (r *HydraClusterReconciler) recordDerivedEndpoint(ctx context.Context, hydr
 //
 // The first such address rather than any: an operator reading the spec can see
 // why it was chosen, and the same network gives the same answer every time.
+//
+// Which is also its limit. It is a function of the declaration alone, so the
+// address is only known to be free on a network this cluster has to itself --
+// the one Hydra creates for it. Naming an existing network adopts it instead,
+// and on a network another cluster or an operator also uses, the same address
+// may already be someone's: two clusters declaring one network get one VIP.
+// Hydra cannot yet tell a network it created from one it adopted (PET-41), so
+// the field documentation asks for a stated endpoint on a shared network.
 func deriveEndpointHost(n *infrav1.HydraManagedNetwork) (string, error) {
 	gateway, subnet, err := managedNetworkGateway(n.Subnet)
 	if err != nil {
@@ -634,7 +642,7 @@ func deriveEndpointHost(n *infrav1.HydraManagedNetwork) (string, error) {
 		candidate = nextIPv4(end)
 	}
 	if candidate == nil || !subnet.Contains(candidate) || bytes.Compare(candidate, broadcastOf(subnet)) >= 0 {
-		return "", fmt.Errorf("%w: managedNetwork.subnet %s has no address left for the control-plane endpoint: everything outside the DHCP range %s-%s is the network, gateway or broadcast address; narrow the range to leave one",
+		return "", fmt.Errorf("%w: managedNetwork.subnet %s has no address left for the control-plane endpoint: everything outside the DHCP range %s-%s is the network, gateway or broadcast address; managedNetwork cannot change, so recreate the cluster with a narrower DHCP range to leave one",
 			providers.ErrTerminal, n.Subnet, n.DHCPStart, n.DHCPEnd)
 	}
 	return candidate.String(), nil
