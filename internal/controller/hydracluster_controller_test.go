@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
@@ -220,7 +222,7 @@ var _ = Describe("HydraCluster Reconciler", func() {
 
 		It("hands the declared managed network to the backend", func() {
 			hc = hydraCluster(func(c *infrav1.HydraCluster) {
-				c.Spec.ControlPlaneEndpoint.Host = "192.168.60.10"
+				c.Spec.ControlPlaneEndpoint.Host = testStatedHost
 				c.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
 					Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
 				}
@@ -233,6 +235,208 @@ var _ = Describe("HydraCluster Reconciler", func() {
 			Expect(provider.LastInfrastructure.ManagedNetwork).To(Equal(&providers.ManagedNetwork{
 				Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
 			}))
+			Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Host: testStatedHost, Port: 6443}),
+				"a stated endpoint is never replaced by a derived one")
+		})
+
+		// PET-42: on a managed network the endpoint may be left for Hydra to choose.
+		Context("choosing the endpoint on a managed network", func() {
+			onManagedNetwork := func(endpoint clusterv1.APIEndpoint, subnet, start, end string) {
+				hc = hydraCluster(func(c *infrav1.HydraCluster) {
+					c.Spec.ControlPlaneEndpoint = endpoint
+					c.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
+						Name: testNetName, Subnet: subnet, DHCPStart: start, DHCPEnd: end,
+					}
+				})
+				key = client.ObjectKeyFromObject(hc)
+			}
+
+			It("records the first usable address outside the range, with port 6443, before reporting provisioned", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				r := build(owningCluster(nil))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+
+				out := reload(r)
+				Expect(out.Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Host: testDerivedHost, Port: 6443}))
+				// Cluster API copies the endpoint only once provisioned is true, so
+				// both must be there after the same pass.
+				Expect(*out.Status.Initialization.Provisioned).To(BeTrue())
+				Expect(provider.InfrastructureChecks).To(Equal(1))
+			})
+
+			It("keeps a port that was stated", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{Port: 7443}, testSubnet, testDHCPStart, testDHCPEnd)
+				r := build(owningCluster(nil))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Host: testDerivedHost, Port: 7443}))
+			})
+
+			// buildWith is build with an interceptor on the client, for the specs
+			// that count or fail the spec write. Status writes go through
+			// SubResourcePatch, so Funcs.Patch sees the spec write alone.
+			buildWith := func(funcs interceptor.Funcs, objs ...client.Object) *HydraClusterReconciler {
+				s := linkScheme()
+				c := fakeclient.NewClientBuilder().
+					WithScheme(s).
+					WithObjects(append([]client.Object{hc}, objs...)...).
+					WithStatusSubresource(&infrav1.HydraCluster{}).
+					WithInterceptorFuncs(funcs).
+					Build()
+				return &HydraClusterReconciler{Client: c, Scheme: s, Provider: provider}
+			}
+
+			It("writes the spec once, then keeps the recorded address on later passes", func() {
+				// Counted, not inferred from metadata.generation: the fake client does
+				// not maintain generation, so an assertion on it could never fail.
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				writes := 0
+				r := buildWith(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.(*infrav1.HydraCluster); ok {
+							writes++
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				}, owningCluster(nil))
+
+				for range 3 {
+					_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+					Expect(err).NotTo(HaveOccurred())
+				}
+				Expect(writes).To(Equal(1))
+				Expect(reload(r).Spec.ControlPlaneEndpoint.Host).To(Equal(testDerivedHost))
+			})
+
+			It("retries a write that conflicts, reporting nothing until it lands", func() {
+				// The optimistic lock is what stops a stale copy overwriting an
+				// endpoint someone stated meanwhile. Its refusal is not a failure.
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				refused := false
+				r := buildWith(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.(*infrav1.HydraCluster); ok && !refused {
+							refused = true
+							return apierrors.NewConflict(infrav1.GroupVersion.WithResource("hydraclusters").GroupResource(), obj.GetName(), errors.New("the object has been modified"))
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				}, owningCluster(nil))
+
+				res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.RequeueAfter).To(Equal(requeueAfterConflict))
+				Expect(provider.InfrastructureChecks).To(BeZero())
+				out := reload(r)
+				Expect(out.Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+				Expect(out.Status.Conditions).To(BeEmpty(), "a conflict is retried, not reported")
+
+				_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Host: testDerivedHost, Port: 6443}))
+			})
+
+			It("returns any other error writing the endpoint, recording nothing", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				r := buildWith(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.(*infrav1.HydraCluster); ok {
+							return errors.New("etcdserver: request timed out")
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+				}, owningCluster(nil))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).To(MatchError(ContainSubstring("recording the control-plane endpoint 192.168.60.2:6443")))
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+			})
+
+			It("refuses a network with no address left, without recording anything or asking the backend", func() {
+				// A /29: .0 network, .1 gateway, .7 broadcast, and .2-.6 all handed out.
+				onManagedNetwork(clusterv1.APIEndpoint{}, "192.168.60.0/29", testDerivedHost, "192.168.60.6")
+				r := build(owningCluster(nil))
+
+				res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.RequeueAfter).To(Equal(requeueClusterUnverified))
+				Expect(provider.InfrastructureChecks).To(BeZero())
+
+				out := reload(r)
+				Expect(out.Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+				Expect(*out.Status.Initialization.Provisioned).To(BeFalse())
+				failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
+				Expect(failed).NotTo(BeNil())
+				Expect(failed.Message).To(ContainSubstring("no address left for the control-plane endpoint"))
+			})
+
+			It("chooses nothing while the cluster is paused", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				paused := true
+				r := build(owningCluster(func(c *clusterv1.Cluster) { c.Spec.Paused = &paused }))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+			})
+
+			// Cluster API uses an endpoint stated on the Cluster instead of copying
+			// this one. Choosing a different address here would record, for good,
+			// an endpoint the cluster does not have.
+			It("records the endpoint the Cluster states instead of choosing one", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				stated := clusterv1.APIEndpoint{Host: "192.168.60.20", Port: 6443}
+				r := build(owningCluster(func(c *clusterv1.Cluster) { c.Spec.ControlPlaneEndpoint = stated }))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(stated))
+			})
+
+			It("refuses an endpoint the Cluster states inside the range, recording nothing", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				r := build(owningCluster(func(c *clusterv1.Cluster) {
+					c.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: "192.168.60.150", Port: 6443}
+				}))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+				failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
+				Expect(failed).NotTo(BeNil())
+				Expect(failed.Message).To(ContainSubstring("DHCP range"))
+			})
+
+			It("refuses a port that disagrees with the Cluster's endpoint", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{Port: 7443}, testSubnet, testDHCPStart, testDHCPEnd)
+				r := build(owningCluster(func(c *clusterv1.Cluster) {
+					c.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: "192.168.60.20", Port: 6443}
+				}))
+
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Port: 7443}))
+				Expect(condition(r, infrav1.ClusterInfrastructureFailedCondition).Message).To(ContainSubstring("states port 7443"))
+			})
+
+			It("records nothing until it knows its owning Cluster", func() {
+				onManagedNetwork(clusterv1.APIEndpoint{}, testSubnet, testDHCPStart, testDHCPEnd)
+				hc.OwnerReferences = nil
+				r := build()
+
+				res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.RequeueAfter).To(Equal(requeueClusterUnverified))
+				Expect(provider.InfrastructureChecks).To(BeZero())
+				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+				ready := condition(r, infrav1.ClusterReadyCondition)
+				Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				Expect(ready.Message).To(ContainSubstring("waiting for the owning Cluster"))
+				Expect(condition(r, infrav1.ClusterInfrastructureFailedCondition)).To(BeNil(), "waiting is not a failure")
+			})
 		})
 
 		It("refuses an endpoint the managed network would hand out, before asking the backend", func() {
@@ -476,7 +680,7 @@ var _ = Describe("managed network endpoint invariant", func() {
 	}
 
 	It("accepts an endpoint below the range", func() {
-		Expect(validateEndpointAgainstManagedNetwork(with("192.168.60.10", net(nil)))).To(Succeed())
+		Expect(validateEndpointAgainstManagedNetwork(with(testStatedHost, net(nil)))).To(Succeed())
 	})
 
 	It("accepts an endpoint above the range", func() {
@@ -535,5 +739,67 @@ var _ = Describe("managed network endpoint invariant", func() {
 
 	It("is inert when no managed network is declared", func() {
 		Expect(validateEndpointAgainstManagedNetwork(with("192.168.15.10", nil))).To(Succeed())
+	})
+})
+
+var _ = Describe("choosing a managed network's endpoint", func() {
+	// The inverse of the invariant above: the first address it would accept.
+	network := func(subnet, start, end string) *infrav1.HydraManagedNetwork {
+		return &infrav1.HydraManagedNetwork{Name: testNetName, Subnet: subnet, DHCPStart: start, DHCPEnd: end}
+	}
+
+	DescribeTable("picks the first usable address outside the DHCP range",
+		func(n *infrav1.HydraManagedNetwork, want string) {
+			got, err := deriveEndpointHost(n)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(want))
+			// Whatever it picks, the check every stated endpoint gets must pass.
+			hc := &infrav1.HydraCluster{}
+			hc.Spec.ManagedNetwork = n
+			hc.Spec.ControlPlaneEndpoint = clusterv1.APIEndpoint{Host: got, Port: defaultAPIServerPort}
+			Expect(validateEndpointAgainstManagedNetwork(hc)).To(Succeed())
+		},
+		Entry("the ticket's example: .0 network, .1 gateway, so .2",
+			network(testSubnet, testDHCPStart, testDHCPEnd), testDerivedHost),
+		Entry("a range starting at .2 pushes it past the range's end",
+			network(testSubnet, testDerivedHost, "192.168.60.200"), "192.168.60.201"),
+		Entry("a range covering the gateway too",
+			network(testSubnet, "192.168.60.1", "192.168.60.50"), "192.168.60.51"),
+		Entry("a range that ends one short of the broadcast address",
+			network(testSubnet, testDerivedHost, "192.168.60.253"), "192.168.60.254"),
+		Entry("a /30 whose only host is not in the range",
+			network(testSmallNet, "192.168.60.0", "192.168.60.0"), testSmallHost),
+		Entry("a subnet that does not start at .0 of a /24",
+			network("10.20.30.64/26", "10.20.30.100", "10.20.30.120"), "10.20.30.66"),
+	)
+
+	DescribeTable("refuses a network with no address left",
+		func(n *infrav1.HydraManagedNetwork) {
+			_, err := deriveEndpointHost(n)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "the network is immutable, so waiting cannot help")
+			Expect(err.Error()).To(ContainSubstring("no address left"))
+		},
+		Entry("a range covering every host after the gateway",
+			network(testSubnet, testDerivedHost, "192.168.60.254")),
+		Entry("a /30 whose only host is in the range",
+			network(testSmallNet, testSmallHost, testSmallHost)),
+	)
+
+	It("refuses DHCP bounds that are not addresses", func() {
+		_, err := deriveEndpointHost(network(testSubnet, "not-an-address", testDHCPEnd))
+		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue())
+	})
+
+	// Recorded rather than fixed: the choice depends on the declaration alone,
+	// so two clusters declaring the same network get the same address. The field
+	// documentation asks for a stated endpoint on a shared or adopted network
+	// for exactly this reason; Hydra cannot tell those apart yet (PET-41).
+	It("gives the same address to every cluster declaring the same network", func() {
+		first, err := deriveEndpointHost(network(testSubnet, testDHCPStart, testDHCPEnd))
+		Expect(err).NotTo(HaveOccurred())
+		second, err := deriveEndpointHost(network(testSubnet, testDHCPStart, testDHCPEnd))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(second).To(Equal(first))
 	})
 })

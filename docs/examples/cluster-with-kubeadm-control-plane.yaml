@@ -16,20 +16,44 @@
 #   networks / storagePool      the bridge and libvirt pool on your hypervisor
 #   baseImage.name              a cloud image present in that pool
 #
-# TWO VALUES ARE STATED TWICE, and nothing checks that the copies agree:
-#   the endpoint address   controlPlaneEndpoint.host  ==  kube-vip `address`
-#                          controlPlaneEndpoint.port  ==  kube-vip `port`
+# THE ENDPOINT IS STATED ONCE, on the HydraCluster. kube-vip is not told it
+# here: each control-plane node reads it at boot from the kubeadm config CABPK
+# writes, so the address kube-vip claims cannot drift from the one the cluster
+# uses (PET-42). One value is still stated twice, and nothing checks the copies
+# agree:
 #   the guest NIC name     kube-vip `vip_interface`   ==  the interface the
 #                          --node-ip command reads (enp1s0 for virtio)
-# Change one copy and not the other and the cluster fails in a way that points
+# Change one and not the other and the cluster fails in a way that points
 # nowhere near the edit. Both sites are marked inline.
 #
-# CHOOSING THE ENDPOINT ADDRESS. It must be outside the DHCP range, and that has
-# to be confirmed against the DHCP server rather than inferred. Guessing from
-# observed leases is not sound: the addresses a server has handed out say
-# nothing about the bounds of its pool, because many servers allocate by hashing
-# the client ID rather than counting up from the start. controlPlaneEndpoint is
-# immutable, so getting this wrong means rebuilding the cluster.
+# CHOOSING THE ENDPOINT ADDRESS. On a site network, as here, it must be outside
+# the DHCP range, and that has to be confirmed against the DHCP server rather
+# than inferred. Guessing from observed leases is not sound: the addresses a
+# server has handed out say nothing about the bounds of its pool, because many
+# servers allocate by hashing the client ID rather than counting up from the
+# start. controlPlaneEndpoint is immutable, so getting this wrong means
+# rebuilding the cluster.
+#
+# On a managed network Hydra owns the range and can choose the address itself.
+# Instead of the endpoint below, declare
+#
+#   managedNetwork:
+#     name: hydra-wl0
+#     subnet: 192.168.60.0/24
+#     dhcpStart: 192.168.60.100
+#     dhcpEnd: 192.168.60.200
+#
+# and leave controlPlaneEndpoint out: it becomes 192.168.60.2:6443, recorded on
+# the HydraCluster before Cluster API reads it. Only do that on a network the
+# cluster has to itself, as one Hydra creates for it is: the choice depends on
+# the declaration alone, so two clusters declaring one network would get one
+# address, and an adopted network may already use it.
+#
+# The VIP then lives on the managed network's interface, the machine's second
+# NIC, so kube-vip's `vip_interface` becomes enp2s0 while --node-ip keeps
+# reading enp1s0, the site network the Node registers on. A managed network is
+# local to its hypervisor: the endpoint is reachable from that host, and from
+# elsewhere only through it.
 #
 # The CNI is not here. After the first control-plane node registers it stays
 # NotReady until one is installed; this cluster used:
@@ -46,14 +70,12 @@ metadata:
 spec:
   controlPlaneEndpoint:
     # Held by kube-vip on whichever control-plane node is leader, so it stays
-    # valid as replicas go 1 -> 3.
-    #
-    # MUST equal kube-vip's `address` env below, and this port MUST equal its
-    # `port`. Nothing validates that they agree: change one and the endpoint
-    # simply stops working, with no error pointing at the cause.
+    # valid as replicas go 1 -> 3. kube-vip reads this value at boot; it is not
+    # repeated below.
     #
     # The address must be outside the DHCP range -- confirmed against the DHCP
-    # server's configuration, not guessed. See the header.
+    # server's configuration, not guessed. See the header, which also shows the
+    # managed-network form that leaves it to Hydra.
     host: 192.168.15.10
     port: 6443
   storagePool: k8s-workers
@@ -214,8 +236,10 @@ spec:
                 env:
                   - name: vip_arp
                     value: "true"
+                  # Filled in at boot from the cluster's endpoint, like
+                  # `address` below.
                   - name: port
-                    value: "6443"
+                    value: "@CONTROL_PLANE_PORT@"
                   - name: vip_interface
                     value: "enp1s0"
                   - name: vip_cidr
@@ -240,11 +264,12 @@ spec:
                     value: "3"
                   - name: vip_retryperiod
                     value: "1"
-                  # MUST equal HydraCluster.spec.controlPlaneEndpoint.host
-                  # above. This is the pair that actually claims the address;
-                  # the HydraCluster field only states where the API will be.
+                  # The address this node claims when it leads. Filled in at boot
+                  # from the cluster's endpoint by preKubeadmCommands below, so
+                  # it is the HydraCluster's value whether that was stated or
+                  # chosen by Hydra.
                   - name: address
-                    value: "192.168.15.10"
+                    value: "@CONTROL_PLANE_HOST@"
                 securityContext:
                   capabilities:
                     add: ["NET_ADMIN", "NET_RAW", "SYS_TIME"]
@@ -308,6 +333,32 @@ spec:
       # this the unit stays disabled -- kubeadm never enables it -- and a node that
       # reboots, for a kernel update or a host restart, never rejoins (PET-56).
       - systemctl enable kubelet
+      # Give kube-vip the cluster's endpoint. CABPK has written it into kubeadm's
+      # own config by the time these commands run -- controlPlaneEndpoint for
+      # the first control plane, apiServerEndpoint for each one that joins -- so
+      # it is read from there rather than stated a second time in the manifest,
+      # where nothing would check the two agree. It covers an endpoint Hydra
+      # chose on a managed network just the same. If no endpoint is found this
+      # stops cloud-init before kubeadm, which would otherwise wait on a VIP
+      # nobody claims; the reason is in /var/log/cloud-init-output.log.
+      # Handles an IPv4 address or a DNS name, quoted or not. An IPv6 endpoint
+      # loses its brackets here, but would also need vip_cidr 128 above.
+      - |
+        if [ -f /etc/kubernetes/manifests/kube-vip.yaml ]; then
+          for f in /run/kubeadm/kubeadm.yaml /run/kubeadm/kubeadm-join-config.yaml; do
+            [ -z "${ENDPOINT:-}" ] && [ -f "$f" ] &&
+              ENDPOINT=$(awk '$1 == "controlPlaneEndpoint:" || $1 == "apiServerEndpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' "$f")
+          done
+          case "${ENDPOINT:-}" in
+            ?*:?*) ;;
+            *) echo "kube-vip: no control-plane endpoint in /run/kubeadm" >&2; exit 1 ;;
+          esac
+          HOST=${ENDPOINT%:*}
+          HOST=${HOST#\[}
+          HOST=${HOST%\]}
+          sed -i -e "s/@CONTROL_PLANE_HOST@/$HOST/" -e "s/@CONTROL_PLANE_PORT@/${ENDPOINT##*:}/" \
+            /etc/kubernetes/manifests/kube-vip.yaml
+        fi
       # kubeadm 1.29+ writes an admin.conf that is NOT cluster-admin, and creates
       # super-admin.conf for that. kube-vip pointed at admin.conf cannot reach the
       # API during init, so `kubeadm init` waits for a control plane that cannot

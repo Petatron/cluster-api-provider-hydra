@@ -19,8 +19,10 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -192,6 +194,22 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{RequeueAfter: requeueClusterHealthy}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// A managed network's endpoint is chosen and recorded first, so that it is
+	// validated below like one that was stated, and is on the spec before
+	// provisioned is reported -- Cluster API copies it only after that.
+	conflicted, err := r.recordDerivedEndpoint(ctx, hydraCluster, cluster)
+	switch {
+	case errors.Is(err, providers.ErrTerminal), errors.Is(err, errEndpointPending):
+		if statusErr := r.recordUnverified(ctx, hydraCluster, err); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: requeueClusterUnverified}, nil
+	case err != nil:
+		return ctrl.Result{}, err
+	case conflicted:
+		return ctrl.Result{RequeueAfter: requeueAfterConflict}, nil
 	}
 
 	// Before the backend is asked for anything. This is a property of the
@@ -517,6 +535,127 @@ func broadcastOf(subnet *net.IPNet) net.IP {
 	for i := range out {
 		out[i] = ip[i] | ^mask[i]
 	}
+	return out
+}
+
+// defaultAPIServerPort is the port a derived endpoint gets when none was
+// stated: kubeadm's default, and the one every example here uses.
+const defaultAPIServerPort = 6443
+
+// errEndpointPending reports that a managed network's endpoint cannot be chosen
+// yet, because the Cluster that might state it is not known.
+var errEndpointPending = errors.New("waiting for the owning Cluster before choosing the control-plane endpoint")
+
+// recordDerivedEndpoint fills in a managed network's control-plane endpoint when
+// the spec leaves the host out, and records it on the spec (PET-42).
+//
+// Recorded, not merely used. Cluster API copies the endpoint out of this object
+// and kubeadm is handed the same value, so an address derived on every pass but
+// never written down would leave nothing holding the two together. Once it is
+// on the spec the immutability rules hold a live cluster on it, whatever later
+// versions of the derivation would choose.
+//
+// The owning Cluster is consulted first. Its own endpoint may be stated
+// instead, and Cluster API then uses that one rather than copying this; choosing
+// a different address here would record, permanently, an endpoint the cluster
+// does not have. So that value is recorded when there is one, and nothing is
+// recorded until the owner is known (errEndpointPending). Either way the value
+// must pass the check every stated endpoint gets before it is written.
+//
+// It returns true when another write got there first; the next pass reads the
+// object afresh. An error wrapping ErrTerminal is an endpoint that cannot work.
+func (r *HydraClusterReconciler) recordDerivedEndpoint(ctx context.Context, hydraCluster *infrav1.HydraCluster, cluster *clusterv1.Cluster) (bool, error) {
+	n := hydraCluster.Spec.ManagedNetwork
+	if n == nil || hydraCluster.Spec.ControlPlaneEndpoint.Host != "" {
+		return false, nil
+	}
+	if cluster == nil {
+		return false, errEndpointPending
+	}
+
+	endpoint := cluster.Spec.ControlPlaneEndpoint
+	stated := hydraCluster.Spec.ControlPlaneEndpoint.Port
+	switch {
+	case endpoint.IsValid() && stated != 0 && stated != endpoint.Port:
+		return false, fmt.Errorf("%w: Cluster %s states controlPlaneEndpoint %s, but this HydraCluster states port %d",
+			providers.ErrTerminal, cluster.Name, endpoint.String(), stated)
+	case !endpoint.IsValid():
+		host, err := deriveEndpointHost(n)
+		if err != nil {
+			return false, err
+		}
+		endpoint = clusterv1.APIEndpoint{Host: host, Port: stated}
+		if endpoint.Port == 0 {
+			endpoint.Port = defaultAPIServerPort
+		}
+	}
+	candidate := hydraCluster.DeepCopy()
+	candidate.Spec.ControlPlaneEndpoint = endpoint
+	if err := validateEndpointAgainstManagedNetwork(candidate); err != nil {
+		return false, err
+	}
+
+	// Optimistic, so a stale copy cannot overwrite an endpoint someone stated
+	// while this was deciding.
+	patch := client.MergeFromWithOptions(hydraCluster.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	hydraCluster.Spec.ControlPlaneEndpoint = endpoint
+	if err := r.Patch(ctx, hydraCluster, patch); err != nil {
+		if apierrors.IsConflict(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("recording the control-plane endpoint %s: %w", endpoint.String(), err)
+	}
+	logf.FromContext(ctx).Info("Recorded control-plane endpoint for managed network", "name", hydraCluster.Name,
+		"endpoint", endpoint.String(), "statedOnCluster", cluster.Spec.ControlPlaneEndpoint.IsValid())
+	return false, nil
+}
+
+// deriveEndpointHost returns the first address of a managed network that can
+// carry the control-plane endpoint: not the network address, not the gateway
+// libvirt puts on the first host address, not the broadcast address, and not
+// inside the DHCP range. It is the inverse of
+// validateEndpointAgainstManagedNetwork, which the reconciler runs on the
+// result anyway.
+//
+// The first such address rather than any: an operator reading the spec can see
+// why it was chosen, and the same network gives the same answer every time.
+//
+// Which is also its limit. It is a function of the declaration alone, so the
+// address is only known to be free on a network this cluster has to itself --
+// the one Hydra creates for it. Naming an existing network adopts it instead,
+// and on a network another cluster or an operator also uses, the same address
+// may already be someone's: two clusters declaring one network get one VIP.
+// Hydra cannot yet tell a network it created from one it adopted (PET-41), so
+// the field documentation asks for a stated endpoint on a shared network.
+func deriveEndpointHost(n *infrav1.HydraManagedNetwork) (string, error) {
+	gateway, subnet, err := managedNetworkGateway(n.Subnet)
+	if err != nil {
+		return "", err
+	}
+	start, end := net.ParseIP(n.DHCPStart).To4(), net.ParseIP(n.DHCPEnd).To4()
+	if start == nil || end == nil {
+		return "", fmt.Errorf("%w: managedNetwork DHCP bounds %q-%q are not both addresses",
+			providers.ErrTerminal, n.DHCPStart, n.DHCPEnd)
+	}
+	candidate := nextIPv4(gateway)
+	if candidate != nil && bytes.Compare(candidate, start) >= 0 && bytes.Compare(candidate, end) <= 0 {
+		candidate = nextIPv4(end)
+	}
+	if candidate == nil || !subnet.Contains(candidate) || bytes.Compare(candidate, broadcastOf(subnet)) >= 0 {
+		return "", fmt.Errorf("%w: managedNetwork.subnet %s has no address left for the control-plane endpoint: everything outside the DHCP range %s-%s is the network, gateway or broadcast address; managedNetwork cannot change, so recreate the cluster with a narrower DHCP range to leave one",
+			providers.ErrTerminal, n.Subnet, n.DHCPStart, n.DHCPEnd)
+	}
+	return candidate.String(), nil
+}
+
+// nextIPv4 returns the address after ip, or nil after 255.255.255.255.
+func nextIPv4(ip net.IP) net.IP {
+	v := binary.BigEndian.Uint32(ip.To4())
+	if v == math.MaxUint32 {
+		return nil
+	}
+	out := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(out, v+1)
 	return out
 }
 
