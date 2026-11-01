@@ -58,6 +58,11 @@ const (
 	testDHCPEnd   = "192.168.60.200"
 	testSmallNet  = "192.168.60.0/30"
 	testSmallHost = "192.168.60.2"
+	// testStatedHost is an endpoint an operator states on testSubnet, below the
+	// range; testDerivedHost is the one Hydra chooses there when none is stated
+	// (PET-42): .0 is the network and .1 the gateway.
+	testStatedHost  = "192.168.60.10"
+	testDerivedHost = "192.168.60.2"
 )
 
 const (

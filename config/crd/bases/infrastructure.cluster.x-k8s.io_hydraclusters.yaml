@@ -112,17 +112,39 @@ spec:
 
                   Cluster API reads it to populate the Cluster's own endpoint. Providers that
                   create the endpoint themselves -- with a load balancer or a VIP -- are
-                  expected to fill it in. Hydra creates neither, so this is supplied by
-                  whoever writes the object, and the provider only reports it back.
+                  expected to fill it in. Hydra creates neither, so on a site network this is
+                  supplied by whoever writes the object, and the provider only reports it
+                  back.
 
-                  Immutable once set. Moving a live cluster's API endpoint is not something
-                  a reconcile can carry out; it is a new cluster.
+                  On a managedNetwork the host may be left out, and the port with it (6443).
+                  Hydra owns that network's DHCP range, so the address is a computation
+                  rather than a guess: the controller picks the first host address that is
+                  not the network, gateway or broadcast address and is outside the range,
+                  and writes it here before reporting the infrastructure provisioned. A
+                  subnet with no such address is refused rather than given an unusable one.
+                  If the owning Cluster states its own endpoint, Cluster API uses that one,
+                  so it is what gets recorded here instead -- checked the same way -- and
+                  nothing is recorded until the owning Cluster is known.
 
-                  Required in practice, and enforced by a rule on the spec rather than by
-                  optional and the struct itself omitempty, so +required would still admit
-                  {host: "x"} with port 0 -- an endpoint that satisfies the schema and cannot
-                  be dialled. Reporting infrastructure provisioned with no usable endpoint
-                  leaves Cluster API with nothing to copy and kubeadm with nowhere to join.
+                  Leave it out only on a network this cluster has to itself, as one Hydra
+                  creates for it is. The choice depends on the declaration alone, so a
+                  network shared with another cluster, or an existing one with static
+                  addresses outside its DHCP range, can be handed an address that is
+                  already in use -- and two clusters declaring the same network get the
+                  same one. State the endpoint on those.
+
+                  Immutable once set, whoever set it: recording the derived address is what
+                  keeps a live cluster on it if the way it is chosen ever changes. Nor can it
+                  be removed. Moving a live cluster's API endpoint is not something a
+                  reconcile can carry out; it is a new cluster.
+
+                  Required in practice off a managed network, and enforced by rules on the
+                  spec rather than by marking this field required. The contract types make
+                  host and port individually optional and the struct itself omitempty, so a
+                  required marker would still admit {host: "x"} with no port -- an endpoint
+                  that satisfies the schema and cannot be dialled. Reporting infrastructure
+                  provisioned with no usable endpoint leaves Cluster API with nothing to copy
+                  and kubeadm with nowhere to join.
 
                   NOTE: this field is part of the Cluster API contract.
                 minProperties: 1
@@ -215,7 +237,8 @@ spec:
 
                   Declaring one here makes the answer structural. Hydra sets the DHCP range,
                   so which addresses can be handed to a machine is known rather than guessed
-                  at from someone else's router.
+                  at from someone else's router -- and so controlPlaneEndpoint.host may be
+                  left out for Hydra to choose.
 
                   "Outside the range" is not the same as "usable", and the difference has
                   bitten before. The network address, the broadcast address and the gateway
@@ -347,9 +370,17 @@ spec:
                 type: string
             type: object
             x-kubernetes-validations:
-            - message: controlPlaneEndpoint requires both a host and a non-zero port
-              rule: has(self.controlPlaneEndpoint) && size(self.controlPlaneEndpoint.host)
-                > 0 && self.controlPlaneEndpoint.port > 0
+            - message: controlPlaneEndpoint requires both a host and a non-zero port;
+                only a cluster with a managedNetwork may leave the host for Hydra
+                to choose
+              rule: has(self.managedNetwork) || (has(self.controlPlaneEndpoint) &&
+                has(self.controlPlaneEndpoint.host) && has(self.controlPlaneEndpoint.port))
+            - message: a controlPlaneEndpoint host needs a non-zero port
+              rule: '!has(self.controlPlaneEndpoint) || !has(self.controlPlaneEndpoint.host)
+                || has(self.controlPlaneEndpoint.port)'
+            - message: controlPlaneEndpoint cannot be removed once set; it is the
+                cluster's recorded API address
+              rule: '!has(oldSelf.controlPlaneEndpoint) || has(self.controlPlaneEndpoint)'
             - message: storagePool is fixed when the cluster is created; omitting
                 it selects the manager's pool, which is equally binding
               rule: has(self.storagePool) == has(oldSelf.storagePool) && (!has(self.storagePool)
