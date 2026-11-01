@@ -405,8 +405,11 @@ var _ = Describe("HydraCluster Reconciler", func() {
 				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 				Expect(err).NotTo(HaveOccurred())
 				Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{}))
+				// Still terminal -- InfrastructureFailed is only raised for that --
+				// and it names the Cluster, since this object's field is empty.
 				failed := condition(r, infrav1.ClusterInfrastructureFailedCondition)
 				Expect(failed).NotTo(BeNil())
+				Expect(failed.Message).To(HavePrefix("the owning Cluster " + linkClusterName + " states controlPlaneEndpoint 192.168.60.150:6443"))
 				Expect(failed.Message).To(ContainSubstring("DHCP range"))
 			})
 

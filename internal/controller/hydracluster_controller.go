@@ -592,6 +592,12 @@ func (r *HydraClusterReconciler) recordDerivedEndpoint(ctx context.Context, hydr
 	candidate := hydraCluster.DeepCopy()
 	candidate.Spec.ControlPlaneEndpoint = endpoint
 	if err := validateEndpointAgainstManagedNetwork(candidate); err != nil {
+		// The check speaks of this object's field, which is still empty. Say
+		// where the address came from, so the fix is made on the Cluster.
+		if cluster.Spec.ControlPlaneEndpoint.IsValid() {
+			return false, fmt.Errorf("the owning Cluster %s states controlPlaneEndpoint %s, which this HydraCluster's managedNetwork cannot carry: %w",
+				cluster.Name, endpoint.String(), err)
+		}
 		return false, err
 	}
 
