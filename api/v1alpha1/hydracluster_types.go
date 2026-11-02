@@ -167,6 +167,13 @@ type HydraClusterSpec struct {
 	// Machines receive an interface on this network IN ADDITION to networks
 	// above, not instead of them -- the site network is what gives them internet
 	// access and the address they register as Nodes.
+	//
+	// The network exists only on its hypervisor. The management cluster must
+	// reach the control-plane endpoint on it, so unless the management cluster
+	// runs on that hypervisor, the operator routes the subnet to the hypervisor's
+	// site address and lets the hypervisor's firewall forward the API port.
+	// Without that, the cluster is built but its control plane never initializes,
+	// and Cluster API reports the Cluster's RemoteConnectionProbe as failed.
 	// +optional
 	ManagedNetwork *HydraManagedNetwork `json:"managedNetwork,omitempty"`
 

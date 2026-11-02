@@ -42,10 +42,9 @@ const (
 	diskTypeFile = "file"
 
 	// netForwardOpen is the forward mode Hydra's managed networks must have, on
-	// creation and on adoption alike. See networkXML: the other modes either
-	// block the inbound connections the management cluster makes to a workload
-	// cluster's API server, or need a route back that only the site's own router
-	// can provide.
+	// creation and on adoption alike. See networkXML: the other modes install
+	// filtering that gets in the way of the inbound connections the management
+	// cluster makes to a workload cluster's API server.
 	netForwardOpen = "open"
 )
 
@@ -262,14 +261,23 @@ type netRangeDef struct {
 // A "nat" network is the obvious pick and is wrong here: libvirt installs
 // filtering rules for it that accept only RELATED,ESTABLISHED traffic inbound,
 // so the management cluster's controllers cannot open a connection to a
-// workload cluster's API server on it. "route" allows that but needs the
-// upstream router to know a route back, which is exactly the dependency on
-// someone else's network equipment this whole feature removes.
+// workload cluster's API server on it. "route" admits that traffic, and was
+// passed over for needing an upstream route back -- which, as below, every
+// mode needs once management runs elsewhere. It still adds libvirt's own
+// filtering alongside the host's firewall.
 //
 // "open" installs no filtering rules at all and leaves the host's ordinary
-// forwarding in charge, which is what makes the network reachable inbound
-// without any hand-maintained firewall state. Machines still reach the internet
-// through their site-network interface, so nothing here needs to provide NAT.
+// forwarding and firewall in charge, so there is one set of rules to reason
+// about. Machines still reach the internet through their site-network
+// interface, so nothing here needs to provide NAT.
+//
+// No forward mode makes the network reachable from another host. The subnet
+// exists only on this hypervisor, so a management cluster running anywhere else
+// reaches it only if the operator routes the subnet to this host's site address
+// and the host's firewall forwards the API port. That is a requirement on the
+// operator's network, stated in the README. It was overlooked while every Cluster
+// API controller ran on the hypervisor itself, where the network is directly
+// attached (PET-75).
 func networkXML(spec providers.ManagedNetwork, gateway, netmask string) (string, error) {
 	n := networkDef{
 		Name:    spec.Name,
