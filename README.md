@@ -110,6 +110,25 @@ deliberately: tearing it down safely means knowing whether Hydra created it or
 adopted an operator's, and waiting until no machine still has an interface on it.
 Until ownership is tracked, a leftover bridge is the cheaper mistake.
 
+**A managed network is a routed network, and the route is yours to provide.**
+The network exists only on its hypervisor. Cluster API's controllers must reach
+the cluster's control-plane endpoint on it, so unless the management cluster runs
+on that same hypervisor, you need two things:
+
+- a route for the subnet via the hypervisor's site address, wherever the
+  management cluster and anyone running `kubectl` against the cluster sit.
+  Routing one block that holds every managed subnet on that hypervisor means
+  setting this up once;
+- the hypervisor's firewall forwarding TCP 6443 into that block. With UFW, for
+  example, `ufw route allow proto tcp to 192.168.60.0/22 port 6443`. Replies
+  pass as established traffic.
+
+Hydra cannot do either: both are on your network, not on the hypervisor it
+drives. Without them, the cluster builds and its API server answers from the
+hypervisor, but Cluster API cannot reach it. The control plane never
+initializes, the Cluster's `RemoteConnectionProbe` condition stays `False`, and
+the `HydraClusterAPIUnreachable` alert fires.
+
 Deliberately **not** here: how to reach the hypervisor. That is still a manager
 flag, and moving it onto this object is PET-38, bundled with the switch to TLS.
 It is left out rather than stubbed because a field the provider accepts and

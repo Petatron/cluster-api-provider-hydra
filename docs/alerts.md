@@ -177,6 +177,14 @@ see the cluster's nodes, so node and control-plane alerts for that cluster are
 unreliable. From the management cluster, try the endpoint in the Cluster's
 `spec.controlPlaneEndpoint`.
 
+On a cluster with a `managedNetwork` that has never initialized, the usual
+cause is routing rather than the control plane: the network exists only on its
+hypervisor, so the management cluster reaches it only through a route to the
+hypervisor's site address and a firewall rule there forwarding the API port.
+If the endpoint answers from the hypervisor but not from the management
+cluster, that path is what is missing. The README's `managedNetwork` section
+says what it needs.
+
 ### HydraClusterNotAvailable
 
 **warning, 15m.** Cluster API's summary condition for a Hydra cluster has not

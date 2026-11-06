@@ -53,7 +53,12 @@
 # NIC, so kube-vip's `vip_interface` becomes enp2s0 while --node-ip keeps
 # reading enp1s0, the site network the Node registers on. A managed network is
 # local to its hypervisor: the endpoint is reachable from that host, and from
-# elsewhere only through it.
+# elsewhere only through it. Unless the management cluster runs on that
+# hypervisor, route the subnet (or one block holding every managed subnet on
+# that hypervisor) to the hypervisor's site address wherever the management
+# cluster and kubectl users are, and let the hypervisor's firewall forward TCP
+# 6443 to it. Without that the cluster builds but never initializes: Cluster API
+# cannot reach the endpoint and reports RemoteConnectionProbe as failed.
 #
 # The CNI is not here. After the first control-plane node registers it stays
 # NotReady until one is installed; this cluster used:
