@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -432,6 +433,10 @@ func (r *HydraMachineReconciler) reconcileNormal(ctx context.Context, prov provi
 // ensureMachine returns the machine's current state, creating it if it does not
 // exist yet.
 func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, link *linkage, placement string) (*providers.MachineState, error) {
+	ident, err := identityOf(machine)
+	if err != nil {
+		return nil, err
+	}
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
@@ -445,7 +450,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 				providers.ErrTerminal, *machine.Spec.ProviderID, prov.Name())
 		}
 		if err == nil {
-			if ownErr := verifyOwnership(machine, state); ownErr != nil {
+			if ownErr := r.confirmOwner(ctx, prov, machine, ident, state); ownErr != nil {
 				return nil, ownErr
 			}
 		}
@@ -474,12 +479,33 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// data the machine already consumed, never reaching the idempotent Create
 	// that would have rediscovered it. The providerID could never be recorded,
 	// for a machine that is running perfectly well.
+	//
+	// Another object's identity here has no explanation that makes it safe to
+	// follow. A moved object always has a providerID -- clusterctl moves a
+	// Machine only once it has a Node -- and this object's own crash window
+	// records its own UID. What is left is a template's metadata or a hand
+	// edit, and honouring it would adopt or build under a name derived from
+	// some other object; ignoring it would let the name change the moment a
+	// providerID is recorded. So refuse, and say why.
+	if ident.foreign {
+		return nil, fmt.Errorf("%w: annotation %s names UID %q, not this HydraMachine's, and it has no providerID; "+
+			"only the controller may set it -- remove it, and from any template whose metadata carries it "+
+			"(a standalone HydraMachine must not be moved before it has a providerID)",
+			providers.ErrTerminal, infrav1.IdentityUIDAnnotation, ident.uid)
+	}
+
 	var spec providers.MachineSpec
 	// recordedNote explains a Create failure when the machine is pinned to a
 	// recorded pool other than the one that resolves now.
 	var recordedNote string
-	switch _, findErr := prov.FindByName(ctx, backendName(machine)); {
+	switch found, findErr := prov.FindByName(ctx, backendName(machine)); {
 	case findErr == nil:
+		// The name is this object's own, so another owner on record is not a
+		// crash window of ours: refuse it rather than adopt it.
+		if found.Owner != "" && found.Owner != string(machine.UID) {
+			return nil, fmt.Errorf("%w: a machine named %q exists but is recorded as owned by %q, not this HydraMachine",
+				providers.ErrOwnerMismatch, found.Name, found.Owner)
+		}
 		// Already exists. Create adopts it below -- including starting it if a
 		// previous attempt defined it without ever starting it.
 		//
@@ -570,7 +596,7 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 		return ctrl.Result{}, nil
 	}
 
-	id, err := r.deletionTargetFor(ctx, prov, machine)
+	id, sweep, err := r.deletionTargetFor(ctx, prov, machine)
 	if err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -597,11 +623,11 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 	// The machine's pool goes with it. It is the one pool the sweep must not
 	// give up on, and the only one: a stopped pool elsewhere on the host must not
 	// hold every deletion hostage. See storagePoolOf for where it comes from.
-	if err := prov.DeleteByName(ctx, backendName(machine), storagePoolOf(machine, link)); err != nil {
+	if err := prov.DeleteByName(ctx, sweep, storagePoolOf(machine, link)); err != nil {
 		if statusErr := r.recordError(ctx, machine, "Deleting", err); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{}, fmt.Errorf("removing residual resources for %q: %w", backendName(machine), err)
+		return ctrl.Result{}, fmt.Errorf("removing residual resources for %q: %w", sweep, err)
 	}
 
 	patch := client.MergeFrom(machine.DeepCopy())
@@ -615,16 +641,28 @@ func (r *HydraMachineReconciler) reconcileDelete(ctx context.Context, prov provi
 	return ctrl.Result{}, nil
 }
 
-// deletionTargetFor works out which backend machine, if any, this object owns.
+// deletionTargetFor works out which backend machine, if any, this object owns,
+// and the name whose leftovers teardown may sweep.
 //
 // The providerID is the normal answer. When it is absent the machine may still
 // exist: Create can succeed and the patch recording its ID can then fail. Left
 // unhandled, deletion would skip cleanup, release the finalizer, and orphan a
 // running VM permanently -- so the name is used as a second handle.
 //
+// Nothing is deleted that this object has not been confirmed to own, on the
+// backend's own record (see confirmOwner). A moved object that never took its
+// machine over -- deleted while still paused, or a stale copy of one on a
+// second management cluster -- is refused rather than allowed to destroy a VM
+// the cluster it came from may still run. Undo a move by moving back.
+//
 // Returns an empty ID when no providerID was persisted, in which case the
 // caller must DeleteByName so a volume-only leftover is still removed.
-func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (string, error) {
+func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine) (string, string, error) {
+	ident, err := identityOf(machine)
+	if err != nil {
+		return "", "", err
+	}
+	own := string(machine.UID)
 	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
 		id, err := r.machineIDFor(prov, *machine.Spec.ProviderID)
 		if err != nil {
@@ -639,10 +677,13 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 			state, err := prov.Get(ctx, id)
 			switch {
 			case err == nil:
-				if ownErr := verifyOwnership(machine, state); ownErr != nil {
-					return "", ownErr
+				if ownErr := verifyOwnership(machine, ident, state); ownErr != nil {
+					return "", "", ownErr
 				}
-				return id, nil
+				if ownErr := ownsForDeletion(machine, ident, state); ownErr != nil {
+					return "", "", ownErr
+				}
+				return id, backendNameFor(machine, ident.uid), nil
 			case errors.Is(err, providers.ErrNotFound), errors.Is(err, providers.ErrInvalidID):
 				// Nothing under that ID, or an ID the backend can never resolve --
 				// a providerID like hydra://libvirt/not-a-uuid satisfies the CRD and
@@ -651,21 +692,128 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 				// Returning an error instead would wedge the finalizer forever over
 				// a value that can never become valid.
 			default:
-				return "", fmt.Errorf("confirming ownership before deletion: %w", err)
+				return "", "", fmt.Errorf("confirming ownership before deletion: %w", err)
 			}
 		}
 	}
 
-	state, err := prov.FindByName(ctx, backendName(machine))
+	// From here on there is no machine whose owner record could vouch for this
+	// object, so sweep only what its own UID names. A moved-from name is
+	// another object's until something here confirmed otherwise, and the
+	// cluster that object lives on may still have resources under it.
+	sweep := backendName(machine)
+	if ident.foreign {
+		logf.FromContext(ctx).Info("Not sweeping resources named for the identity this object was moved with; nothing confirmed it owns them",
+			"name", backendNameFor(machine, ident.uid))
+	}
+	state, err := prov.FindByName(ctx, sweep)
 	if err != nil {
 		if errors.Is(err, providers.ErrNotFound) {
-			return "", nil
+			return "", sweep, nil
 		}
-		return "", fmt.Errorf("searching for an unrecorded machine: %w", err)
+		return "", "", fmt.Errorf("searching for an unrecorded machine: %w", err)
+	}
+	if state.Owner != "" && state.Owner != own {
+		return "", "", fmt.Errorf("%w: a machine named %q exists but is recorded as owned by %q, not this HydraMachine",
+			providers.ErrOwnerMismatch, state.Name, state.Owner)
 	}
 	logf.FromContext(ctx).Info("Found a machine whose providerID was never recorded, deleting it",
-		"name", backendName(machine), "id", state.ID)
-	return state.ID, nil
+		"name", sweep, "id", state.ID)
+	return state.ID, sweep, nil
+}
+
+// identity is the UID a machine's backend name derives from, and whether that
+// is another object's: one moved here from another management cluster, which
+// may or may not have taken its machine over yet. See
+// infrav1.IdentityUIDAnnotation.
+type identity struct {
+	uid     string
+	foreign bool
+}
+
+// canonicalUID is the only shape an object UID takes. Anything else in the
+// annotation is refused rather than hashed: the hash input is
+// namespace/name/uid, and only a value that cannot contain a slash keeps it
+// unambiguous.
+var canonicalUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// identityOf is the one place a machine's identity is resolved, so every name
+// derived from it -- for creating, adopting, confirming a hypervisor and
+// sweeping -- agrees.
+func identityOf(machine *infrav1.HydraMachine) (identity, error) {
+	own := string(machine.UID)
+	recorded := machine.Annotations[infrav1.IdentityUIDAnnotation]
+	if recorded == "" || recorded == own {
+		// The object's own UID is the API server's, so it needs no checking.
+		return identity{uid: own}, nil
+	}
+	if !canonicalUID.MatchString(recorded) {
+		return identity{}, fmt.Errorf("%w: annotation %s is %q, which is not an object UID; only the controller may set it",
+			providers.ErrTerminal, infrav1.IdentityUIDAnnotation, recorded)
+	}
+	return identity{uid: recorded, foreign: recorded != own}, nil
+}
+
+// confirmOwner checks that a machine found under this object's providerID is
+// this object's, on the backend's own record, and brings that record up to
+// date: it takes over a machine this object was moved with, and records an
+// owner on a machine made before owners were recorded. Either way the identity
+// annotation is then recorded if it is not yet, which is the migration every
+// machine needs before it can be moved.
+func (r *HydraMachineReconciler) confirmOwner(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, ident identity, state *providers.MachineState) error {
+	if err := verifyOwnership(machine, ident, state); err != nil {
+		return err
+	}
+	own := string(machine.UID)
+	switch {
+	case state.Owner == own:
+	case state.Owner == "" && !ident.foreign:
+		// Made before owners were recorded; the name just matched this UID.
+		if err := prov.ClaimOwner(ctx, state.ID, "", own); err != nil {
+			return fmt.Errorf("recording the owner of machine %q: %w", state.ID, err)
+		}
+		logf.FromContext(ctx).Info("Recorded owner on a machine made before owners were recorded",
+			"name", state.Name, "id", state.ID)
+	case ident.foreign && state.Owner == ident.uid:
+		// Moved here with the object that made it, and not yet taken over. Only
+		// one copy of that object can do this: the claim fails for any other
+		// once this one succeeds.
+		if err := prov.ClaimOwner(ctx, state.ID, ident.uid, own); err != nil {
+			return fmt.Errorf("taking over moved machine %q: %w", state.ID, err)
+		}
+		logf.FromContext(ctx).Info("Took over a machine moved from another management cluster",
+			"name", state.Name, "id", state.ID, "from", ident.uid)
+	default:
+		return ownerMismatch(machine, ident, state)
+	}
+	_, err := r.recordPlacement(ctx, machine, "", "")
+	return err
+}
+
+// ownsForDeletion is the owner check teardown makes. Stricter than
+// confirmOwner's, because it takes nothing over: a machine is this object's to
+// delete only if the record names it, or names nobody and the name is its own.
+func ownsForDeletion(machine *infrav1.HydraMachine, ident identity, state *providers.MachineState) error {
+	own := string(machine.UID)
+	if state.Owner == own || (state.Owner == "" && !ident.foreign) {
+		return nil
+	}
+	if ident.foreign && state.Owner == ident.uid {
+		return fmt.Errorf("%w: machine %q was moved here with this HydraMachine and has not been taken over yet, "+
+			"so it may still belong to the management cluster it came from; let the object reconcile unpaused "+
+			"here before deleting it, and undo a move by moving back rather than deleting the copies",
+			providers.ErrTerminal, state.Name)
+	}
+	return ownerMismatch(machine, ident, state)
+}
+
+func ownerMismatch(machine *infrav1.HydraMachine, ident identity, state *providers.MachineState) error {
+	recorded := state.Owner
+	if recorded == "" {
+		recorded = "nobody"
+	}
+	return fmt.Errorf("%w: machine %q is recorded as owned by %s, not this HydraMachine (UID %s, identity %s)",
+		providers.ErrOwnerMismatch, state.Name, recorded, machine.UID, ident.uid)
 }
 
 // verifyOwnership refuses to act on a machine this object does not own.
@@ -675,11 +823,17 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 // catch that -- a well-formed UUID for someone else's domain passes both. Only
 // comparing the resolved machine's name against this object's derived name
 // does, and without it deletion would destroy that unrelated machine.
-func verifyOwnership(machine *infrav1.HydraMachine, state *providers.MachineState) error {
-	want := backendName(machine)
+//
+// The name is a necessary check, not a sufficient one: a copy of this object
+// elsewhere derives the same name. The owner record settles the rest; see
+// confirmOwner and ownsForDeletion.
+func verifyOwnership(machine *infrav1.HydraMachine, ident identity, state *providers.MachineState) error {
+	want := backendNameFor(machine, ident.uid)
 	if state.Name != want {
-		return fmt.Errorf("%w: providerID resolves to machine %q, which is not owned by this HydraMachine (expected %q)",
-			providers.ErrTerminal, state.Name, want)
+		return fmt.Errorf("%w: providerID resolves to machine %q, which is not owned by this HydraMachine (expected %q); "+
+			"if it was moved from another management cluster before annotation %s was recorded, or a template "+
+			"sets that annotation, the name no longer derives from the UID it was made with",
+			providers.ErrTerminal, state.Name, want, infrav1.IdentityUIDAnnotation)
 	}
 	return nil
 }
@@ -872,14 +1026,22 @@ func hasIPAddress(addrs []providers.Address) bool {
 	return false
 }
 
-// backendName derives the machine's globally unique identity on the backend.
+// backendName is the name this object gives a machine it creates: the one its
+// own UID derives. A machine it was moved with may have another; see
+// identityOf.
+func backendName(machine *infrav1.HydraMachine) string {
+	return backendNameFor(machine, string(machine.UID))
+}
+
+// backendNameFor derives the machine's globally unique identity on the backend
+// from the object's namespace and name and the UID it was made under.
 //
 // A libvirt domain namespace is flat, while a Kubernetes object name is unique
 // only within its namespace. Keying on the object name alone would let two
 // HydraMachines called "worker-1" in different namespaces adopt -- and then
 // delete -- each other's VM. The object UID closes that, and also ensures a
 // deleted-and-recreated object does not inherit its predecessor's machine.
-func backendName(machine *infrav1.HydraMachine) string {
+func backendNameFor(machine *infrav1.HydraMachine, uid string) string {
 	// Uniqueness comes from a hash over the full namespace, name and UID -- not
 	// from a truncated UID, where 32 bits makes a birthday collision plausible in
 	// tens of thousands of objects, and a collision means two HydraMachines
@@ -890,7 +1052,7 @@ func backendName(machine *infrav1.HydraMachine) string {
 	// A namespace may be 63 characters and an object name 253, so concatenating
 	// them raw exceeds the 255-byte limit of directory-backed pools and a
 	// perfectly valid HydraMachine could never provision.
-	sum := sha256.Sum256([]byte(machine.Namespace + "/" + machine.Name + "/" + string(machine.UID)))
+	sum := sha256.Sum256([]byte(machine.Namespace + "/" + machine.Name + "/" + uid))
 	digest := hex.EncodeToString(sum[:])[:20] // 80 bits
 
 	readable := machine.Namespace + "-" + machine.Name
@@ -959,7 +1121,10 @@ func specFor(machine *infrav1.HydraMachine, link *linkage, bootstrapData []byte)
 	}
 
 	spec := providers.MachineSpec{
-		Name: backendName(machine),
+		// Create is reached only for an object building under its own identity
+		// (see ensureMachine), so its own UID is both the name and the owner.
+		Name:     backendName(machine),
+		OwnerUID: string(machine.UID),
 		// The object's own name, not the derived backend name. The backend name
 		// carries a hash for global uniqueness, which is right for a domain name
 		// and wrong for something an operator has to recognise in `kubectl get
@@ -1040,10 +1205,14 @@ func (r *HydraMachineReconciler) recordPlacement(ctx context.Context, machine *i
 	recordedPool := machine.Annotations[infrav1.StoragePoolAnnotation]
 	writePool := recordedPool == "" && pool != ""
 	writeHypervisor := hypervisor != "" && machine.Annotations[infrav1.HypervisorAnnotation] == ""
+	// The identity goes with the placement, and on its own when that is all
+	// that is missing: every caller has either just confirmed this object owns
+	// its machine under its own UID or is about to create one under it.
+	writeIdentity := machine.Annotations[infrav1.IdentityUIDAnnotation] == "" && machine.UID != ""
 	if recordedPool != "" {
 		pool = recordedPool
 	}
-	if !writePool && !writeHypervisor {
+	if !writePool && !writeHypervisor && !writeIdentity {
 		return pool, nil
 	}
 	// Optimistic: a stale cached copy must not overwrite a record another
@@ -1058,8 +1227,11 @@ func (r *HydraMachineReconciler) recordPlacement(ctx context.Context, machine *i
 	if writeHypervisor {
 		machine.Annotations[infrav1.HypervisorAnnotation] = hypervisor
 	}
+	if writeIdentity {
+		machine.Annotations[infrav1.IdentityUIDAnnotation] = string(machine.UID)
+	}
 	if err := r.Patch(ctx, machine, patch); err != nil {
-		return "", fmt.Errorf("recording storage pool %q and hypervisor %q: %w", pool, hypervisor, err)
+		return "", fmt.Errorf("recording storage pool %q, hypervisor %q and identity: %w", pool, hypervisor, err)
 	}
 	return pool, nil
 }

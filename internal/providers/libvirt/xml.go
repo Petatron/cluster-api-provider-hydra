@@ -46,6 +46,13 @@ const (
 	// filtering that gets in the way of the inbound connections the management
 	// cluster makes to a workload cluster's API server.
 	netForwardOpen = "open"
+
+	// ownerNamespace and ownerKey are where a domain's owner is recorded in its
+	// <metadata>: <hydra:owner uid="..."/> in this namespace (PET-76). The
+	// namespace is an identifier, not a page anyone fetches; changing it would
+	// make every existing record invisible.
+	ownerNamespace = "https://github.com/Petatron/cluster-api-provider-hydra/owner/v1"
+	ownerKey       = "hydra"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -66,6 +73,14 @@ type domainDef struct {
 
 // featuresDef is the hypervisor features a domain is given. Both are pointers
 // so a domain read back without them parses as absent rather than as present.
+// ownerDef is the owner record kept in a domain's metadata. The element name
+// carries no namespace here on purpose: libvirt returns it under whatever
+// prefix it stores, and encoding/xml matches a local name in any namespace.
+type ownerDef struct {
+	XMLName xml.Name `xml:"owner"`
+	UID     string   `xml:"uid,attr"`
+}
+
 type featuresDef struct {
 	ACPI *presentDef `xml:"acpi,omitempty"`
 	APIC *presentDef `xml:"apic,omitempty"`

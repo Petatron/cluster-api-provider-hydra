@@ -60,6 +60,11 @@ var ErrInvalidID = errors.New("machine id is not valid for this backend")
 // terminal would invite remediation of a machine that was about to be fine.
 var ErrTerminal = errors.New("terminal provider failure")
 
+// ErrOwnerMismatch is ClaimOwner finding a different owner recorded than the
+// one the caller expected: another object, or another management cluster, has
+// the machine. It is terminal, because no retry changes who owns a machine.
+var ErrOwnerMismatch = fmt.Errorf("%w: machine is owned by another object", ErrTerminal)
+
 // AddressType classifies a machine address, mirroring the Cluster API
 // MachineAddress types the controller surfaces on status.
 type AddressType string
@@ -179,6 +184,10 @@ type MachineSpec struct {
 	// namespace, name and object UID rather than from the object name alone.
 	Name string
 
+	// OwnerUID is recorded on the backend at creation as the machine's owner:
+	// the UID of the object that asked for it. See MachineState.Owner.
+	OwnerUID string
+
 	VCPUs       int32
 	MemoryBytes int64
 	DiskBytes   int64
@@ -241,6 +250,17 @@ type MachineState struct {
 	// only comparing the resolved machine's name against the one this object owns
 	// does. Never run a destructive operation without that comparison.
 	Name string
+
+	// Owner is the UID recorded on the backend as the machine's owner, or empty
+	// for a machine made before owners were recorded.
+	//
+	// The name alone cannot settle ownership once an object can move between
+	// management clusters (PET-76). A moved object has to derive the same name
+	// from carried-over metadata, and a copy of that metadata on a second cluster
+	// derives it just as well. Only a record on the backend, which a moved object
+	// takes over exactly once with ClaimOwner, tells the copy that is current
+	// from the copy that is stale.
+	Owner string
 
 	// Ready reports that the machine is running and, as far as the backend can
 	// tell, usable. It does not mean the machine has joined a cluster -- that is
@@ -350,6 +370,16 @@ type MachineProvider interface {
 	// the machine's own pool cannot be searched, nothing found is not proof, and
 	// deletion fails until it can be.
 	DeleteByName(ctx context.Context, name, storagePool string) error
+
+	// ClaimOwner records to as the machine's owner if, and only if, from is the
+	// owner recorded now -- empty meaning none is. Otherwise it changes nothing
+	// and returns ErrOwnerMismatch. ErrNotFound when the machine does not exist.
+	//
+	// The comparison is the point: it is what lets exactly one of two copies of
+	// a moved object take a machine over. A backend that cannot compare and set
+	// atomically must still compare first; its window is then the time between
+	// the two, which is documented where it applies.
+	ClaimOwner(ctx context.Context, id, from, to string) error
 }
 
 // ProviderID renders the Cluster API providerID for a machine.

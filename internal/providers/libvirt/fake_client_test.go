@@ -18,6 +18,7 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"fmt"
 	"io"
 	"path"
 	"slices"
@@ -100,6 +101,9 @@ type fakeDomain struct {
 	// addrs is what DomainInterfaceAddresses reports per source; a source with
 	// no entry fails, the way an absent guest agent does.
 	addrs map[uint32][]golibvirt.DomainInterface
+	// metadata is the persistent definition's <metadata> elements, by namespace
+	// URI, in the prefixed form libvirt hands back.
+	metadata map[string]string
 }
 
 type fakeNetwork struct {
@@ -136,10 +140,11 @@ func (f *fakeLibvirt) addPool(name string, vols ...string) *fakePool {
 func (f *fakeLibvirt) addDomain(name, desc string, active bool) *fakeDomain {
 	f.nextUUID++
 	d := &fakeDomain{
-		dom:    golibvirt.Domain{Name: name, UUID: golibvirt.UUID{15: f.nextUUID}},
-		xml:    desc,
-		active: active,
-		addrs:  map[uint32][]golibvirt.DomainInterface{},
+		dom:      golibvirt.Domain{Name: name, UUID: golibvirt.UUID{15: f.nextUUID}},
+		xml:      desc,
+		active:   active,
+		addrs:    map[uint32][]golibvirt.DomainInterface{},
+		metadata: map[string]string{},
 	}
 	f.domains[name] = d
 	return d
@@ -406,6 +411,52 @@ func (f *fakeLibvirt) DomainInterfaceAddresses(dom golibvirt.Domain, source, _ u
 
 // ConnectListAllStoragePools honours the active and inactive filters the way
 // libvirt does: either one alone narrows the list, neither or both list all.
+func (f *fakeLibvirt) DomainGetMetadata(dom golibvirt.Domain, typ int32, uri golibvirt.OptString,
+	flags golibvirt.DomainModificationImpact,
+) (string, error) {
+	defer f.mu.Unlock()
+	if err := f.enter("DomainGetMetadata", dom.Name); err != nil {
+		return "", err
+	}
+	d, err := f.domain(dom)
+	if err != nil {
+		return "", err
+	}
+	if typ != int32(golibvirt.DomainMetadataElement) || len(uri) != 1 || flags != golibvirt.DomainAffectConfig {
+		return "", lvErr(golibvirt.ErrInvalidArg)
+	}
+	doc, ok := d.metadata[uri[0]]
+	if !ok {
+		return "", lvErr(golibvirt.ErrNoDomainMetadata)
+	}
+	return doc, nil
+}
+
+// DomainSetMetadata stores the element the way libvirt does: under the key as
+// its prefix, with the namespace declared on it, whatever form it was given in.
+func (f *fakeLibvirt) DomainSetMetadata(dom golibvirt.Domain, typ int32, metadata, key, uri golibvirt.OptString,
+	flags golibvirt.DomainModificationImpact,
+) error {
+	defer f.mu.Unlock()
+	if err := f.enter("DomainSetMetadata", dom.Name); err != nil {
+		return err
+	}
+	d, err := f.domain(dom)
+	if err != nil {
+		return err
+	}
+	if typ != int32(golibvirt.DomainMetadataElement) || len(metadata) != 1 || len(key) != 1 ||
+		len(uri) != 1 || flags != golibvirt.DomainAffectConfig {
+		return lvErr(golibvirt.ErrInvalidArg)
+	}
+	var rec ownerDef
+	if err := xml.Unmarshal([]byte(metadata[0]), &rec); err != nil {
+		return lvErr(golibvirt.ErrXMLError)
+	}
+	d.metadata[uri[0]] = fmt.Sprintf(`<%s:owner xmlns:%s="%s" uid="%s"/>`, key[0], key[0], uri[0], rec.UID)
+	return nil
+}
+
 func (f *fakeLibvirt) ConnectListAllStoragePools(_ int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("ConnectListAllStoragePools", ""); err != nil {
