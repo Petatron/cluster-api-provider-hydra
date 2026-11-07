@@ -233,7 +233,12 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 		Expect(ownerOf(id)).To(Equal(string(machine.UID)))
 	})
 
-	It("sweeps the moved-from name once it has taken the machine over", func() {
+	It("leaves the moved-from name's leftovers alone once its machine is gone", func() {
+		// After a takeover the domain is undefined behind the provider's back;
+		// its disks are not. owner-uid says this object took it over, but that
+		// is an annotation anyone can write, and with no domain left nothing on
+		// the backend can confirm it -- so the disks are left, not deleted on
+		// the annotation's word.
 		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())
 		id := machineID()
@@ -241,12 +246,37 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 		_, err = reconcile()
 		Expect(err).NotTo(HaveOccurred())
 
-		// The domain is undefined behind the provider's back; its disks are not.
 		Expect(provider.Delete(ctx, id)).To(Succeed())
 		provider.AddPartial(backendNameFor(machine, string(oldUID)))
 
 		Expect(deleteAndReconcile()).To(Succeed())
-		Expect(provider.PartialCount()).To(Equal(0), "what it owned must not be left behind")
+		Expect(provider.PartialCount()).To(Equal(1), "nothing on the backend vouched for them")
+	})
+
+	It("deletes the moved-from domain it took over even without a providerID", func() {
+		// The record on the domain is what confirms it, not the annotation.
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		id := machineID()
+		oldUID := move()
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		// The same object, its providerID lost: only the name can find it.
+		gone(machine)
+		bare := copyOf(machine)
+		bare.Spec.ProviderID = nil
+		bare.Annotations[infrav1.OwnerUIDAnnotation] = "" // rewritten below once the UID is known
+		Expect(k8sClient.Create(ctx, bare)).To(Succeed())
+		machine = bare
+		provider.SetOwner(id, string(machine.UID))
+		patch := client.MergeFrom(machine.DeepCopy())
+		machine.Annotations[infrav1.OwnerUIDAnnotation] = string(machine.UID)
+		Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+		Expect(machine.Annotations).To(HaveKeyWithValue(infrav1.IdentityUIDAnnotation, string(oldUID)))
+
+		Expect(deleteAndReconcile()).To(Succeed())
+		Expect(provider.Count()).To(Equal(0))
 	})
 
 	It("refuses a stale copy once the move has been taken over, and deletes nothing for it", func() {

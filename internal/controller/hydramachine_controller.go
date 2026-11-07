@@ -708,18 +708,32 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 	// object, so sweep only what its own UID names. A moved-from name is
 	// another object's until something here confirmed otherwise, and the
 	// cluster that object lives on may still have resources under it.
-	sweep, sweepIdent := backendName(machine), identity{uid: own}
-	if ident.foreign && ident.lastOwner == own {
-		// Except where this object records that it took the machine over: then
-		// what is left under that name is its own. The record is an annotation
-		// anyone able to patch the object can write, so it only widens where to
-		// look. A domain still there must itself name this object as its owner,
-		// which ownsForDeletion below insists on.
-		sweep, sweepIdent = backendNameFor(machine, ident.uid), ident
-	} else if ident.foreign {
-		logf.FromContext(ctx).Info("Not sweeping resources named for the identity this object was moved with; nothing confirmed it owns them",
-			"name", backendNameFor(machine, ident.uid))
+	//
+	// Except where this object records that it took the machine over, and the
+	// machine is still there to agree. The record is an annotation anyone able
+	// to patch the object can write, so it only says where to look: the
+	// domain's own owner record decides, through ownsForDeletion. With no
+	// domain left there is nothing on the backend to vouch for leftovers under
+	// that name, and they are left alone rather than swept on the annotation's
+	// word -- an orphaned disk is recoverable, a deleted one is not.
+	if ident.foreign {
+		moved := backendNameFor(machine, ident.uid)
+		if ident.lastOwner == own {
+			state, err := prov.FindByName(ctx, moved)
+			switch {
+			case err == nil:
+				if err := ownsForDeletion(machine, ident, state); err != nil {
+					return "", "", err
+				}
+				return state.ID, moved, nil
+			case !errors.Is(err, providers.ErrNotFound):
+				return "", "", fmt.Errorf("searching for the machine this object was moved with: %w", err)
+			}
+		}
+		logf.FromContext(ctx).Info("Not sweeping resources named for the identity this object was moved with; nothing on the backend confirms it owns them",
+			"name", moved)
 	}
+	sweep := backendName(machine)
 	state, err := prov.FindByName(ctx, sweep)
 	if err != nil {
 		if errors.Is(err, providers.ErrNotFound) {
@@ -727,7 +741,7 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 		}
 		return "", "", fmt.Errorf("searching for an unrecorded machine: %w", err)
 	}
-	if err := ownsForDeletion(machine, sweepIdent, state); err != nil {
+	if err := ownsForDeletion(machine, identity{uid: own}, state); err != nil {
 		return "", "", err
 	}
 	logf.FromContext(ctx).Info("Found a machine whose providerID was never recorded, deleting it",

@@ -371,9 +371,10 @@ type MachineProvider interface {
 	// deletion fails until it can be.
 	DeleteByName(ctx context.Context, name, storagePool string) error
 
-	// ClaimOwner records to as the machine's owner if, and only if, from is the
-	// owner recorded now -- empty meaning none is. Otherwise it changes nothing
-	// and returns ErrOwnerMismatch. ErrNotFound when the machine does not exist.
+	// ClaimOwner records the UID in `to` as the machine's owner if, and only if,
+	// the UID in `from` is the owner recorded now -- an empty `from` meaning none
+	// is recorded. Otherwise it changes nothing and returns ErrOwnerMismatch. It
+	// returns ErrNotFound when the machine does not exist.
 	//
 	// The comparison is the point: it is what lets exactly one of two copies of
 	// a moved object take a machine over. A backend that cannot compare and set
