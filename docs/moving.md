@@ -24,12 +24,18 @@ reconcile. This must print nothing:
 
 ```bash
 kubectl get hydramachines -A -o json | jq -r '.items[]
-  | select((.metadata.annotations["hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"] // "") != .metadata.uid)
+  | (.metadata.annotations // {}) as $a
+  | select(($a["hydramachine.infrastructure.cluster.x-k8s.io/identity-uid"] // "") == ""
+      or ($a["hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"] // "") != .metadata.uid)
   | "\(.metadata.namespace)/\(.metadata.name)"'
 ```
 
-A machine moved without it cannot be recovered by the provider, because
-nothing the move carries says which UID its VM was named for.
+The identity is the one that cannot be missing. A machine moved without
+`identity-uid` cannot be recovered by the provider: its VM's name hashes the UID
+it was made under, and nothing else the move carries says what that was. One
+moved without `owner-uid` still takes its VM over, from the owner the VM
+records. The check asks for both so the next move, and the one after it, start
+from a confirmed owner.
 
 **2. The Hydra CRDs carry `clusterctl.cluster.x-k8s.io`.** Move looks up the
 types to move by that label and nothing else. The release manifest sets it. A

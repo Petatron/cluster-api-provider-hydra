@@ -71,8 +71,6 @@ type domainDef struct {
 	Devices  devices     `xml:"devices"`
 }
 
-// featuresDef is the hypervisor features a domain is given. Both are pointers
-// so a domain read back without them parses as absent rather than as present.
 // ownerDef is the owner record kept in a domain's metadata. The element name
 // carries no namespace here on purpose: libvirt returns it under whatever
 // prefix it stores, and encoding/xml matches a local name in any namespace.
@@ -81,6 +79,8 @@ type ownerDef struct {
 	UID     string   `xml:"uid,attr"`
 }
 
+// featuresDef is the hypervisor features a domain is given. Both are pointers
+// so a domain read back without them parses as absent rather than as present.
 type featuresDef struct {
 	ACPI *presentDef `xml:"acpi,omitempty"`
 	APIC *presentDef `xml:"apic,omitempty"`

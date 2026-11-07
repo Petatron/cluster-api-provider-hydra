@@ -285,7 +285,7 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 
 		err = deleteAndReconcile()
 		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "got %v", err)
-		Expect(err.Error()).To(ContainSubstring("has not been taken over"))
+		Expect(err.Error()).To(ContainSubstring("never taken over"))
 		Expect(provider.Count()).To(Equal(1), "the source's machine must survive")
 		Expect(ownerOf(id)).To(Equal(string(oldUID)))
 	})
@@ -299,6 +299,31 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 		_, err := reconcile()
 		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "got %v", err)
 		Expect(provider.CreateCalls).To(Equal(0), "nothing may be built under a borrowed identity")
+	})
+
+	It("will not delete an untaken machine because its own owner-uid says it took it over", func() {
+		// owner-uid is an annotation anyone who can patch the object can write.
+		// Naming itself there widens where teardown looks, but a machine still
+		// present must name this object on its own record before it is deleted.
+		// The sequence: an object that shares the victim's namespace and name
+		// (free on a second management cluster) borrows its identity, claims to
+		// have taken the machine over, and is deleted -- no providerID, so the
+		// name check never runs.
+		theirs, err := provider.Create(ctx, providers.MachineSpec{Name: backendNameFor(machine, otherObjectUID)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(theirs.Owner).To(BeEmpty(), "precondition: a machine with no owner recorded yet")
+
+		patch := client.MergeFrom(machine.DeepCopy())
+		machine.Annotations[infrav1.IdentityUIDAnnotation] = otherObjectUID
+		machine.Annotations[infrav1.OwnerUIDAnnotation] = string(machine.UID)
+		controllerutil.AddFinalizer(machine, MachineFinalizer)
+		Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+		err = deleteAndReconcile()
+		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "got %v", err)
+		Expect(err.Error()).To(ContainSubstring("remove finalizer"), "the message must say what is left to do")
+		_, err = provider.Get(ctx, theirs.ID)
+		Expect(err).NotTo(HaveOccurred(), "the machine must survive")
 	})
 
 	It("refuses another object's owner record on a machine with no providerID", func() {

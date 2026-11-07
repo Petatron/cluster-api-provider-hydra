@@ -708,11 +708,14 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 	// object, so sweep only what its own UID names. A moved-from name is
 	// another object's until something here confirmed otherwise, and the
 	// cluster that object lives on may still have resources under it.
-	sweep := backendName(machine)
+	sweep, sweepIdent := backendName(machine), identity{uid: own}
 	if ident.foreign && ident.lastOwner == own {
-		// Except where this object has been confirmed as the owner: it took the
-		// machine over, so what is left under that name is its own.
-		sweep = backendNameFor(machine, ident.uid)
+		// Except where this object records that it took the machine over: then
+		// what is left under that name is its own. The record is an annotation
+		// anyone able to patch the object can write, so it only widens where to
+		// look. A domain still there must itself name this object as its owner,
+		// which ownsForDeletion below insists on.
+		sweep, sweepIdent = backendNameFor(machine, ident.uid), ident
 	} else if ident.foreign {
 		logf.FromContext(ctx).Info("Not sweeping resources named for the identity this object was moved with; nothing confirmed it owns them",
 			"name", backendNameFor(machine, ident.uid))
@@ -724,9 +727,8 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 		}
 		return "", "", fmt.Errorf("searching for an unrecorded machine: %w", err)
 	}
-	if state.Owner != "" && state.Owner != own {
-		return "", "", fmt.Errorf("%w: a machine named %q exists but is recorded as owned by %q, not this HydraMachine",
-			providers.ErrOwnerMismatch, state.Name, state.Owner)
+	if err := ownsForDeletion(machine, sweepIdent, state); err != nil {
+		return "", "", err
 	}
 	logf.FromContext(ctx).Info("Found a machine whose providerID was never recorded, deleting it",
 		"name", sweep, "id", state.ID)
@@ -860,10 +862,15 @@ func ownsForDeletion(machine *infrav1.HydraMachine, ident identity, state *provi
 		return nil
 	}
 	if state.Owner == "" || movedFrom(ident, state) {
-		return fmt.Errorf("%w: machine %q was moved here with this HydraMachine and has not been taken over yet, "+
-			"so it may still belong to the management cluster it came from; let the object reconcile unpaused "+
-			"here before deleting it, and undo a move by moving back rather than deleting the copies",
-			providers.ErrTerminal, state.Name)
+		// Only teardown reaches this, and an object being deleted never takes
+		// anything over: it goes to reconcileDelete, never to confirmOwner, and
+		// its deletion cannot be undone. So say what is left to do.
+		return fmt.Errorf("%w: machine %q was moved here with this HydraMachine but never taken over, so it may "+
+			"still belong to the management cluster it came from; this object is being deleted and will neither "+
+			"take it over nor release its finalizer. To abandon the object without touching the machine, remove "+
+			"finalizer %s; to manage the machine here, let a copy that is not being deleted reconcile; to undo the "+
+			"move, move back while the source still owns it",
+			providers.ErrTerminal, state.Name, MachineFinalizer)
 	}
 	return ownerMismatch(machine, ident, state)
 }
