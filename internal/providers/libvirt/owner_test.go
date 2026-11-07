@@ -128,6 +128,19 @@ func TestAnUnreadableOwnerRecordIsTerminal(t *testing.T) {
 	}
 }
 
+// A domain with no persistent definition has nowhere to keep a record. Hydra
+// never makes one, so it is refused outright rather than retried forever.
+func TestATransientDomainIsTerminal(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := f.addDomain("transient", "<domain/>", true)
+	f.errs["DomainGetMetadata"] = lvErr(golibvirt.ErrOperationInvalid)
+
+	_, err := p.Get(t.Context(), formatUUID(d.dom.UUID))
+	if !errors.Is(err, providers.ErrTerminal) {
+		t.Fatalf("got %v, want a terminal error", err)
+	}
+}
+
 // Any other failure reading the record is an ordinary error, not "unowned":
 // reading it as unowned would let a machine be claimed from nobody.
 func TestAFailedOwnerReadIsNotUnowned(t *testing.T) {

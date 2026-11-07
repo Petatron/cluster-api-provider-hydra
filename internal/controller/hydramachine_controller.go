@@ -702,7 +702,11 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 	// another object's until something here confirmed otherwise, and the
 	// cluster that object lives on may still have resources under it.
 	sweep := backendName(machine)
-	if ident.foreign {
+	if ident.foreign && ident.lastOwner == own {
+		// Except where this object has been confirmed as the owner: it took the
+		// machine over, so what is left under that name is its own.
+		sweep = backendNameFor(machine, ident.uid)
+	} else if ident.foreign {
 		logf.FromContext(ctx).Info("Not sweeping resources named for the identity this object was moved with; nothing confirmed it owns them",
 			"name", backendNameFor(machine, ident.uid))
 	}
@@ -729,6 +733,11 @@ func (r *HydraMachineReconciler) deletionTargetFor(ctx context.Context, prov pro
 type identity struct {
 	uid     string
 	foreign bool
+	// lastOwner is the owner the backend last confirmed for this machine, as
+	// carried across by a move: this object's own UID once it has taken the
+	// machine over, the object it was moved from before that, or empty when
+	// nothing was ever confirmed. See infrav1.OwnerUIDAnnotation.
+	lastOwner string
 }
 
 // canonicalUID is the only shape an object UID takes. Anything else in the
@@ -741,17 +750,30 @@ var canonicalUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 // derived from it -- for creating, adopting, confirming a hypervisor and
 // sweeping -- agrees.
 func identityOf(machine *infrav1.HydraMachine) (identity, error) {
-	own := string(machine.UID)
-	recorded := machine.Annotations[infrav1.IdentityUIDAnnotation]
-	if recorded == "" || recorded == own {
-		// The object's own UID is the API server's, so it needs no checking.
-		return identity{uid: own}, nil
+	id := identity{uid: string(machine.UID)}
+	uid, err := recordedUID(machine, infrav1.IdentityUIDAnnotation)
+	if err != nil {
+		return identity{}, err
 	}
-	if !canonicalUID.MatchString(recorded) {
-		return identity{}, fmt.Errorf("%w: annotation %s is %q, which is not an object UID; only the controller may set it",
-			providers.ErrTerminal, infrav1.IdentityUIDAnnotation, recorded)
+	if uid != "" {
+		id.uid, id.foreign = uid, uid != string(machine.UID)
 	}
-	return identity{uid: recorded, foreign: recorded != own}, nil
+	if id.lastOwner, err = recordedUID(machine, infrav1.OwnerUIDAnnotation); err != nil {
+		return identity{}, err
+	}
+	return id, nil
+}
+
+// recordedUID reads a UID the controller recorded in an annotation, or "".
+// The object's own UID is the API server's and needs no checking; anything
+// else must be a UID, or it is refused before any name is derived from it.
+func recordedUID(machine *infrav1.HydraMachine, annotation string) (string, error) {
+	recorded := machine.Annotations[annotation]
+	if recorded == "" || recorded == string(machine.UID) || canonicalUID.MatchString(recorded) {
+		return recorded, nil
+	}
+	return "", fmt.Errorf("%w: annotation %s is %q, which is not an object UID; only the controller may set it",
+		providers.ErrTerminal, annotation, recorded)
 }
 
 // confirmOwner checks that a machine found under this object's providerID is
@@ -767,27 +789,59 @@ func (r *HydraMachineReconciler) confirmOwner(ctx context.Context, prov provider
 	own := string(machine.UID)
 	switch {
 	case state.Owner == own:
-	case state.Owner == "" && !ident.foreign:
-		// Made before owners were recorded; the name just matched this UID.
+	case state.Owner == "":
+		// Nobody on record: a machine made before owners were recorded, or one
+		// whose record Create never got to write -- possibly moved since. The
+		// name just matched, and claiming from nobody is a compare like any
+		// other: of every copy of this object, only the first to claim wins.
 		if err := prov.ClaimOwner(ctx, state.ID, "", own); err != nil {
 			return fmt.Errorf("recording the owner of machine %q: %w", state.ID, err)
 		}
-		logf.FromContext(ctx).Info("Recorded owner on a machine made before owners were recorded",
+		logf.FromContext(ctx).Info("Recorded owner on a machine that had none recorded",
 			"name", state.Name, "id", state.ID)
-	case ident.foreign && state.Owner == ident.uid:
-		// Moved here with the object that made it, and not yet taken over. Only
-		// one copy of that object can do this: the claim fails for any other
-		// once this one succeeds.
-		if err := prov.ClaimOwner(ctx, state.ID, ident.uid, own); err != nil {
+	case movedFrom(ident, state):
+		// Moved here, and not yet taken over: the record still names the object
+		// this one was moved from. Only one copy can take it over -- the claim
+		// fails for any other once this one succeeds.
+		if err := prov.ClaimOwner(ctx, state.ID, state.Owner, own); err != nil {
 			return fmt.Errorf("taking over moved machine %q: %w", state.ID, err)
 		}
 		logf.FromContext(ctx).Info("Took over a machine moved from another management cluster",
-			"name", state.Name, "id", state.ID, "from", ident.uid)
+			"name", state.Name, "id", state.ID, "from", state.Owner)
 	default:
 		return ownerMismatch(machine, ident, state)
 	}
-	_, err := r.recordPlacement(ctx, machine, "", "")
-	return err
+	return r.recordOwnership(ctx, machine)
+}
+
+// movedFrom reports that a machine's recorded owner is the object this one was
+// moved from: the owner last confirmed before the move, or -- for an object
+// moved before it ever confirmed one -- the object its name was derived from.
+func movedFrom(ident identity, state *providers.MachineState) bool {
+	return state.Owner != "" && (state.Owner == ident.lastOwner || (ident.foreign && state.Owner == ident.uid))
+}
+
+// recordOwnership writes what the next move needs, once the backend's record
+// names this object: its identity, if not yet recorded, and itself as the owner
+// last confirmed. Optimistic, like recordPlacement.
+func (r *HydraMachineReconciler) recordOwnership(ctx context.Context, machine *infrav1.HydraMachine) error {
+	own := string(machine.UID)
+	writeIdentity := machine.Annotations[infrav1.IdentityUIDAnnotation] == ""
+	if !writeIdentity && machine.Annotations[infrav1.OwnerUIDAnnotation] == own {
+		return nil
+	}
+	patch := client.MergeFromWithOptions(machine.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	if machine.Annotations == nil {
+		machine.Annotations = map[string]string{}
+	}
+	if writeIdentity {
+		machine.Annotations[infrav1.IdentityUIDAnnotation] = own
+	}
+	machine.Annotations[infrav1.OwnerUIDAnnotation] = own
+	if err := r.Patch(ctx, machine, patch); err != nil {
+		return fmt.Errorf("recording identity and owner: %w", err)
+	}
+	return nil
 }
 
 // ownsForDeletion is the owner check teardown makes. Stricter than
@@ -798,7 +852,7 @@ func ownsForDeletion(machine *infrav1.HydraMachine, ident identity, state *provi
 	if state.Owner == own || (state.Owner == "" && !ident.foreign) {
 		return nil
 	}
-	if ident.foreign && state.Owner == ident.uid {
+	if state.Owner == "" || movedFrom(ident, state) {
 		return fmt.Errorf("%w: machine %q was moved here with this HydraMachine and has not been taken over yet, "+
 			"so it may still belong to the management cluster it came from; let the object reconcile unpaused "+
 			"here before deleting it, and undo a move by moving back rather than deleting the copies",

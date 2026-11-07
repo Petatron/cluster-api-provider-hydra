@@ -276,8 +276,9 @@ const HypervisorAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/hyper
 // HydraMachine derives a different name and can never find its VM again.
 //
 // It names, it does not grant. Which object owns a machine is recorded on the
-// backend itself, and a moved object takes ownership over from the UID this
-// annotation names only once, the first time it reconciles: until then it can
+// backend itself, and a moved object takes ownership over from the owner last
+// confirmed before the move (OwnerUIDAnnotation) exactly once, the first time
+// it reconciles: until then it can
 // neither manage nor delete the machine, so a stale copy of a moved object --
 // a failed move, a restored backup, a re-applied manifest -- cannot destroy a
 // VM another management cluster still runs.
@@ -288,6 +289,18 @@ const HypervisorAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/hyper
 // it by hand, and never in a template's metadata: Cluster API copies template
 // annotations onto existing machines, which would rename all of them.
 const IdentityUIDAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/identity-uid"
+
+// OwnerUIDAnnotation records the UID the backend last confirmed as this
+// machine's owner (PET-76). Unlike the identity it changes: each time a moved
+// object takes its machine over it writes its own UID here, and the next move
+// carries that across -- the one thing that says which owner record that
+// move's object may take over from. Without it a second move would find the
+// machine recorded as owned by an object it has no trace of.
+//
+// Written by the controller once the backend's record names this object.
+// Leave it to the controller, and keep it out of templates for the same
+// reason as the identity.
+const OwnerUIDAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"
 
 const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady

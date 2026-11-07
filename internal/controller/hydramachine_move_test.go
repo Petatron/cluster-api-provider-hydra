@@ -191,6 +191,64 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 		Expect(provider.Count()).To(Equal(0), "the machine is deleted with the moved object")
 	})
 
+	It("takes over again after a second move", func() {
+		// A pivot back, or a chain of management clusters. After the first
+		// takeover the machine records the first copy as its owner, which only
+		// the owner-uid annotation that copy wrote can tell the second.
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		id := machineID()
+
+		move()
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		first := machine.UID
+		Expect(machine.Annotations).To(HaveKeyWithValue(infrav1.OwnerUIDAnnotation, string(first)))
+
+		move()
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ownerOf(id)).To(Equal(string(machine.UID)))
+		Expect(ownerOf(id)).NotTo(Equal(string(first)))
+
+		Expect(deleteAndReconcile()).To(Succeed())
+		Expect(provider.Count()).To(Equal(0))
+	})
+
+	It("takes over a machine moved before its owner was ever recorded", func() {
+		// Create's window: the identity is written before Create, the owner
+		// record by Create itself, and a failed write leaves the machine owned
+		// by nobody. A move landing then must not strand it.
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		id := machineID()
+		provider.SetOwner(id, "")
+		patch := client.MergeFrom(machine.DeepCopy())
+		delete(machine.Annotations, infrav1.OwnerUIDAnnotation)
+		Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+		move()
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ownerOf(id)).To(Equal(string(machine.UID)))
+	})
+
+	It("sweeps the moved-from name once it has taken the machine over", func() {
+		_, err := reconcile()
+		Expect(err).NotTo(HaveOccurred())
+		id := machineID()
+		oldUID := move()
+		_, err = reconcile()
+		Expect(err).NotTo(HaveOccurred())
+
+		// The domain is undefined behind the provider's back; its disks are not.
+		Expect(provider.Delete(ctx, id)).To(Succeed())
+		provider.AddPartial(backendNameFor(machine, string(oldUID)))
+
+		Expect(deleteAndReconcile()).To(Succeed())
+		Expect(provider.PartialCount()).To(Equal(0), "what it owned must not be left behind")
+	})
+
 	It("refuses a stale copy once the move has been taken over, and deletes nothing for it", func() {
 		_, err := reconcile()
 		Expect(err).NotTo(HaveOccurred())

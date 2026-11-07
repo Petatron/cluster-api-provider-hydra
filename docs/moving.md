@@ -15,14 +15,16 @@ move. Everything below is checked before anything changes.
 **1. The source runs a provider with PET-76, and every machine has reconciled
 under it.** A machine's VM is named from the object's UID, and a move gives
 every object a new one. The provider records the UID the name came from in the
-`hydramachine.infrastructure.cluster.x-k8s.io/identity-uid` annotation, which
-the move carries across. It also records the owner on the VM itself. Both are
-written the first time each machine reconciles after the upgrade, and a paused
-cluster's machines do not reconcile. This must print nothing:
+`hydramachine.infrastructure.cluster.x-k8s.io/identity-uid` annotation, and the
+owner on the VM itself, with the owner it last confirmed in
+`hydramachine.infrastructure.cluster.x-k8s.io/owner-uid`. The move carries both
+annotations across. They are written the first time each machine reconciles
+after the upgrade, and after each move, and a paused cluster's machines do not
+reconcile. This must print nothing:
 
 ```bash
 kubectl get hydramachines -A -o json | jq -r '.items[]
-  | select((.metadata.annotations["hydramachine.infrastructure.cluster.x-k8s.io/identity-uid"] // "") == "")
+  | select((.metadata.annotations["hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"] // "") != .metadata.uid)
   | "\(.metadata.namespace)/\(.metadata.name)"'
 ```
 
