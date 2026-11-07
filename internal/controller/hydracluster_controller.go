@@ -841,14 +841,21 @@ func machineOnHypervisor(ctx context.Context, prov providers.MachineProvider, ma
 	if err != nil || backend != prov.Name() {
 		return fmt.Sprintf("%s has providerID %q, which this backend cannot look up", machine.Name, *machine.Spec.ProviderID), nil
 	}
-	state, err := prov.FindByName(ctx, backendName(machine))
+	// The name the machine was given, which for one moved from another
+	// management cluster is not the one its new UID would give (PET-76).
+	ident, err := identityOf(machine)
+	if err != nil {
+		return fmt.Sprintf("%s: %v", machine.Name, err), nil
+	}
+	name := backendNameFor(machine, ident.uid)
+	state, err := prov.FindByName(ctx, name)
 	switch {
 	case errors.Is(err, providers.ErrNotFound):
-		return fmt.Sprintf("%s has no domain named %s there", machine.Name, backendName(machine)), nil
+		return fmt.Sprintf("%s has no domain named %s there", machine.Name, name), nil
 	case err != nil:
 		return "", fmt.Errorf("looking for HydraMachine %s on the hypervisor: %w", machine.Name, err)
 	case state.ID != id:
-		return fmt.Sprintf("%s's domain %s there has ID %s, not the recorded %s", machine.Name, backendName(machine), state.ID, id), nil
+		return fmt.Sprintf("%s's domain %s there has ID %s, not the recorded %s", machine.Name, name, state.ID, id), nil
 	}
 	return "", nil
 }

@@ -269,6 +269,45 @@ const StoragePoolAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/stor
 // the controller: pointing it elsewhere points teardown elsewhere.
 const HypervisorAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/hypervisor"
 
+// IdentityUIDAnnotation records the object UID a machine's backend name was
+// derived from (PET-76). The name hashes namespace, name and that UID, so it
+// must not change when the UID does -- and `clusterctl move` gives every object
+// a new UID while carrying its annotations across. Without this record a moved
+// HydraMachine derives a different name and can never find its VM again.
+//
+// It names, it does not grant. Which object owns a machine is recorded on the
+// backend itself, and a moved object takes ownership over from the owner last
+// confirmed before the move (OwnerUIDAnnotation) exactly once, the first time
+// it reconciles. Until then it can neither manage nor delete the machine, and
+// once it has, every copy that came before it is refused: a failed move, or a
+// manifest re-applied where the object used to live, cannot destroy a VM
+// another management cluster runs.
+//
+// What it cannot tell apart is a move from a restore. A backup of the current
+// objects restored into a second, live management cluster carries the same
+// annotations a move does, and takes the machines over just as a move would;
+// the cluster it was taken from can then no longer manage them. Restoring is
+// moving.
+//
+// The controller writes it with the object's own UID before the first Create,
+// and onto a machine made before it existed the first time that machine is
+// confirmed to own its VM. Every machine must carry it before a move. Never set
+// it by hand, and never in a template's metadata: Cluster API copies template
+// annotations onto existing machines, which would rename all of them.
+const IdentityUIDAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/identity-uid"
+
+// OwnerUIDAnnotation records the UID the backend last confirmed as this
+// machine's owner (PET-76). Unlike the identity it changes: each time a moved
+// object takes its machine over it writes its own UID here, and the next move
+// carries that across -- the one thing that says which owner record that
+// move's object may take over from. Without it a second move would find the
+// machine recorded as owned by an object it has no trace of.
+//
+// Written by the controller once the backend's record names this object.
+// Leave it to the controller, and keep it out of templates for the same
+// reason as the identity.
+const OwnerUIDAnnotation = "hydramachine.infrastructure.cluster.x-k8s.io/owner-uid"
+
 const (
 	// MachineReadyCondition is mirrored into the Machine's InfrastructureReady
 	// condition by Cluster API.

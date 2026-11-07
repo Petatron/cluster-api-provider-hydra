@@ -41,6 +41,10 @@ Secret informer. A Secret that is missing, lacks a key, or holds a certificate
 and key that don't match is reported terminally on the cluster, as
 `InfrastructureFailed` naming the Secret. Its machines only wait; see below.
 
+**Moving the cluster to another management cluster:** label this Secret
+`clusterctl.cluster.x-k8s.io/move`, or `clusterctl move` leaves it behind. See
+[moving.md](moving.md).
+
 **Rotating credentials:** replace the Secret's contents, or point
 `credentialsSecretRef` at a new Secret. The next reconcile opens a connection
 with the new credentials, and the old connection closes once nothing uses it.
