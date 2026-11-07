@@ -487,6 +487,13 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	// edit, and honouring it would adopt or build under a name derived from
 	// some other object; ignoring it would let the name change the moment a
 	// providerID is recorded. So refuse, and say why.
+	if ident.lastOwner != "" && ident.lastOwner != string(machine.UID) {
+		// Same reasoning for the owner last confirmed: only a move carries
+		// another object's, and a move carries a providerID with it.
+		return nil, fmt.Errorf("%w: annotation %s names UID %q, not this HydraMachine's, and it has no providerID; "+
+			"only the controller may set it -- remove it, and from any template whose metadata carries it",
+			providers.ErrTerminal, infrav1.OwnerUIDAnnotation, ident.lastOwner)
+	}
 	if ident.foreign {
 		return nil, fmt.Errorf("%w: annotation %s names UID %q, not this HydraMachine's, and it has no providerID; "+
 			"only the controller may set it -- remove it, and from any template whose metadata carries it "+

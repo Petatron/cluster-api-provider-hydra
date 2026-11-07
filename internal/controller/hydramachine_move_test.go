@@ -301,6 +301,16 @@ var _ = Describe("HydraMachine Reconciler — moving between management clusters
 		Expect(provider.CreateCalls).To(Equal(0), "nothing may be built under a borrowed identity")
 	})
 
+	It("refuses another object's owner record on a machine with no providerID", func() {
+		patch := client.MergeFrom(machine.DeepCopy())
+		machine.Annotations[infrav1.OwnerUIDAnnotation] = otherObjectUID
+		Expect(k8sClient.Patch(ctx, machine, patch)).To(Succeed())
+
+		_, err := reconcile()
+		Expect(errors.Is(err, providers.ErrTerminal)).To(BeTrue(), "got %v", err)
+		Expect(provider.CreateCalls).To(Equal(0))
+	})
+
 	It("sweeps only its own name when deleted with another object's identity and no providerID", func() {
 		theirs, err := provider.Create(ctx, providers.MachineSpec{
 			Name:     backendNameFor(machine, otherObjectUID),

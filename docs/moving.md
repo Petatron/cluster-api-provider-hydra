@@ -84,6 +84,10 @@ recreated. The providerID and the VM are the same as before.
 - **Do not re-apply old copies of moved objects** (a backup, a manifest dump)
   to the cluster they left. They are refused as soon as they reconcile, because
   the VM records another owner, but they will not clean themselves up either.
+- **Restoring a backup into another live management cluster is a move.** A
+  backup of the current objects carries what a move carries, so its copies take
+  the machines over, and the cluster the backup came from can then no longer
+  manage them. Restore only where the original is gone or paused for good.
 - **Do not put the identity annotation in a template's metadata.** Cluster API
   copies template annotations onto existing machines, which would rename every
   one of them.

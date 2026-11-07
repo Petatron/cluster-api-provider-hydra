@@ -1441,8 +1441,11 @@ func (p *Provider) ownerOf(ctx context.Context, dom golibvirt.Domain) (string, e
 		if isInvalidState(err) {
 			// A transient domain has no persistent definition to keep a record
 			// in. Hydra defines every domain persistently, so this one was made
-			// some other way; say so rather than retry a read that cannot work.
-			return "", fmt.Errorf("%w: libvirt domain %q has no persistent definition to record an owner in: %v",
+			// some other way, or its definition was removed by hand while it ran
+			// (`virsh undefine`); say so rather than retry a read that cannot
+			// work. Defining it again from its running XML recovers it.
+			return "", fmt.Errorf("%w: libvirt domain %q has no persistent definition to record an owner in "+
+				"(made outside Hydra, or undefined while running): %v",
 				providers.ErrTerminal, dom.Name, err)
 		}
 		return "", fmt.Errorf("libvirt: reading the owner of domain %q: %w", dom.Name, err)
