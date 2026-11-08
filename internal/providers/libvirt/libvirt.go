@@ -210,6 +210,7 @@ type client interface {
 	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
 	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
 	DomainInterfaceAddresses(dom golibvirt.Domain, source, flags uint32) ([]golibvirt.DomainInterface, error)
+	ConnectListAllDomains(needResults int32, flags golibvirt.ConnectListAllDomainsFlags) ([]golibvirt.Domain, uint32, error)
 
 	ConnectListAllStoragePools(needResults int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error)
 	StoragePoolLookupByName(name string) (golibvirt.StoragePool, error)
@@ -228,6 +229,8 @@ type client interface {
 	NetworkCreate(n golibvirt.Network) error
 	NetworkSetAutostart(n golibvirt.Network, autostart int32) error
 	NetworkGetXMLDesc(n golibvirt.Network, flags uint32) (string, error)
+	NetworkDestroy(n golibvirt.Network) error
+	NetworkUndefine(n golibvirt.Network) error
 }
 
 var _ client = (*golibvirt.Libvirt)(nil)
@@ -1278,6 +1281,126 @@ func (p *Provider) networkBridge(ctx context.Context, n golibvirt.Network, name 
 		return "", fmt.Errorf("libvirt: network %q reports no bridge to attach machines to", name)
 	}
 	return parsed.Bridge.Name, nil
+}
+
+// DeleteNetwork implements providers.MachineProvider (PET-41).
+//
+// Three checks stand between a cluster's deletion and a network going away, and
+// each one can only leave a network behind, never take the wrong one:
+//
+//   - the definition must carry Hydra's owner record, naming this owner's ID.
+//     A network Hydra adopted has none, nor does one made before records
+//     existed, and those are never removed;
+//   - no domain on the host, running or not, may reference it, either by the
+//     network's name or by its bridge -- which is how Hydra's own machines
+//     attach, so libvirt's count of a network's connections does not see them;
+//   - and it is undefined before it is stopped. Undefined, a running network is
+//     transient and dies with the destroy; stopped first, a reconcile racing
+//     this could find it defined and start it again.
+func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner providers.NetworkOwner) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	n, err := call(ctx, p, func() (golibvirt.Network, error) { return p.client().NetworkLookupByName(name) })
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: looking up network %q: %w", name, err)
+	}
+	// The persistent definition, which is where the record was written and the
+	// copy that survives a restart.
+	desc, err := call(ctx, p, func() (string, error) {
+		return p.client().NetworkGetXMLDesc(n, uint32(golibvirt.NetworkXMLInactive))
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: reading network %q: %w", name, err)
+	}
+	var def networkDef
+	if err := xml.Unmarshal([]byte(desc), &def); err != nil {
+		return fmt.Errorf("libvirt: parsing network %q: %w", name, err)
+	}
+	switch {
+	case def.Metadata == nil || def.Metadata.Owner == nil:
+		return fmt.Errorf("%w: libvirt network %q records no owner -- adopted, or made before owners were recorded",
+			providers.ErrNetworkNotOwned, name)
+	case owner.ID == "" || def.Metadata.Owner.ID != owner.ID:
+		return fmt.Errorf("%w: libvirt network %q records owner %q (%s), not %q",
+			providers.ErrNetworkNotOwned, name, def.Metadata.Owner.ID, def.Metadata.Owner.Cluster, owner.ID)
+	}
+
+	bridge := def.Bridge.Name
+	if bridge == "" {
+		// libvirt names the bridge when it defines a network, so this should not
+		// happen. Hydra's machines attach by bridge, so a scan without one could
+		// not see them: take the running definition's, and refuse without one.
+		if bridge, err = p.networkBridge(ctx, n, name); err != nil {
+			return fmt.Errorf("%w: libvirt network %q: no bridge to check for machines: %v",
+				providers.ErrNetworkInUse, name, err)
+		}
+	}
+	users, err := p.domainsReferencing(ctx, name, bridge)
+	if err != nil {
+		return err
+	}
+	if len(users) > 0 {
+		return fmt.Errorf("%w: libvirt network %q is referenced by %s", providers.ErrNetworkInUse, name, strings.Join(users, ", "))
+	}
+
+	if err := callVoid(ctx, p, func() error { return p.client().NetworkUndefine(n) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
+		// Invalid state: already undefined by an earlier attempt whose destroy
+		// then failed, so it is running and transient ("can't undefine transient
+		// network", libvirt 12.0.0). The destroy below finishes it.
+		return fmt.Errorf("libvirt: undefining network %q: %w", name, err)
+	}
+	if err := callVoid(ctx, p, func() error { return p.client().NetworkDestroy(n) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
+		// Not found: already gone. Invalid state: it was not running, and once
+		// undefined an inactive network no longer exists either.
+		return fmt.Errorf("libvirt: stopping network %q: %w", name, err)
+	}
+	return nil
+}
+
+// domainsReferencing names every domain on the host whose definition -- live or
+// persistent, the two can differ -- has an interface on the network or its
+// bridge. Every domain, not only Hydra's: a guest an operator attached by hand
+// loses its network just the same.
+func (p *Provider) domainsReferencing(ctx context.Context, network, bridge string) ([]string, error) {
+	doms, _, err := call2(ctx, p, func() ([]golibvirt.Domain, uint32, error) {
+		return p.client().ConnectListAllDomains(1, 0)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("libvirt: listing domains: %w", err)
+	}
+	var users []string
+	for _, dom := range doms {
+		for _, flags := range []golibvirt.DomainXMLFlags{0, golibvirt.DomainXMLInactive} {
+			desc, err := call(ctx, p, func() (string, error) { return p.client().DomainGetXMLDesc(dom, flags) })
+			if err != nil {
+				if isNotFound(err) {
+					break // undefined since the list: it references nothing now
+				}
+				return nil, fmt.Errorf("libvirt: reading domain %q: %w", dom.Name, err)
+			}
+			var d domainIfacesDef
+			if err := xml.Unmarshal([]byte(desc), &d); err != nil {
+				return nil, fmt.Errorf("libvirt: parsing domain %q: %w", dom.Name, err)
+			}
+			if d.references(network, bridge) {
+				users = append(users, dom.Name)
+				break
+			}
+		}
+	}
+	return users, nil
 }
 
 // EnsureInfrastructure implements providers.MachineProvider.

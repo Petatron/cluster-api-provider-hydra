@@ -60,6 +60,16 @@ var ErrInvalidID = errors.New("machine id is not valid for this backend")
 // terminal would invite remediation of a machine that was about to be fine.
 var ErrTerminal = errors.New("terminal provider failure")
 
+// ErrNetworkNotOwned is DeleteNetwork finding a network it may not remove: one
+// with no owner record, which Hydra adopted or which predates owner records,
+// or one recorded as another cluster's. Not a failure -- leaving such a
+// network alone is the point -- so it is neither terminal nor retried.
+var ErrNetworkNotOwned = errors.New("network was not created for this cluster")
+
+// ErrNetworkInUse is DeleteNetwork finding a machine still attached to the
+// network. Retry: it clears once that machine is gone.
+var ErrNetworkInUse = errors.New("network is still in use")
+
 // AddressType classifies a machine address, mirroring the Cluster API
 // MachineAddress types the controller surfaces on status.
 type AddressType string
@@ -112,6 +122,21 @@ type ManagedNetwork struct {
 	// out is the point: that is the space the endpoint comes from.
 	DHCPStart string
 	DHCPEnd   string
+
+	// Owner is recorded on a network the backend creates, and only then: it is
+	// what lets DeleteNetwork tell a network made for this cluster from one it
+	// adopted (PET-41). Zero means record none.
+	Owner NetworkOwner
+}
+
+// NetworkOwner identifies the cluster a managed network was created for.
+type NetworkOwner struct {
+	// ID is the cluster's network-owner ID: random, recorded on the HydraCluster
+	// once, and carried across a move. Ownership is decided on this alone.
+	ID string
+	// Cluster is namespace/name, recorded beside the ID for whoever reads the
+	// network's definition. It is not compared.
+	Cluster string
 }
 
 // NodePlatform is the platform of the Kubernetes node a machine becomes, as
@@ -350,6 +375,13 @@ type MachineProvider interface {
 	// the machine's own pool cannot be searched, nothing found is not proof, and
 	// deletion fails until it can be.
 	DeleteByName(ctx context.Context, name, storagePool string) error
+
+	// DeleteNetwork removes the managed network called name if it was created
+	// for owner and nothing uses it. It returns nil once the network is gone,
+	// including when it was never there; ErrNetworkNotOwned when the network
+	// records no owner or another one, which it leaves alone; and
+	// ErrNetworkInUse while any machine on the host still references it.
+	DeleteNetwork(ctx context.Context, name string, owner NetworkOwner) error
 }
 
 // ProviderID renders the Cluster API providerID for a machine.

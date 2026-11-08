@@ -100,6 +100,9 @@ type fakeDomain struct {
 	// addrs is what DomainInterfaceAddresses reports per source; a source with
 	// no entry fails, the way an absent guest agent does.
 	addrs map[uint32][]golibvirt.DomainInterface
+	// inactiveXML, when set, is the persistent definition where it differs from
+	// the running one -- an interface added with --config only, say.
+	inactiveXML string
 }
 
 type fakeNetwork struct {
@@ -107,6 +110,9 @@ type fakeNetwork struct {
 	xml       string
 	active    bool
 	autostart bool
+	// transient is a running network that has been undefined: it goes away
+	// when it stops.
+	transient bool
 }
 
 func newFakeLibvirt() *fakeLibvirt {
@@ -307,7 +313,7 @@ func (f *fakeLibvirt) DomainIsActive(dom golibvirt.Domain) (int32, error) {
 	return 0, nil
 }
 
-func (f *fakeLibvirt) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXMLFlags) (string, error) {
+func (f *fakeLibvirt) DomainGetXMLDesc(dom golibvirt.Domain, flags golibvirt.DomainXMLFlags) (string, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("DomainGetXMLDesc", dom.Name); err != nil {
 		return "", err
@@ -316,7 +322,31 @@ func (f *fakeLibvirt) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainX
 	if err != nil {
 		return "", err
 	}
+	if flags&golibvirt.DomainXMLInactive != 0 && d.inactiveXML != "" {
+		return d.inactiveXML, nil
+	}
 	return d.xml, nil
+}
+
+// ConnectListAllDomains returns every domain, running or not, as flags 0 does.
+func (f *fakeLibvirt) ConnectListAllDomains(_ int32, flags golibvirt.ConnectListAllDomainsFlags) ([]golibvirt.Domain, uint32, error) {
+	defer f.mu.Unlock()
+	if err := f.enter("ConnectListAllDomains", ""); err != nil {
+		return nil, 0, err
+	}
+	if flags != 0 {
+		return nil, 0, lvErr(golibvirt.ErrInvalidArg)
+	}
+	names := make([]string, 0, len(f.domains))
+	for name := range f.domains {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	out := make([]golibvirt.Domain, 0, len(names))
+	for _, name := range names {
+		out = append(out, f.domains[name].dom)
+	}
+	return out, uint32(len(out)), nil
 }
 
 func (f *fakeLibvirt) DomainCreate(dom golibvirt.Domain) error {
@@ -687,4 +717,46 @@ func (f *fakeLibvirt) NetworkGetXMLDesc(n golibvirt.Network, _ uint32) (string, 
 		return "", err
 	}
 	return got.xml, nil
+}
+
+// NetworkUndefine removes an inactive network, and leaves a running one
+// transient, as libvirt does.
+func (f *fakeLibvirt) NetworkUndefine(n golibvirt.Network) error {
+	defer f.mu.Unlock()
+	if err := f.enter("NetworkUndefine", n.Name); err != nil {
+		return err
+	}
+	got, err := f.network(n)
+	if err != nil {
+		return err
+	}
+	if got.transient {
+		return lvErr(golibvirt.ErrOperationInvalid) // "can't undefine transient network"
+	}
+	if !got.active {
+		delete(f.networks, n.Name)
+		return nil
+	}
+	got.transient = true
+	return nil
+}
+
+// NetworkDestroy stops a running network, which removes it if it is transient.
+func (f *fakeLibvirt) NetworkDestroy(n golibvirt.Network) error {
+	defer f.mu.Unlock()
+	if err := f.enter("NetworkDestroy", n.Name); err != nil {
+		return err
+	}
+	got, err := f.network(n)
+	if err != nil {
+		return err
+	}
+	if !got.active {
+		return lvErr(golibvirt.ErrOperationInvalid)
+	}
+	got.active = false
+	if got.transient {
+		delete(f.networks, n.Name)
+	}
+	return nil
 }

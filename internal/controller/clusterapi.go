@@ -449,6 +449,12 @@ func clusterReadyForCreate(link *linkage) error {
 		// ever revisit it.
 		return fmt.Errorf("%w: HydraCluster %q is not visible yet", errWaitingForHydraCluster, link.hydraClusterName)
 	}
+	if link.hydraCluster != nil && !link.hydraCluster.DeletionTimestamp.IsZero() {
+		// Its teardown may be removing the managed network this machine would be
+		// attached to (PET-41), and nothing a machine created now could do is
+		// worth racing that.
+		return fmt.Errorf("%w: HydraCluster %q is being deleted", errWaitingForHydraCluster, link.hydraClusterName)
+	}
 	// Gate on the HydraCluster's CURRENT readiness, not on the latched milestone
 	// below.
 	//

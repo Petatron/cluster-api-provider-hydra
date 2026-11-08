@@ -150,6 +150,13 @@ func (p *Instrumented) EnsureInfrastructure(ctx context.Context, spec Infrastruc
 	return err
 }
 
+func (p *Instrumented) DeleteNetwork(ctx context.Context, name string, owner NetworkOwner) error {
+	start := time.Now()
+	err := p.MachineProvider.DeleteNetwork(ctx, name, owner)
+	p.observe("DeleteNetwork", start, err)
+	return err
+}
+
 func (p *Instrumented) observe(operation string, start time.Time, err error) {
 	observe(p.hypervisor, operation, start, err)
 }

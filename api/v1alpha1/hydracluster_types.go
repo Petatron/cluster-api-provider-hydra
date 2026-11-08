@@ -22,6 +22,18 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
+// NetworkOwnerAnnotation records the ID a HydraCluster's managed network is
+// created under (PET-41). The controller writes it once, a random value,
+// before the network can be defined, and the network records the same ID in its
+// definition; only a cluster whose annotation matches removes the network when
+// it is deleted.
+//
+// Random rather than the object's UID so that `clusterctl move` -- which
+// carries annotations and replaces UIDs -- keeps a cluster's network its own,
+// while a cluster deleted and recreated under the same name gets a new ID and
+// does not inherit the previous one's network. Leave it to the controller.
+const NetworkOwnerAnnotation = "hydracluster.infrastructure.cluster.x-k8s.io/network-owner"
+
 // HydraClusterSpec defines the desired state of HydraCluster.
 //
 // This is the cluster-scoped half of the provider's configuration. Everything
@@ -264,7 +276,9 @@ type HydraManagedNetwork struct {
 	//
 	// Hydra creates it if it is absent and verifies it if it is not, so naming an
 	// existing network adopts it -- which is why the checks are strict about the
-	// subnet and range matching rather than reconfiguring what it finds.
+	// subnet and range matching rather than reconfiguring what it finds. A
+	// network Hydra created is removed with the cluster once nothing uses it; an
+	// adopted one never is.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63

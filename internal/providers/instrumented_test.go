@@ -127,6 +127,7 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		"EnsureInfrastructure": func() error {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
 		},
+		"DeleteNetwork": func() error { return p.DeleteNetwork(t.Context(), "net", NetworkOwner{}) },
 	}
 	// Name is a constant and StoragePoolFor reads configuration; neither is a
 	// backend operation, and neither touches the hypervisor.
@@ -224,6 +225,11 @@ func (p *recordingProvider) DeleteByName(_ context.Context, _, _ string) error {
 
 func (p *recordingProvider) EnsureInfrastructure(_ context.Context, _ InfrastructureSpec) error {
 	p.lastOp = "EnsureInfrastructure"
+	return p.err
+}
+
+func (p *recordingProvider) DeleteNetwork(_ context.Context, _ string, _ NetworkOwner) error {
+	p.lastOp = "DeleteNetwork"
 	return p.err
 }
 

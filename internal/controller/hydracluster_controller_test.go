@@ -232,8 +232,11 @@ var _ = Describe("HydraCluster Reconciler", func() {
 
 			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
+			owner := reload(r).Annotations[infrav1.NetworkOwnerAnnotation]
+			Expect(owner).NotTo(BeEmpty(), "the owner ID is recorded before the backend may define the network")
 			Expect(provider.LastInfrastructure.ManagedNetwork).To(Equal(&providers.ManagedNetwork{
 				Name: testNetName, Subnet: testSubnet, DHCPStart: testDHCPStart, DHCPEnd: testDHCPEnd,
+				Owner: providers.NetworkOwner{ID: owner, Cluster: linkNamespace + "/" + linkClusterName},
 			}))
 			Expect(reload(r).Spec.ControlPlaneEndpoint).To(Equal(clusterv1.APIEndpoint{Host: testStatedHost, Port: 6443}),
 				"a stated endpoint is never replaced by a derived one")
@@ -243,6 +246,10 @@ var _ = Describe("HydraCluster Reconciler", func() {
 		Context("choosing the endpoint on a managed network", func() {
 			onManagedNetwork := func(endpoint clusterv1.APIEndpoint, subnet, start, end string) {
 				hc = hydraCluster(func(c *infrav1.HydraCluster) {
+					// As after the first reconcile, so the specs below count and
+					// fail the endpoint write alone (PET-41 writes these first).
+					c.Finalizers = []string{ClusterFinalizer}
+					c.Annotations = map[string]string{infrav1.NetworkOwnerAnnotation: testNetworkOwnerID}
 					c.Spec.ControlPlaneEndpoint = endpoint
 					c.Spec.ManagedNetwork = &infrav1.HydraManagedNetwork{
 						Name: testNetName, Subnet: subnet, DHCPStart: start, DHCPEnd: end,
