@@ -150,38 +150,20 @@ var _ = Describe("HydraCluster Reconciler — releasing a managed network", func
 		Expect(gone()).To(BeTrue(), "the finalizer is released")
 	})
 
-	It("waits for the cluster's machines first", func() {
+	It("does not wait for machines that have no domain", func() {
+		// The wedge a machine count made: deleting the HydraCluster on its own
+		// while a MachineDeployment still stamps machines. Each new HydraMachine
+		// is held at the create gate, never gets a domain, and never goes away.
+		// One that has a domain is held by the backend's scan instead.
 		machine := newMachine(func(m *infrav1.HydraMachine) {
 			m.Labels = map[string]string{clusterv1.ClusterNameLabel: linkClusterName}
 		})
 		ownedAndCreated(owningCluster(nil), machine)
 
-		res, err := deleted()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(requeueClusterDeleting))
-		Expect(provider.NetworkDeletes).To(BeZero())
-		Expect(gone()).To(BeFalse())
-
-		// A machine gone never blocks.
-		Expect(c.Delete(ctx, machine)).To(Succeed())
-		_, err = reconcile()
+		_, err := deleted()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(provider.DeletedNetworks).To(Equal([]string{testNetName}))
 		Expect(gone()).To(BeTrue())
-	})
-
-	It("finds the cluster's machines by its own label when the owning Cluster is gone", func() {
-		machine := newMachine(func(m *infrav1.HydraMachine) {
-			m.Labels = map[string]string{clusterv1.ClusterNameLabel: linkClusterName}
-		})
-		ownedAndCreated(machine)
-		hc.Labels = map[string]string{clusterv1.ClusterNameLabel: linkClusterName}
-		Expect(c.Update(ctx, hc)).To(Succeed())
-
-		res, err := deleted()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(requeueClusterDeleting))
-		Expect(provider.NetworkDeletes).To(BeZero())
 	})
 
 	It("waits while a machine still references the network", func() {

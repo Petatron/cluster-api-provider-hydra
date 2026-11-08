@@ -507,18 +507,13 @@ func (r *HydraClusterReconciler) reconcileDelete(ctx context.Context, hydraClust
 		return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
 	}
 
-	// Wait for the cluster's machines. Cluster API deletes the infrastructure
-	// cluster only after them anyway; this covers a HydraCluster deleted on its
-	// own. A machine already gone never blocks. It is a courtesy, not the guard:
-	// the backend's check for domains still on the network is.
-	if remaining, err := r.remainingMachines(ctx, hydraCluster, cluster); err != nil {
-		return ctrl.Result{}, err
-	} else if remaining > 0 {
-		log.Info("Waiting for the cluster's machines before releasing its managed network",
-			"name", hydraCluster.Name, "remaining", remaining)
-		return ctrl.Result{RequeueAfter: requeueClusterDeleting},
-			r.recordDeleting(ctx, hydraCluster, fmt.Sprintf("waiting for %d HydraMachine(s) before releasing managed network %q", remaining, managed.Name))
-	}
+	// No wait for the cluster's HydraMachines. One that has a domain is held
+	// by the backend's scan below, and one that has none is not on the network.
+	// Counting objects instead wedges: a machine machine creation will not let
+	// proceed while this cluster is deleting never gets a domain and never goes
+	// away, and a MachineDeployment replaces any that are removed by hand. A
+	// create that passed that gate just before this deletion re-reads the
+	// cluster, uncached, before defining its domain.
 
 	// Another cluster declaring the same network may have adopted it, and may be
 	// creating a machine on it right now -- between resolving the bridge and
@@ -545,8 +540,8 @@ func (r *HydraClusterReconciler) reconcileDelete(ctx context.Context, hydraClust
 			// when a whole namespace is deleted. Nothing can be checked, so nothing
 			// is removed; and nothing can fix this by waiting, so do not hold the
 			// deletion forever over it.
-			log.Error(err, "Left the managed network in place: its hypervisor cannot be reached to check it",
-				"name", hydraCluster.Name, "network", managed.Name)
+			log.Info("Left the managed network in place: no backend can be built to check it",
+				"name", hydraCluster.Name, "network", managed.Name, "reason", err.Error())
 			return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
 		}
 		return ctrl.Result{}, err
@@ -605,25 +600,6 @@ func (r *HydraClusterReconciler) releaseFinalizer(ctx context.Context, hydraClus
 	}
 	r.release(ctx, client.ObjectKeyFromObject(hydraCluster))
 	return nil
-}
-
-// remainingMachines counts the HydraMachines still in the cluster: those
-// labelled with its Cluster's name, from the owning Cluster or, when that is
-// not known, the cluster-name label Cluster API puts on this object too.
-func (r *HydraClusterReconciler) remainingMachines(ctx context.Context, hydraCluster *infrav1.HydraCluster, cluster *clusterv1.Cluster) (int, error) {
-	name := hydraCluster.Labels[clusterv1.ClusterNameLabel]
-	if cluster != nil {
-		name = cluster.Name
-	}
-	if name == "" {
-		return 0, nil
-	}
-	machines := &infrav1.HydraMachineList{}
-	if err := r.List(ctx, machines, client.InNamespace(hydraCluster.Namespace),
-		client.MatchingLabels{clusterv1.ClusterNameLabel: name}); err != nil {
-		return 0, fmt.Errorf("listing the cluster's machines: %w", err)
-	}
-	return len(machines.Items), nil
 }
 
 // otherClusterDeclaring names another HydraCluster, in any namespace and not
