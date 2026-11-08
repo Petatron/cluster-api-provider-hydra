@@ -110,13 +110,15 @@ Hydra created it for that cluster and nothing uses it any more** (PET-41):
 
 - A network Hydra defines records its owner, a random ID the cluster keeps in its
   `hydracluster.infrastructure.cluster.x-k8s.io/network-owner` annotation, in the
-  network's own definition. A network Hydra adopted carries no such record, and
-  is never removed, nor is one made before records existed. A cluster recreated
-  under the same name gets a new ID, so it does not inherit the old network.
+  network's own definition, beside the cluster's namespace/name; both must
+  match. A network Hydra adopted carries no such record, and is never removed,
+  nor is one made before records existed. A cluster recreated under the same
+  name gets a new ID, so it does not inherit the old network.
 - The cluster's deletion waits for every domain on the host -- Hydra's or not,
   running or stopped -- that still references the network. It does not wait for
   HydraMachines that have no domain: no machine is built while its HydraCluster
-  is being deleted, so one that has not been built never will be.
+  is being deleted, so one that has not been built never will be, and one being
+  built holds the network from resolving it until its domain is defined.
 - A network another HydraCluster also declares is left alone.
 - When no backend can be built for the cluster -- its credentials Secret is gone,
   as when a whole namespace is deleted, or no hypervisor is configured -- the

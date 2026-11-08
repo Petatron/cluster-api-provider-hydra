@@ -45,6 +45,9 @@ const (
 	otherClusterName = "other"
 )
 
+// testOwner is the owner the cluster under test records on its network.
+var testOwner = providers.NetworkOwner{ID: testNetworkOwnerID, Cluster: linkNamespace + "/" + linkClusterName}
+
 // PET-41: a HydraCluster releases the managed network it created when it is
 // deleted, and nothing else.
 var _ = Describe("HydraCluster Reconciler — releasing a managed network", func() {
@@ -97,7 +100,7 @@ var _ = Describe("HydraCluster Reconciler — releasing a managed network", func
 		hc.Annotations = map[string]string{infrav1.NetworkOwnerAnnotation: testNetworkOwnerID}
 		key = client.ObjectKeyFromObject(hc)
 		build(objs...)
-		provider.AddNetwork(testNetName, testNetworkOwnerID)
+		provider.AddNetwork(testNetName, fake.RecordedOwner(testOwner))
 	}
 
 	BeforeEach(func() {
@@ -119,7 +122,9 @@ var _ = Describe("HydraCluster Reconciler — releasing a managed network", func
 		Expect(id).NotTo(BeEmpty())
 		recorded, ok := provider.HasNetwork(testNetName)
 		Expect(ok).To(BeTrue())
-		Expect(recorded).To(Equal(id), "the network is defined under the recorded owner")
+		Expect(recorded).To(Equal(fake.RecordedOwner(providers.NetworkOwner{
+			ID: id, Cluster: linkNamespace + "/" + linkClusterName,
+		})), "the network is defined under the recorded owner")
 
 		// And keeps it: a second pass writes no new ID.
 		_, err = reconcile()
@@ -200,14 +205,29 @@ var _ = Describe("HydraCluster Reconciler — releasing a managed network", func
 
 	It("leaves a network made for a previous cluster of the same name", func() {
 		ownedAndCreated()
-		provider.AddNetwork(testNetName, "0b9c1a64-1111-4222-8333-444455556666")
+		provider.AddNetwork(testNetName, fake.RecordedOwner(providers.NetworkOwner{
+			ID: "0b9c1a64-1111-4222-8333-444455556666", Cluster: testOwner.Cluster,
+		}))
 
 		_, err := deleted()
 		Expect(err).NotTo(HaveOccurred())
-		recorded, ok := provider.HasNetwork(testNetName)
+		_, ok := provider.HasNetwork(testNetName)
 		Expect(ok).To(BeTrue())
-		Expect(recorded).NotTo(Equal(testNetworkOwnerID))
 		Expect(gone()).To(BeTrue())
+	})
+
+	It("does not honour its owner ID on a network recorded for another cluster", func() {
+		// The ID is an annotation, so it can be copied. Only an object of the
+		// same namespace and name -- a moved cluster -- may use it.
+		ownedAndCreated()
+		provider.AddNetwork(testNetName, fake.RecordedOwner(providers.NetworkOwner{
+			ID: testNetworkOwnerID, Cluster: "elsewhere/" + linkClusterName,
+		}))
+
+		_, err := deleted()
+		Expect(err).NotTo(HaveOccurred())
+		_, ok := provider.HasNetwork(testNetName)
+		Expect(ok).To(BeTrue())
 	})
 
 	It("leaves a network another cluster declares, without asking the backend", func() {
@@ -238,7 +258,7 @@ var _ = Describe("HydraCluster Reconciler — releasing a managed network", func
 
 	It("releases a network that is already gone", func() {
 		ownedAndCreated()
-		Expect(provider.DeleteNetwork(ctx, testNetName, providers.NetworkOwner{ID: testNetworkOwnerID})).To(Succeed())
+		Expect(provider.DeleteNetwork(ctx, testNetName, testOwner)).To(Succeed())
 
 		_, err := deleted()
 		Expect(err).NotTo(HaveOccurred())

@@ -775,9 +775,17 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// existence, and machine creation is already gated on that check having
 	// passed -- so a machine that gets this far and finds no network has hit a
 	// real fault, not a race worth papering over by creating one here.
+	//
+	// Held from resolving the bridge until the domain is defined, the same lock
+	// DeleteNetwork holds from its scan to its destroy (PET-41). Without it a
+	// teardown could find no domain on the network between the two, remove it,
+	// and leave this machine defined against a bridge that no longer exists.
+	var unlock func()
 	if spec.ManagedNetwork != nil {
+		unlock = p.lockNetwork(spec.ManagedNetwork.Name)
 		bridge, nErr := p.resolveNetwork(ctx, *spec.ManagedNetwork)
 		if nErr != nil {
+			unlock()
 			rollback()
 			return nil, nErr
 		}
@@ -787,6 +795,9 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
 		return p.client().DomainDefineXML(domainXML(spec, rootPath, cidataPath))
 	})
+	if unlock != nil {
+		unlock()
+	}
 	if err != nil {
 		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
@@ -1303,6 +1314,9 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 		return err
 	}
 	defer cancel()
+	// No machine can be between resolving this network and defining its domain
+	// while the scan below runs and the network is removed. See Create.
+	defer p.lockNetwork(name)()
 
 	n, err := call(ctx, p, func() (golibvirt.Network, error) { return p.client().NetworkLookupByName(name) })
 	if err != nil {
@@ -1312,10 +1326,16 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 		return fmt.Errorf("libvirt: looking up network %q: %w", name, err)
 	}
 	// The persistent definition, which is where the record was written and the
-	// copy that survives a restart.
+	// copy that survives a restart. A network an earlier attempt undefined and
+	// then failed to stop has none; libvirt 12.0.0 answers with its running
+	// definition anyway, but fall back to that explicitly rather than read a
+	// failure as gone while it still runs.
 	desc, err := call(ctx, p, func() (string, error) {
 		return p.client().NetworkGetXMLDesc(n, uint32(golibvirt.NetworkXMLInactive))
 	})
+	if err != nil {
+		desc, err = call(ctx, p, func() (string, error) { return p.client().NetworkGetXMLDesc(n, 0) })
+	}
 	if err != nil {
 		if isNotFound(err) {
 			return nil
@@ -1330,9 +1350,12 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 	case def.Metadata == nil || def.Metadata.Owner == nil:
 		return fmt.Errorf("%w: libvirt network %q records no owner -- adopted, or made before owners were recorded",
 			providers.ErrNetworkNotOwned, name)
-	case owner.ID == "" || def.Metadata.Owner.ID != owner.ID:
-		return fmt.Errorf("%w: libvirt network %q records owner %q (%s), not %q",
-			providers.ErrNetworkNotOwned, name, def.Metadata.Owner.ID, def.Metadata.Owner.Cluster, owner.ID)
+	case owner.ID == "" || def.Metadata.Owner.ID != owner.ID || def.Metadata.Owner.Cluster != owner.Cluster:
+		// The cluster too, not the ID alone. The ID lives in an annotation, so
+		// requiring both means a copied ID is only honoured by an object of the
+		// same namespace and name -- which is what a moved cluster is.
+		return fmt.Errorf("%w: libvirt network %q records owner %q (%s), not %q (%s)",
+			providers.ErrNetworkNotOwned, name, def.Metadata.Owner.ID, def.Metadata.Owner.Cluster, owner.ID, owner.Cluster)
 	}
 
 	bridge := def.Bridge.Name
@@ -1367,6 +1390,22 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 		return fmt.Errorf("libvirt: stopping network %q: %w", name, err)
 	}
 	return nil
+}
+
+// networkLocks serialises, per hypervisor and network, attaching a new machine
+// to a managed network with removing that network (PET-41). Both happen in this
+// one manager process -- its cluster and machine controllers -- so a process
+// lock is the whole of the coordination needed. Keyed by the hypervisor, not
+// the Provider: two providers can reach the same host.
+var networkLocks sync.Map // string -> *sync.Mutex
+
+// lockNetwork takes the lock for a network on this provider's hypervisor and
+// returns the function that releases it.
+func (p *Provider) lockNetwork(name string) func() {
+	m, _ := networkLocks.LoadOrStore(p.cfg.Hypervisor()+"/"+name, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // domainsReferencing names every domain on the host whose definition -- live or

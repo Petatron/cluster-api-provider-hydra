@@ -129,6 +129,7 @@ func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters/finalizers,verbs=update
 // Confirming a hypervisor lists the cluster's machines and records it on them.
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;patch
 // Hypervisor credentials, read one at a time through the uncached APIReader.
@@ -544,6 +545,10 @@ func (r *HydraClusterReconciler) reconcileDelete(ctx context.Context, hydraClust
 				"name", hydraCluster.Name, "network", managed.Name, "reason", err.Error())
 			return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
 		}
+		// Configured, but not reachable now: retried, and said so on the object.
+		if statusErr := r.recordDeleting(ctx, hydraCluster, fmt.Sprintf("releasing managed network %q: %v", managed.Name, err)); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -572,6 +577,14 @@ func (r *HydraClusterReconciler) reconcileDelete(ctx context.Context, hydraClust
 		return ctrl.Result{}, fmt.Errorf("releasing managed network %q: %w", managed.Name, err)
 	}
 	return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+}
+
+// reader is the uncached API reader, or the client where none is set.
+func (r *HydraClusterReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // recordDeleting says on the object what its deletion is waiting for.
@@ -607,8 +620,10 @@ func (r *HydraClusterReconciler) releaseFinalizer(ctx context.Context, hydraClus
 // Hypervisors are not compared: telling them apart would only ever save a
 // network, and getting it wrong would remove one in use.
 func (r *HydraClusterReconciler) otherClusterDeclaring(ctx context.Context, hydraCluster *infrav1.HydraCluster) (string, error) {
+	// Uncached: a cluster created a moment ago, which the cache has not seen
+	// yet, is exactly the one that may be about to attach to this network.
 	all := &infrav1.HydraClusterList{}
-	if err := r.List(ctx, all); err != nil {
+	if err := r.reader().List(ctx, all); err != nil {
 		return "", fmt.Errorf("listing HydraClusters: %w", err)
 	}
 	for i := range all.Items {

@@ -158,8 +158,10 @@ func (p *Provider) EnsureInfrastructure(_ context.Context, spec providers.Infras
 		return p.InfrastructureErr
 	}
 	if n := spec.ManagedNetwork; n != nil {
-		if _, ok := p.networks[n.Name]; !ok {
-			p.networks[n.Name] = n.Owner.ID
+		if _, ok := p.networks[n.Name]; !ok && n.Owner.ID != "" {
+			p.networks[n.Name] = n.Owner.ID + "|" + n.Owner.Cluster
+		} else if !ok {
+			p.networks[n.Name] = ""
 		}
 	}
 	return nil
@@ -178,7 +180,7 @@ func (p *Provider) DeleteNetwork(_ context.Context, name string, owner providers
 	switch {
 	case !ok:
 		return nil
-	case recorded == "" || recorded != owner.ID:
+	case recorded == "" || recorded != owner.ID+"|"+owner.Cluster:
 		return fmt.Errorf("%w: %s records owner %q", providers.ErrNetworkNotOwned, name, recorded)
 	case p.NetworkUsers[name]:
 		return fmt.Errorf("%w: %s", providers.ErrNetworkInUse, name)
@@ -189,12 +191,16 @@ func (p *Provider) DeleteNetwork(_ context.Context, name string, owner providers
 }
 
 // AddNetwork defines a network directly, standing in for one an operator made
-// (owner "") or one made for another cluster.
+// (owner "") or one made for another cluster: owner is "ID|namespace/name",
+// as RecordedOwner builds it.
 func (p *Provider) AddNetwork(name, owner string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.networks[name] = owner
 }
+
+// RecordedOwner renders an owner the way the fake records it.
+func RecordedOwner(o providers.NetworkOwner) string { return o.ID + "|" + o.Cluster }
 
 // HasNetwork reports whether a network is defined, and its recorded owner.
 func (p *Provider) HasNetwork(name string) (string, bool) {

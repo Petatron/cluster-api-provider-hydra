@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 
@@ -86,7 +87,7 @@ func TestDeleteNetworkReadsAPrefixedOwnerRecord(t *testing.T) {
 	def := matchingNetworkDef()
 	n := f.addNetwork(def.Name, def, true)
 	n.xml = `<network><name>` + def.Name + `</name><metadata><hydra:owner xmlns:hydra="` + networkOwnerNamespace +
-		`" id="` + testNetworkOwner.ID + `"/></metadata><bridge name="virbr7"/></network>`
+		`" id="` + testNetworkOwner.ID + `" cluster="` + testNetworkOwner.Cluster + `"/></metadata><bridge name="virbr7"/></network>`
 
 	if err := p.DeleteNetwork(t.Context(), def.Name, testNetworkOwner); err != nil {
 		t.Fatalf("DeleteNetwork: %v", err)
@@ -251,5 +252,76 @@ func TestDeleteNetworkFailsWhenItCannotLook(t *testing.T) {
 				t.Error("the network was removed without a complete check")
 			}
 		})
+	}
+}
+
+// The record names the cluster as well as the ID, and both must match: the ID
+// lives in an annotation and can be copied, but only an object of the same
+// namespace and name is a moved cluster.
+func TestDeleteNetworkRequiresTheRecordedCluster(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+
+	copied := providers.NetworkOwner{ID: testNetworkOwner.ID, Cluster: "elsewhere/cluster"}
+	if err := p.DeleteNetwork(t.Context(), testManagedNetwork.Name, copied); !errors.Is(err, providers.ErrNetworkNotOwned) {
+		t.Fatalf("got %v, want ErrNetworkNotOwned", err)
+	}
+	if _, ok := f.networks[testManagedNetwork.Name]; !ok {
+		t.Error("removed on a copied ID")
+	}
+}
+
+// Reading the persistent definition can fail where a running one exists -- a
+// network an earlier attempt undefined. The live definition is read instead,
+// rather than taking the failure to mean the network is gone.
+func TestDeleteNetworkFallsBackToTheRunningDefinition(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+	f.errs["NetworkGetXMLDesc:inactive"] = lvErr(golibvirt.ErrOperationInvalid)
+
+	if err := p.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner); err != nil {
+		t.Fatalf("DeleteNetwork: %v", err)
+	}
+	if _, ok := f.networks[testManagedNetwork.Name]; ok {
+		t.Error("the network is still there")
+	}
+}
+
+// A machine being created holds the network from resolving its bridge until
+// its domain is defined, and a teardown in that window waits for it -- and
+// then finds the domain, and leaves the network.
+func TestDeleteNetworkWaitsForACreateThatIsAttaching(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.hook = func(method string) {
+		if method == "DomainDefineXML" {
+			close(entered)
+			<-release
+		}
+	}
+	spec := testSpec()
+	n := testManagedNetwork
+	spec.ManagedNetwork = &n
+	created := make(chan error, 1)
+	go func() { _, err := p.Create(t.Context(), spec); created <- err }()
+	<-entered
+
+	deleted := make(chan error, 1)
+	go func() { deleted <- p.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner) }()
+	select {
+	case err := <-deleted:
+		t.Fatalf("DeleteNetwork returned (%v) while a create was attaching to the network", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	f.hook = nil
+	close(release)
+	if err := <-created; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := <-deleted; !errors.Is(err, providers.ErrNetworkInUse) {
+		t.Fatalf("got %v, want ErrNetworkInUse once the domain was defined", err)
 	}
 }

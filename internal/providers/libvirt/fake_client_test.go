@@ -707,9 +707,13 @@ func (f *fakeLibvirt) NetworkSetAutostart(n golibvirt.Network, autostart int32) 
 	return nil
 }
 
-func (f *fakeLibvirt) NetworkGetXMLDesc(n golibvirt.Network, _ uint32) (string, error) {
+func (f *fakeLibvirt) NetworkGetXMLDesc(n golibvirt.Network, flags uint32) (string, error) {
 	defer f.mu.Unlock()
 	if err := f.enter("NetworkGetXMLDesc", n.Name); err != nil {
+		return "", err
+	}
+	// "NetworkGetXMLDesc:inactive" fails only the persistent-definition read.
+	if err, ok := f.errs["NetworkGetXMLDesc:inactive"]; ok && flags&uint32(golibvirt.NetworkXMLInactive) != 0 {
 		return "", err
 	}
 	got, err := f.network(n)
