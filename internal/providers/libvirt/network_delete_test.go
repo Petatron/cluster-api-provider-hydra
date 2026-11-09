@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -295,10 +296,13 @@ func TestDeleteNetworkWaitsForACreateThatIsAttaching(t *testing.T) {
 	ownedNetwork(t, p, f)
 
 	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once // blocks the first call only; the hook is never reassigned
 	f.hook = func(method string) {
 		if method == "DomainDefineXML" {
-			close(entered)
-			<-release
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
 		}
 	}
 	spec := testSpec()
@@ -308,20 +312,86 @@ func TestDeleteNetworkWaitsForACreateThatIsAttaching(t *testing.T) {
 	go func() { _, err := p.Create(t.Context(), spec); created <- err }()
 	<-entered
 
+	// Torn down through a second provider that reaches the same daemon by
+	// another address: the lock is the daemon's, not the address's.
+	other := &Provider{cfg: Config{RemoteAddr: "10.0.0.13:16514", StoragePool: testPool, RPCTimeout: 5 * time.Second}, lv: f}
 	deleted := make(chan error, 1)
-	go func() { deleted <- p.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner) }()
+	go func() { deleted <- other.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner) }()
 	select {
 	case err := <-deleted:
 		t.Fatalf("DeleteNetwork returned (%v) while a create was attaching to the network", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	f.hook = nil
 	close(release)
 	if err := <-created; err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := <-deleted; !errors.Is(err, providers.ErrNetworkInUse) {
 		t.Fatalf("got %v, want ErrNetworkInUse once the domain was defined", err)
+	}
+}
+
+// A cluster ensuring the network -- one that shares it -- waits out a teardown
+// in progress instead of verifying a network about to vanish, and then defines
+// it again for itself.
+func TestEnsureInfrastructureWaitsForATeardownInProgress(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once // blocks the first call only; the hook is never reassigned
+	f.hook = func(method string) {
+		if method == "NetworkUndefine" {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- p.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner) }()
+	<-entered
+
+	sharer := clusterSpec()
+	n := testManagedNetwork
+	n.Owner = providers.NetworkOwner{ID: "0b9c1a64-1111-4222-8333-444455556666", Cluster: "other/sharer"}
+	sharer.ManagedNetwork = &n
+	ensured := make(chan error, 1)
+	go func() { ensured <- p.EnsureInfrastructure(t.Context(), sharer) }()
+	select {
+	case err := <-ensured:
+		t.Fatalf("EnsureInfrastructure returned (%v) inside another cluster's teardown", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-deleted; err != nil {
+		t.Fatalf("DeleteNetwork: %v", err)
+	}
+	if err := <-ensured; err != nil {
+		t.Fatalf("EnsureInfrastructure: %v", err)
+	}
+	f.mu.Lock()
+	doc := f.networks[testManagedNetwork.Name]
+	f.mu.Unlock()
+	if doc == nil || !strings.Contains(doc.xml, n.Owner.ID) {
+		t.Fatal("the sharer did not define the network again for itself")
+	}
+}
+
+// Without the daemon's identity there is no lock to take, and going ahead
+// without one is the race the lock exists for.
+func TestDeleteNetworkFailsWithoutTheHostIdentity(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+	p.host = ""
+	f.errs["ConnectGetHostname"] = lvErr(golibvirt.ErrInternalError)
+
+	if err := p.DeleteNetwork(t.Context(), testManagedNetwork.Name, testNetworkOwner); err == nil {
+		t.Fatal("DeleteNetwork went ahead without its lock")
+	}
+	if _, ok := f.networks[testManagedNetwork.Name]; !ok {
+		t.Error("the network was removed without the lock")
 	}
 }

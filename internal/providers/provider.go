@@ -132,10 +132,14 @@ type ManagedNetwork struct {
 // NetworkOwner identifies the cluster a managed network was created for.
 type NetworkOwner struct {
 	// ID is the cluster's network-owner ID: random, recorded on the HydraCluster
-	// once, and carried across a move. Ownership is decided on this alone.
+	// once, and carried across a move.
 	ID string
-	// Cluster is namespace/name, recorded beside the ID for whoever reads the
-	// network's definition. It is not compared.
+	// Cluster is the cluster's namespace/name.
+	//
+	// Both are recorded, and a backend must compare both before removing a
+	// network: the ID lives in an annotation and can be copied, and requiring
+	// the namespace/name too means a copied ID is honoured only by an object
+	// of the same name -- which is what a moved cluster is.
 	Cluster string
 }
 

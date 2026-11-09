@@ -196,6 +196,7 @@ const defaultTCPPort = "16509"
 // only way to produce most of them on demand.
 type client interface {
 	ConnectToURI(uri golibvirt.ConnectURI) error
+	ConnectGetHostname() (string, error)
 	Disconnect() error
 	IsConnected() bool
 
@@ -264,6 +265,10 @@ type Provider struct {
 	// dialer is the transport, retained so a stalled connection can be dropped
 	// without waiting on the daemon to acknowledge it.
 	dialer *trackingDialer
+
+	// host is the daemon's own hostname, asked once and kept: the identity
+	// managed-network locks are keyed by (see lockNetwork). Guarded by mu.
+	host string
 }
 
 var _ providers.MachineProvider = (*Provider)(nil)
@@ -782,7 +787,10 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// and leave this machine defined against a bridge that no longer exists.
 	var unlock func()
 	if spec.ManagedNetwork != nil {
-		unlock = p.lockNetwork(spec.ManagedNetwork.Name)
+		if unlock, err = p.lockNetwork(ctx, spec.ManagedNetwork.Name); err != nil {
+			rollback()
+			return nil, err
+		}
 		bridge, nErr := p.resolveNetwork(ctx, *spec.ManagedNetwork)
 		if nErr != nil {
 			unlock()
@@ -1314,9 +1322,14 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 		return err
 	}
 	defer cancel()
-	// No machine can be between resolving this network and defining its domain
-	// while the scan below runs and the network is removed. See Create.
-	defer p.lockNetwork(name)()
+	// No machine can be between resolving this network and defining its domain,
+	// and no cluster can be ensuring it, while the scan below runs and the
+	// network is removed. See Create and EnsureInfrastructure.
+	unlock, err := p.lockNetwork(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	n, err := call(ctx, p, func() (golibvirt.Network, error) { return p.client().NetworkLookupByName(name) })
 	if err != nil {
@@ -1393,19 +1406,50 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 }
 
 // networkLocks serialises, per hypervisor and network, attaching a new machine
-// to a managed network with removing that network (PET-41). Both happen in this
-// one manager process -- its cluster and machine controllers -- so a process
-// lock is the whole of the coordination needed. Keyed by the hypervisor, not
-// the Provider: two providers can reach the same host.
+// to a managed network, and ensuring it, with removing it (PET-41). All three
+// happen in this one manager process -- its cluster and machine controllers --
+// so a process lock is the whole of the coordination needed.
+//
+// Keyed by the daemon's own hostname, not by any address this provider was
+// configured with: one host can be reached as an IP and as a name, through two
+// providers, and both must take the same lock. Two distinct hosts sharing a
+// hostname only share a lock, which serialises them needlessly but harmlessly.
 var networkLocks sync.Map // string -> *sync.Mutex
 
 // lockNetwork takes the lock for a network on this provider's hypervisor and
 // returns the function that releases it.
-func (p *Provider) lockNetwork(name string) func() {
-	m, _ := networkLocks.LoadOrStore(p.cfg.Hypervisor()+"/"+name, &sync.Mutex{})
+func (p *Provider) lockNetwork(ctx context.Context, name string) (func(), error) {
+	host, err := p.hostIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := networkLocks.LoadOrStore(host+"/"+name, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
 	mu.Lock()
-	return mu.Unlock
+	return mu.Unlock, nil
+}
+
+// hostIdentity is the daemon's hostname, asked once per provider. A host does
+// not change its name under a running connection in any way that matters
+// here, and a provider is replaced when its hypervisor changes.
+func (p *Provider) hostIdentity(ctx context.Context) (string, error) {
+	p.mu.Lock()
+	host := p.host
+	p.mu.Unlock()
+	if host != "" {
+		return host, nil
+	}
+	host, err := call(ctx, p, func() (string, error) { return p.client().ConnectGetHostname() })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: asking the hypervisor its hostname: %w", err)
+	}
+	if host == "" {
+		return "", fmt.Errorf("libvirt: the hypervisor reports an empty hostname")
+	}
+	p.mu.Lock()
+	p.host = host
+	p.mu.Unlock()
+	return host, nil
 }
 
 // domainsReferencing names every domain on the host whose definition -- live or
@@ -1481,7 +1525,16 @@ func (p *Provider) EnsureInfrastructure(ctx context.Context, spec providers.Infr
 	// early when the cluster named no image, and a managed network is not
 	// contingent on there being one.
 	if spec.ManagedNetwork != nil {
-		if _, err := p.ensureNetwork(ctx, *spec.ManagedNetwork); err != nil {
+		// Under the lock DeleteNetwork holds, so a cluster that shares the network
+		// does not start or verify it inside another cluster's teardown and go on
+		// reporting Ready for a network that is about to be removed.
+		unlock, err := p.lockNetwork(ctx, spec.ManagedNetwork.Name)
+		if err != nil {
+			return err
+		}
+		_, err = p.ensureNetwork(ctx, *spec.ManagedNetwork)
+		unlock()
+		if err != nil {
 			return err
 		}
 	}

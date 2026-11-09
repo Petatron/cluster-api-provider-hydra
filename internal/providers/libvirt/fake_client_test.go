@@ -57,6 +57,8 @@ type fakeLibvirt struct {
 
 	connected  bool
 	connectErr error
+	// hostname is what ConnectGetHostname answers; "fake-host" when unset.
+	hostname string
 	// dial, when set, runs inside ConnectToURI outside the lock, standing in for
 	// the socket go-libvirt dials; its error fails the connect.
 	dial func() error
@@ -233,6 +235,18 @@ func (f *fakeLibvirt) ConnectToURI(golibvirt.ConnectURI) error {
 
 // Disconnect stays connected when it fails, as go-libvirt does: a failed close
 // RPC returns before the socket is closed.
+// ConnectGetHostname answers with hostname, or "fake-host" when unset.
+func (f *fakeLibvirt) ConnectGetHostname() (string, error) {
+	defer f.mu.Unlock()
+	if err := f.enter("ConnectGetHostname", ""); err != nil {
+		return "", err
+	}
+	if f.hostname == "" {
+		return "fake-host", nil
+	}
+	return f.hostname, nil
+}
+
 func (f *fakeLibvirt) Disconnect() error {
 	defer f.mu.Unlock()
 	if err := f.enter("Disconnect", ""); err != nil {
