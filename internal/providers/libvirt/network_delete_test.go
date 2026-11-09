@@ -17,6 +17,7 @@ limitations under the License.
 package libvirt
 
 import (
+	"context"
 	"encoding/xml"
 	"errors"
 	"reflect"
@@ -393,5 +394,32 @@ func TestDeleteNetworkFailsWithoutTheHostIdentity(t *testing.T) {
 	}
 	if _, ok := f.networks[testManagedNetwork.Name]; !ok {
 		t.Error("the network was removed without the lock")
+	}
+}
+
+// Waiting for the lock gives up with the caller's context, instead of waiting
+// out whatever holds it.
+func TestNetworkLockWaitEndsWithTheContext(t *testing.T) {
+	p, f := newFakeProvider(t)
+	ownedNetwork(t, p, f)
+
+	unlock, err := p.lockNetwork(t.Context(), testManagedNetwork.Name)
+	if err != nil {
+		t.Fatalf("lockNetwork: %v", err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.DeleteNetwork(ctx, testManagedNetwork.Name, testNetworkOwner)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want the context's deadline", err)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Errorf("waited %v for a lock it should have given up on", waited)
+	}
+	if _, ok := f.networks[testManagedNetwork.Name]; !ok {
+		t.Error("the network was touched without the lock")
 	}
 }

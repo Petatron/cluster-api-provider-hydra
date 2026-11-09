@@ -1414,19 +1414,27 @@ func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner provide
 // configured with: one host can be reached as an IP and as a name, through two
 // providers, and both must take the same lock. Two distinct hosts sharing a
 // hostname only share a lock, which serialises them needlessly but harmlessly.
-var networkLocks sync.Map // string -> *sync.Mutex
+var networkLocks sync.Map // string -> chan struct{}, a one-slot semaphore
 
 // lockNetwork takes the lock for a network on this provider's hypervisor and
 // returns the function that releases it.
+//
+// A one-slot channel rather than a mutex, so that waiting for the lock gives up
+// with the caller's context: whoever holds it is bounded by its RPC deadlines,
+// but a reconcile cancelled behind it should not have to wait those out.
 func (p *Provider) lockNetwork(ctx context.Context, name string) (func(), error) {
 	host, err := p.hostIdentity(ctx)
 	if err != nil {
 		return nil, err
 	}
-	m, _ := networkLocks.LoadOrStore(host+"/"+name, &sync.Mutex{})
-	mu := m.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock, nil
+	v, _ := networkLocks.LoadOrStore(host+"/"+name, make(chan struct{}, 1))
+	sem := v.(chan struct{})
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("libvirt: waiting for managed network %q: %w", name, ctx.Err())
+	}
 }
 
 // hostIdentity is the daemon's hostname, asked once per provider. A host does
