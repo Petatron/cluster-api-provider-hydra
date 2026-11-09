@@ -77,6 +77,19 @@ type Provider struct {
 	// backends usually do not, so the default of false is the honest one.
 	ReadyOnCreate bool
 
+	// networks are managed networks by name, with the owner recorded on each
+	// ("" for none). EnsureInfrastructure defines one when absent, with the
+	// owner it was given, the way the libvirt backend does.
+	networks map[string]string
+	// NetworkUsers names networks a machine still references, so DeleteNetwork
+	// refuses them.
+	NetworkUsers map[string]bool
+	// NetworkDeletes counts DeleteNetwork calls; DeletedNetworks names those
+	// that removed something.
+	NetworkDeletes   int
+	DeletedNetworks  []string
+	DeleteNetworkErr error
+
 	// partials are names that have leftover resources but no machine -- a
 	// volume created before DomainDefineXML failed. DeleteByName must remove
 	// these; FindByName cannot see them.
@@ -86,9 +99,11 @@ type Provider struct {
 // New returns an empty fake provider.
 func New() *Provider {
 	return &Provider{
-		machines: map[string]*providers.MachineState{},
-		byName:   map[string]string{},
-		partials: map[string]struct{}{},
+		machines:     map[string]*providers.MachineState{},
+		byName:       map[string]string{},
+		partials:     map[string]struct{}{},
+		networks:     map[string]string{},
+		NetworkUsers: map[string]bool{},
 	}
 }
 
@@ -144,7 +159,60 @@ func (p *Provider) EnsureInfrastructure(_ context.Context, spec providers.Infras
 
 	p.InfrastructureChecks++
 	p.LastInfrastructure = spec
-	return p.InfrastructureErr
+	if p.InfrastructureErr != nil {
+		return p.InfrastructureErr
+	}
+	if n := spec.ManagedNetwork; n != nil {
+		if _, ok := p.networks[n.Name]; !ok && n.Owner.ID != "" {
+			p.networks[n.Name] = n.Owner.ID + "|" + n.Owner.Cluster
+		} else if !ok {
+			p.networks[n.Name] = ""
+		}
+	}
+	return nil
+}
+
+// DeleteNetwork implements providers.MachineProvider.
+func (p *Provider) DeleteNetwork(_ context.Context, name string, owner providers.NetworkOwner) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.NetworkDeletes++
+	if p.DeleteNetworkErr != nil {
+		return p.DeleteNetworkErr
+	}
+	recorded, ok := p.networks[name]
+	switch {
+	case !ok:
+		return nil
+	case recorded == "" || recorded != owner.ID+"|"+owner.Cluster:
+		return fmt.Errorf("%w: %s records owner %q", providers.ErrNetworkNotOwned, name, recorded)
+	case p.NetworkUsers[name]:
+		return fmt.Errorf("%w: %s", providers.ErrNetworkInUse, name)
+	}
+	delete(p.networks, name)
+	p.DeletedNetworks = append(p.DeletedNetworks, name)
+	return nil
+}
+
+// AddNetwork defines a network directly, standing in for one an operator made
+// (owner "") or one made for another cluster: owner is "ID|namespace/name",
+// as RecordedOwner builds it.
+func (p *Provider) AddNetwork(name, owner string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.networks[name] = owner
+}
+
+// RecordedOwner renders an owner the way the fake records it.
+func RecordedOwner(o providers.NetworkOwner) string { return o.ID + "|" + o.Cluster }
+
+// HasNetwork reports whether a network is defined, and its recorded owner.
+func (p *Provider) HasNetwork(name string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	owner, ok := p.networks[name]
+	return owner, ok
 }
 
 // Get implements providers.MachineProvider.

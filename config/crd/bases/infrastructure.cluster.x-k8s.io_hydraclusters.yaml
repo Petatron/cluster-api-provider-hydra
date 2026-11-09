@@ -286,7 +286,9 @@ spec:
 
                       Hydra creates it if it is absent and verifies it if it is not, so naming an
                       existing network adopts it -- which is why the checks are strict about the
-                      subnet and range matching rather than reconfiguring what it finds.
+                      subnet and range matching rather than reconfiguring what it finds. A
+                      network Hydra created is removed with the cluster once nothing uses it; an
+                      adopted one never is.
                     maxLength: 63
                     minLength: 1
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$

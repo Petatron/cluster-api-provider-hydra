@@ -53,6 +53,13 @@ const (
 	// make every existing record invisible.
 	ownerNamespace = "https://github.com/Petatron/cluster-api-provider-hydra/owner/v1"
 	ownerKey       = "hydra"
+
+	// networkOwnerNamespace is where a managed network's owner is recorded in
+	// its <metadata> (PET-41). It must equal the namespace in netMetadataDef's
+	// struct tag, which cannot refer to a constant; a test holds them together.
+	// An identifier, not a page anyone fetches: changing it makes every existing
+	// record invisible, and every network Hydra made look adopted.
+	networkOwnerNamespace = "https://github.com/Petatron/cluster-api-provider-hydra/network-owner/v1"
 )
 
 // libvirt's API is XML in and XML out. These types exist so the provider builds
@@ -170,6 +177,26 @@ type interfaceSourceDef struct {
 	Bridge string `xml:"bridge,attr"`
 }
 
+// domainIfacesDef is the part of any domain's definition that says what it is
+// attached to, parsed from whatever defined the domain -- not only Hydra.
+type domainIfacesDef struct {
+	Interfaces []struct {
+		Source struct {
+			Bridge  string `xml:"bridge,attr"`
+			Network string `xml:"network,attr"`
+		} `xml:"source"`
+	} `xml:"devices>interface"`
+}
+
+func (d domainIfacesDef) references(network, bridge string) bool {
+	for _, i := range d.Interfaces {
+		if i.Source.Network == network || (bridge != "" && i.Source.Bridge == bridge) {
+			return true
+		}
+	}
+	return false
+}
+
 type interfaceModelDef struct {
 	Type string `xml:"type,attr"`
 }
@@ -235,11 +262,27 @@ type poolTargetDef struct {
 
 // networkDef is a libvirt network Hydra creates and owns.
 type networkDef struct {
-	XMLName xml.Name      `xml:"network"`
-	Name    string        `xml:"name"`
-	Forward netForwardDef `xml:"forward"`
-	Bridge  netBridgeDef  `xml:"bridge"`
-	IP      netIPDef      `xml:"ip"`
+	XMLName  xml.Name        `xml:"network"`
+	Name     string          `xml:"name"`
+	Metadata *netMetadataDef `xml:"metadata,omitempty"`
+	Forward  netForwardDef   `xml:"forward"`
+	Bridge   netBridgeDef    `xml:"bridge"`
+	IP       netIPDef        `xml:"ip"`
+}
+
+// netMetadataDef is the part of a network's <metadata> Hydra reads and writes:
+// its own owner record, matched by namespace, so anything else an operator
+// keeps there is neither read as ours nor disturbed.
+type netMetadataDef struct {
+	Owner *netOwnerDef `xml:"https://github.com/Petatron/cluster-api-provider-hydra/network-owner/v1 owner,omitempty"`
+}
+
+// netOwnerDef is the owner record Hydra puts in a network it creates (PET-41):
+// the owning cluster's network-owner ID, which decides ownership, and its
+// namespace/name, for whoever reads the definition.
+type netOwnerDef struct {
+	ID      string `xml:"id,attr"`
+	Cluster string `xml:"cluster,attr,omitempty"`
 }
 
 type netForwardDef struct {
@@ -303,6 +346,11 @@ func networkXML(spec providers.ManagedNetwork, gateway, netmask string) (string,
 			Netmask: netmask,
 			DHCP:    &netDHCPDef{Range: netRangeDef{Start: spec.DHCPStart, End: spec.DHCPEnd}},
 		},
+	}
+	// In the same document that defines the network, so no crash can leave a
+	// network Hydra made without the record that lets it be removed.
+	if spec.Owner.ID != "" {
+		n.Metadata = &netMetadataDef{Owner: &netOwnerDef{ID: spec.Owner.ID, Cluster: spec.Owner.Cluster}}
 	}
 	out, err := xml.Marshal(n)
 	if err != nil {

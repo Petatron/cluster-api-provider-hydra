@@ -35,18 +35,19 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
+  - hydraclusters/finalizers
+  - hydramachines/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
   - hydraclusters/status
   - hydramachines/status
   - hydramachinetemplates/status
   verbs:
   - get
   - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - hydramachines/finalizers
-  verbs:
   - update
 - apiGroups:
   - infrastructure.cluster.x-k8s.io

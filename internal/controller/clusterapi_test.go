@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -445,6 +446,37 @@ var _ = Describe("Cluster API linkage", func() {
 			Expect(provider.LastSpec.Networks).To(HaveLen(1))
 			Expect(provider.LastSpec.Networks[0].Name).To(Equal(testNetwork))
 			Expect(provider.LastSpec.StoragePool).To(Equal(linkPool))
+		})
+
+		It("re-reads the HydraCluster, uncached, and builds nothing once it is being deleted", func() {
+			// PET-41: the gate reads the cluster from the cache, which can be behind
+			// the deletion that is about to remove its managed network. The cache
+			// here says live; the API server says deleting.
+			bare()
+			secretName := linkSecretName
+			others := func() []client.Object {
+				return []client.Object{
+					ownerMachine(&secretName),
+					bootstrapSecret(secretName, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")}),
+					owningCluster(nil),
+				}
+			}
+			r := buildWithoutCluster(append(others(), verifiedHydraCluster(nil))...)
+			// The uncached reader sees everything the cache does, except that the
+			// HydraCluster is being deleted -- so that is the only thing it can
+			// refuse over.
+			deleting := verifiedHydraCluster(nil)
+			deleting.Finalizers = []string{ClusterFinalizer}
+			now := metav1.Now()
+			deleting.DeletionTimestamp = &now
+			r.APIReader = fakeclient.NewClientBuilder().WithScheme(linkScheme()).
+				WithObjects(append(others(), hm.DeepCopy(), deleting)...).Build()
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred(), "a wait, not a failure")
+			Expect(res.RequeueAfter).NotTo(BeZero())
+			Expect(provider.CreateCalls).To(BeZero(), "nothing may be built on a network being removed")
+			Expect(fmt.Sprint(reload(r).Status.Conditions)).To(ContainSubstring("is being deleted"))
 		})
 
 		It("records the pool on the machine before Create runs", func() {

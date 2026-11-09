@@ -32,9 +32,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -127,6 +129,7 @@ func (r *HydraClusterReconciler) release(ctx context.Context, hydraCluster types
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydraclusters/finalizers,verbs=update
 // Confirming a hypervisor lists the cluster's machines and records it on them.
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines,verbs=get;list;watch;patch
 // Hypervisor credentials, read one at a time through the uncached APIReader.
@@ -144,29 +147,12 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// No finalizer, and this is now a policy rather than a tautology.
-	//
-	// It used to be simply true that there was nothing to release: the storage
-	// pool and base image were there before the controller looked and outlive it.
-	// A managed network changes that -- Hydra may have defined it -- so deletion
-	// now LEAKS a libvirt network, on purpose, and that is worth stating rather
-	// than discovering.
-	//
-	// Tearing one down correctly needs two things this controller does not have.
-	// It needs to know whether Hydra created the network or merely adopted one an
-	// operator built, because deleting the latter would take down every guest
-	// already attached to it, including guests belonging to nobody here. And it
-	// needs to wait until no machine still holds an interface on it, which means
-	// ordering cluster teardown behind machine teardown. Getting that order wrong
-	// destroys running clusters; a leftover virbr costs an operator one
-	// `virsh net-undefine`.
-	//
-	// So the leak is the deliberate choice until ownership is tracked. See PET-41.
+	// A finalizer only for a cluster that declares a managed network, which is
+	// the one thing it may have to release (PET-41). Every other cluster keeps
+	// deleting the way it always has, and cannot be held up by a provider that
+	// is no longer installed.
 	if !hydraCluster.DeletionTimestamp.IsZero() {
-		log.V(1).Info("HydraCluster is being deleted; any managed network is deliberately left in place",
-			"name", hydraCluster.Name)
-		r.release(ctx, req.NamespacedName)
-		return ctrl.Result{}, nil
+		return r.reconcileDelete(ctx, hydraCluster)
 	}
 
 	cluster, err := r.ownerCluster(ctx, hydraCluster)
@@ -179,6 +165,13 @@ func (r *HydraClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, r.setPaused(ctx, hydraCluster, reason)
 	}
 	if err := r.setPaused(ctx, hydraCluster, ""); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Before the backend is asked for anything, because the infrastructure check
+	// may define the network: the finalizer that will remove it, and the owner
+	// ID it is recorded under, both have to exist first.
+	if err := r.ensureNetworkOwner(ctx, hydraCluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -435,7 +428,214 @@ func managedNetworkOf(hydraCluster *infrav1.HydraCluster) *providers.ManagedNetw
 		Subnet:    n.Subnet,
 		DHCPStart: n.DHCPStart,
 		DHCPEnd:   n.DHCPEnd,
+		Owner:     networkOwnerOf(hydraCluster),
 	}
+}
+
+// networkOwnerOf is the owner a cluster's managed network is created under and
+// removed as. See infrav1.NetworkOwnerAnnotation.
+func networkOwnerOf(hydraCluster *infrav1.HydraCluster) providers.NetworkOwner {
+	return providers.NetworkOwner{
+		ID:      hydraCluster.Annotations[infrav1.NetworkOwnerAnnotation],
+		Cluster: hydraCluster.Namespace + "/" + hydraCluster.Name,
+	}
+}
+
+// ClusterFinalizer holds a HydraCluster with a managed network until the
+// network it may have created is released (PET-41).
+const ClusterFinalizer = "hydracluster.infrastructure.cluster.x-k8s.io/finalizer"
+
+// requeueClusterDeleting paces the wait for a cluster's machines to go, and
+// for anything else still on its network.
+const requeueClusterDeleting = 15 * time.Second
+
+// ensureNetworkOwner gives a cluster that declares a managed network its
+// finalizer and its network-owner ID, in one write, before anything can define
+// the network. The object is updated in place, so reconciling carries on from
+// what was written.
+func (r *HydraClusterReconciler) ensureNetworkOwner(ctx context.Context, hydraCluster *infrav1.HydraCluster) error {
+	if hydraCluster.Spec.ManagedNetwork == nil {
+		return nil
+	}
+	hasFinalizer := controllerutil.ContainsFinalizer(hydraCluster, ClusterFinalizer)
+	if hasFinalizer && hydraCluster.Annotations[infrav1.NetworkOwnerAnnotation] != "" {
+		return nil
+	}
+	// Optimistic: two writers must not each record a different ID.
+	patch := client.MergeFromWithOptions(hydraCluster.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	controllerutil.AddFinalizer(hydraCluster, ClusterFinalizer)
+	if hydraCluster.Annotations[infrav1.NetworkOwnerAnnotation] == "" {
+		if hydraCluster.Annotations == nil {
+			hydraCluster.Annotations = map[string]string{}
+		}
+		hydraCluster.Annotations[infrav1.NetworkOwnerAnnotation] = string(uuid.NewUUID())
+	}
+	if err := r.Patch(ctx, hydraCluster, patch); err != nil {
+		return fmt.Errorf("recording the managed network's owner: %w", err)
+	}
+	return nil
+}
+
+// reconcileDelete releases a deleted cluster's managed network, if it is the
+// cluster's to release, once nothing needs it (PET-41).
+//
+// Every way out but one leaves the network where it is. Only a network this
+// cluster created -- its owner ID in the network's own definition -- that no
+// other cluster declares and no domain on the host references is removed.
+// Anything less certain is left, which is what every cluster did before: a
+// leftover network costs an operator one `virsh net-undefine`, and removing one
+// in use takes down every guest on it.
+func (r *HydraClusterReconciler) reconcileDelete(ctx context.Context, hydraCluster *infrav1.HydraCluster) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	key := client.ObjectKeyFromObject(hydraCluster)
+	if !controllerutil.ContainsFinalizer(hydraCluster, ClusterFinalizer) {
+		r.release(ctx, key)
+		return ctrl.Result{}, nil
+	}
+
+	cluster, err := r.ownerCluster(ctx, hydraCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Paused means do not touch, deletion included, as for machines.
+	if reason := pausedReason(hydraCluster.Annotations, cluster); reason != "" {
+		log.V(1).Info("Reconciliation is paused", "name", hydraCluster.Name, "reason", reason)
+		return ctrl.Result{}, r.setPaused(ctx, hydraCluster, reason)
+	}
+
+	managed := hydraCluster.Spec.ManagedNetwork
+	if managed == nil {
+		return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+	}
+
+	// No wait for the cluster's HydraMachines. One that has a domain is held
+	// by the backend's scan below, and one that has none is not on the network.
+	// Counting objects instead wedges: a machine machine creation will not let
+	// proceed while this cluster is deleting never gets a domain and never goes
+	// away, and a MachineDeployment replaces any that are removed by hand. A
+	// create that passed that gate just before this deletion re-reads the
+	// cluster, uncached, before defining its domain.
+
+	// Another cluster declaring the same network may have adopted it, and may be
+	// creating a machine on it right now -- between resolving the bridge and
+	// defining the domain, where no scan of domains can see it. Leave it.
+	sharer, err := r.otherClusterDeclaring(ctx, hydraCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if sharer != "" {
+		log.Info("Left the managed network in place: another HydraCluster declares it",
+			"name", hydraCluster.Name, "network", managed.Name, "other", sharer)
+		return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+	}
+
+	owner := networkOwnerOf(hydraCluster)
+	if owner.ID == "" {
+		// Never recorded, so never defined by this cluster.
+		return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+	}
+	prov, err := r.provider(ctx, hydraCluster)
+	if err != nil {
+		if errors.Is(err, providers.ErrTerminal) {
+			// No backend can be built -- its credentials Secret is gone, as it is
+			// when a whole namespace is deleted. Nothing can be checked, so nothing
+			// is removed; and nothing can fix this by waiting, so do not hold the
+			// deletion forever over it.
+			log.Info("Left the managed network in place: no backend can be built to check it",
+				"name", hydraCluster.Name, "network", managed.Name, "reason", err.Error())
+			return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+		}
+		// Configured, but not reachable now: retried, and said so on the object.
+		if statusErr := r.recordDeleting(ctx, hydraCluster, fmt.Sprintf("releasing managed network %q: %v", managed.Name, err)); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
+	}
+
+	switch err := prov.DeleteNetwork(ctx, managed.Name, owner); {
+	case err == nil:
+		log.Info("Released managed network", "name", hydraCluster.Name, "network", managed.Name)
+	case errors.Is(err, providers.ErrNetworkNotOwned):
+		log.Info("Left the managed network in place: this cluster did not create it",
+			"name", hydraCluster.Name, "network", managed.Name, "reason", err.Error())
+	case errors.Is(err, providers.ErrNetworkInUse):
+		// Named on the object, because nothing ends this wait but those domains
+		// going: a leftover domain whose machine is gone, or a guest attached by
+		// hand, holds it until someone removes it -- or removes the finalizer,
+		// which leaves the network in place.
+		log.Info("Waiting for machines still on the managed network", "name", hydraCluster.Name,
+			"network", managed.Name, "reason", err.Error())
+		return ctrl.Result{RequeueAfter: requeueClusterDeleting},
+			r.recordDeleting(ctx, hydraCluster, fmt.Sprintf("not releasing managed network %q yet: %v", managed.Name, err))
+	default:
+		// Transient: retried, and the finalizer stays. A hypervisor gone for good
+		// holds the deletion until the finalizer is removed by hand, which leaves
+		// the network in place -- a choice for whoever knows the host is gone.
+		if statusErr := r.recordDeleting(ctx, hydraCluster, fmt.Sprintf("releasing managed network %q: %v", managed.Name, err)); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, fmt.Errorf("releasing managed network %q: %w", managed.Name, err)
+	}
+	return ctrl.Result{}, r.releaseFinalizer(ctx, hydraCluster)
+}
+
+// reader is the uncached API reader, or the client where none is set.
+func (r *HydraClusterReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// recordDeleting says on the object what its deletion is waiting for.
+func (r *HydraClusterReconciler) recordDeleting(ctx context.Context, hydraCluster *infrav1.HydraCluster, message string) error {
+	patch := client.MergeFrom(hydraCluster.DeepCopy())
+	apimeta.SetStatusCondition(&hydraCluster.Status.Conditions, metav1.Condition{
+		Type:               infrav1.ClusterReadyCondition,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Deleting",
+		Message:            message,
+		ObservedGeneration: hydraCluster.Generation,
+	})
+	if err := r.Status().Patch(ctx, hydraCluster, patch); err != nil {
+		return fmt.Errorf("recording deletion progress: %w", err)
+	}
+	return nil
+}
+
+// releaseFinalizer removes the cluster's finalizer and its share of a backend
+// connection.
+func (r *HydraClusterReconciler) releaseFinalizer(ctx context.Context, hydraCluster *infrav1.HydraCluster) error {
+	patch := client.MergeFrom(hydraCluster.DeepCopy())
+	controllerutil.RemoveFinalizer(hydraCluster, ClusterFinalizer)
+	if err := r.Patch(ctx, hydraCluster, patch); err != nil {
+		return fmt.Errorf("removing finalizer: %w", err)
+	}
+	r.release(ctx, client.ObjectKeyFromObject(hydraCluster))
+	return nil
+}
+
+// otherClusterDeclaring names another HydraCluster, in any namespace and not
+// itself being deleted, that declares the same managed network, or "".
+// Hypervisors are not compared: telling them apart would only ever save a
+// network, and getting it wrong would remove one in use.
+func (r *HydraClusterReconciler) otherClusterDeclaring(ctx context.Context, hydraCluster *infrav1.HydraCluster) (string, error) {
+	// Uncached: a cluster created a moment ago, which the cache has not seen
+	// yet, is exactly the one that may be about to attach to this network.
+	all := &infrav1.HydraClusterList{}
+	if err := r.reader().List(ctx, all); err != nil {
+		return "", fmt.Errorf("listing HydraClusters: %w", err)
+	}
+	for i := range all.Items {
+		other := &all.Items[i]
+		if other.UID == hydraCluster.UID || !other.DeletionTimestamp.IsZero() || other.Spec.ManagedNetwork == nil {
+			continue
+		}
+		if other.Spec.ManagedNetwork.Name == hydraCluster.Spec.ManagedNetwork.Name {
+			return other.Namespace + "/" + other.Name, nil
+		}
+	}
+	return "", nil
 }
 
 // validateEndpointAgainstManagedNetwork checks the one invariant a managed

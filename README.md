@@ -105,10 +105,35 @@ before anything is attempted.
 The exception is `managedNetwork`. A cluster that declares one is asking Hydra to
 own a network, so the provider creates it if it is absent and verifies it if it
 is not — and even then it will not reconfigure the addressing of a network it
-found, only refuse to use it. Deleting the cluster **leaves that network behind**,
-deliberately: tearing it down safely means knowing whether Hydra created it or
-adopted an operator's, and waiting until no machine still has an interface on it.
-Until ownership is tracked, a leftover bridge is the cheaper mistake.
+found, only refuse to use it. Deleting the cluster **removes the network only if
+Hydra created it for that cluster and nothing uses it any more** (PET-41):
+
+- A network Hydra defines records its owner, a random ID the cluster keeps in its
+  `hydracluster.infrastructure.cluster.x-k8s.io/network-owner` annotation, in the
+  network's own definition, beside the cluster's namespace/name; both must
+  match. A network Hydra adopted carries no such record, and is never removed,
+  nor is one made before records existed. A cluster recreated under the same
+  name gets a new ID, so it does not inherit the old network.
+- The cluster's deletion waits for every domain on the host -- Hydra's or not,
+  running or stopped -- that still references the network. It does not wait for
+  HydraMachines that have no domain: no machine is built while its HydraCluster
+  is being deleted, so one that has not been built never will be, and one being
+  built holds the network from resolving it until its domain is defined.
+- A network another HydraCluster also declares is left alone.
+- When no backend can be built for the cluster -- its credentials Secret is gone,
+  as when a whole namespace is deleted, or no hypervisor is configured -- the
+  network is left and the deletion is not held. So is a network on a hypervisor
+  the cluster has since stopped naming. Remove those with `virsh net-destroy`
+  and `virsh net-undefine`.
+- A hypervisor that is configured but cannot be reached is retried, and the
+  deletion waits, as it does while a domain still references the network; the
+  HydraCluster's `Ready` condition (reason `Deleting`) says which. If the host
+  is gone for good, or the domain is one you mean to keep, remove the finalizer
+  `hydracluster.infrastructure.cluster.x-k8s.io/finalizer` by hand: the
+  deletion completes and the network is left in place.
+
+Every case that is not certain leaves the network in place: a leftover bridge is
+the cheap mistake, and removing a network in use takes down every guest on it.
 
 **A managed network is a routed network, and the route is yours to provide.**
 The network exists only on its hypervisor. Cluster API's controllers must reach

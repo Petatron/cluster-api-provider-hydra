@@ -196,6 +196,7 @@ const defaultTCPPort = "16509"
 // only way to produce most of them on demand.
 type client interface {
 	ConnectToURI(uri golibvirt.ConnectURI) error
+	ConnectGetHostname() (string, error)
 	Disconnect() error
 	IsConnected() bool
 
@@ -212,6 +213,7 @@ type client interface {
 	DomainInterfaceAddresses(dom golibvirt.Domain, source, flags uint32) ([]golibvirt.DomainInterface, error)
 	DomainGetMetadata(dom golibvirt.Domain, typ int32, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) (string, error)
 	DomainSetMetadata(dom golibvirt.Domain, typ int32, metadata, key, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) error
+	ConnectListAllDomains(needResults int32, flags golibvirt.ConnectListAllDomainsFlags) ([]golibvirt.Domain, uint32, error)
 
 	ConnectListAllStoragePools(needResults int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error)
 	StoragePoolLookupByName(name string) (golibvirt.StoragePool, error)
@@ -230,6 +232,8 @@ type client interface {
 	NetworkCreate(n golibvirt.Network) error
 	NetworkSetAutostart(n golibvirt.Network, autostart int32) error
 	NetworkGetXMLDesc(n golibvirt.Network, flags uint32) (string, error)
+	NetworkDestroy(n golibvirt.Network) error
+	NetworkUndefine(n golibvirt.Network) error
 }
 
 var _ client = (*golibvirt.Libvirt)(nil)
@@ -263,6 +267,10 @@ type Provider struct {
 	// dialer is the transport, retained so a stalled connection can be dropped
 	// without waiting on the daemon to acknowledge it.
 	dialer *trackingDialer
+
+	// host is the daemon's own hostname, asked once and kept: the identity
+	// managed-network locks are keyed by (see lockNetwork). Guarded by mu.
+	host string
 }
 
 var _ providers.MachineProvider = (*Provider)(nil)
@@ -774,9 +782,20 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	// existence, and machine creation is already gated on that check having
 	// passed -- so a machine that gets this far and finds no network has hit a
 	// real fault, not a race worth papering over by creating one here.
+	//
+	// Held from resolving the bridge until the domain is defined, the same lock
+	// DeleteNetwork holds from its scan to its destroy (PET-41). Without it a
+	// teardown could find no domain on the network between the two, remove it,
+	// and leave this machine defined against a bridge that no longer exists.
+	var unlock func()
 	if spec.ManagedNetwork != nil {
+		if unlock, err = p.lockNetwork(ctx, spec.ManagedNetwork.Name); err != nil {
+			rollback()
+			return nil, err
+		}
 		bridge, nErr := p.resolveNetwork(ctx, *spec.ManagedNetwork)
 		if nErr != nil {
+			unlock()
 			rollback()
 			return nil, nErr
 		}
@@ -786,6 +805,9 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	dom, err = call(ctx, p, func() (golibvirt.Domain, error) {
 		return p.client().DomainDefineXML(domainXML(spec, rootPath, cidataPath))
 	})
+	if unlock != nil {
+		unlock()
+	}
 	if err != nil {
 		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
@@ -1291,6 +1313,198 @@ func (p *Provider) networkBridge(ctx context.Context, n golibvirt.Network, name 
 	return parsed.Bridge.Name, nil
 }
 
+// DeleteNetwork implements providers.MachineProvider (PET-41).
+//
+// Three checks stand between a cluster's deletion and a network going away, and
+// each one can only leave a network behind, never take the wrong one:
+//
+//   - the definition must carry Hydra's owner record, naming this owner's ID.
+//     A network Hydra adopted has none, nor does one made before records
+//     existed, and those are never removed;
+//   - no domain on the host, running or not, may reference it, either by the
+//     network's name or by its bridge -- which is how Hydra's own machines
+//     attach, so libvirt's count of a network's connections does not see them;
+//   - and it is undefined before it is stopped. Undefined, a running network is
+//     transient and dies with the destroy; stopped first, a reconcile racing
+//     this could find it defined and start it again.
+func (p *Provider) DeleteNetwork(ctx context.Context, name string, owner providers.NetworkOwner) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	// No machine can be between resolving this network and defining its domain,
+	// and no cluster can be ensuring it, while the scan below runs and the
+	// network is removed. See Create and EnsureInfrastructure.
+	unlock, err := p.lockNetwork(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	n, err := call(ctx, p, func() (golibvirt.Network, error) { return p.client().NetworkLookupByName(name) })
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: looking up network %q: %w", name, err)
+	}
+	// The persistent definition, which is where the record was written and the
+	// copy that survives a restart. A network an earlier attempt undefined and
+	// then failed to stop has none; libvirt 12.0.0 answers with its running
+	// definition anyway, but fall back to that explicitly rather than read a
+	// failure as gone while it still runs.
+	desc, err := call(ctx, p, func() (string, error) {
+		return p.client().NetworkGetXMLDesc(n, uint32(golibvirt.NetworkXMLInactive))
+	})
+	if err != nil {
+		desc, err = call(ctx, p, func() (string, error) { return p.client().NetworkGetXMLDesc(n, 0) })
+	}
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("libvirt: reading network %q: %w", name, err)
+	}
+	var def networkDef
+	if err := xml.Unmarshal([]byte(desc), &def); err != nil {
+		return fmt.Errorf("libvirt: parsing network %q: %w", name, err)
+	}
+	switch {
+	case def.Metadata == nil || def.Metadata.Owner == nil:
+		return fmt.Errorf("%w: libvirt network %q records no owner -- adopted, or made before owners were recorded",
+			providers.ErrNetworkNotOwned, name)
+	case owner.ID == "" || def.Metadata.Owner.ID != owner.ID || def.Metadata.Owner.Cluster != owner.Cluster:
+		// The cluster too, not the ID alone. The ID lives in an annotation, so
+		// requiring both means a copied ID is only honoured by an object of the
+		// same namespace and name -- which is what a moved cluster is.
+		return fmt.Errorf("%w: libvirt network %q records owner %q (%s), not %q (%s)",
+			providers.ErrNetworkNotOwned, name, def.Metadata.Owner.ID, def.Metadata.Owner.Cluster, owner.ID, owner.Cluster)
+	}
+
+	bridge := def.Bridge.Name
+	if bridge == "" {
+		// libvirt names the bridge when it defines a network, so this should not
+		// happen. Hydra's machines attach by bridge, so a scan without one could
+		// not see them: take the running definition's, and refuse without one.
+		if bridge, err = p.networkBridge(ctx, n, name); err != nil {
+			return fmt.Errorf("%w: libvirt network %q: no bridge to check for machines: %v",
+				providers.ErrNetworkInUse, name, err)
+		}
+	}
+	users, err := p.domainsReferencing(ctx, name, bridge)
+	if err != nil {
+		return err
+	}
+	if len(users) > 0 {
+		return fmt.Errorf("%w: libvirt network %q is referenced by %s", providers.ErrNetworkInUse, name, strings.Join(users, ", "))
+	}
+
+	if err := callVoid(ctx, p, func() error { return p.client().NetworkUndefine(n) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
+		// Invalid state: already undefined by an earlier attempt whose destroy
+		// then failed, so it is running and transient ("can't undefine transient
+		// network", libvirt 12.0.0). The destroy below finishes it.
+		return fmt.Errorf("libvirt: undefining network %q: %w", name, err)
+	}
+	if err := callVoid(ctx, p, func() error { return p.client().NetworkDestroy(n) }); err != nil &&
+		!isNotFound(err) && !isInvalidState(err) {
+		// Not found: already gone. Invalid state: it was not running, and once
+		// undefined an inactive network no longer exists either.
+		return fmt.Errorf("libvirt: stopping network %q: %w", name, err)
+	}
+	return nil
+}
+
+// networkLocks serialises, per hypervisor and network, attaching a new machine
+// to a managed network, and ensuring it, with removing it (PET-41). All three
+// happen in this one manager process -- its cluster and machine controllers --
+// so a process lock is the whole of the coordination needed.
+//
+// Keyed by the daemon's own hostname, not by any address this provider was
+// configured with: one host can be reached as an IP and as a name, through two
+// providers, and both must take the same lock. Two distinct hosts sharing a
+// hostname only share a lock, which serialises them needlessly but harmlessly.
+var networkLocks sync.Map // string -> chan struct{}, a one-slot semaphore
+
+// lockNetwork takes the lock for a network on this provider's hypervisor and
+// returns the function that releases it.
+//
+// A one-slot channel rather than a mutex, so that waiting for the lock gives up
+// with the caller's context: whoever holds it is bounded by its RPC deadlines,
+// but a reconcile cancelled behind it should not have to wait those out.
+func (p *Provider) lockNetwork(ctx context.Context, name string) (func(), error) {
+	host, err := p.hostIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, _ := networkLocks.LoadOrStore(host+"/"+name, make(chan struct{}, 1))
+	sem := v.(chan struct{})
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("libvirt: waiting for managed network %q: %w", name, ctx.Err())
+	}
+}
+
+// hostIdentity is the daemon's hostname, asked once per provider. A host does
+// not change its name under a running connection in any way that matters
+// here, and a provider is replaced when its hypervisor changes.
+func (p *Provider) hostIdentity(ctx context.Context) (string, error) {
+	p.mu.Lock()
+	host := p.host
+	p.mu.Unlock()
+	if host != "" {
+		return host, nil
+	}
+	host, err := call(ctx, p, func() (string, error) { return p.client().ConnectGetHostname() })
+	if err != nil {
+		return "", fmt.Errorf("libvirt: asking the hypervisor its hostname: %w", err)
+	}
+	if host == "" {
+		return "", fmt.Errorf("libvirt: the hypervisor reports an empty hostname")
+	}
+	p.mu.Lock()
+	p.host = host
+	p.mu.Unlock()
+	return host, nil
+}
+
+// domainsReferencing names every domain on the host whose definition -- live or
+// persistent, the two can differ -- has an interface on the network or its
+// bridge. Every domain, not only Hydra's: a guest an operator attached by hand
+// loses its network just the same.
+func (p *Provider) domainsReferencing(ctx context.Context, network, bridge string) ([]string, error) {
+	doms, _, err := call2(ctx, p, func() ([]golibvirt.Domain, uint32, error) {
+		return p.client().ConnectListAllDomains(1, 0)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("libvirt: listing domains: %w", err)
+	}
+	var users []string
+	for _, dom := range doms {
+		for _, flags := range []golibvirt.DomainXMLFlags{0, golibvirt.DomainXMLInactive} {
+			desc, err := call(ctx, p, func() (string, error) { return p.client().DomainGetXMLDesc(dom, flags) })
+			if err != nil {
+				if isNotFound(err) {
+					break // undefined since the list: it references nothing now
+				}
+				return nil, fmt.Errorf("libvirt: reading domain %q: %w", dom.Name, err)
+			}
+			var d domainIfacesDef
+			if err := xml.Unmarshal([]byte(desc), &d); err != nil {
+				return nil, fmt.Errorf("libvirt: parsing domain %q: %w", dom.Name, err)
+			}
+			if d.references(network, bridge) {
+				users = append(users, dom.Name)
+				break
+			}
+		}
+	}
+	return users, nil
+}
+
 // EnsureInfrastructure implements providers.MachineProvider.
 //
 // Two things are worth checking and nothing else is: the pool exists and is
@@ -1330,7 +1544,16 @@ func (p *Provider) EnsureInfrastructure(ctx context.Context, spec providers.Infr
 	// early when the cluster named no image, and a managed network is not
 	// contingent on there being one.
 	if spec.ManagedNetwork != nil {
-		if _, err := p.ensureNetwork(ctx, *spec.ManagedNetwork); err != nil {
+		// Under the lock DeleteNetwork holds, so a cluster that shares the network
+		// does not start or verify it inside another cluster's teardown and go on
+		// reporting Ready for a network that is about to be removed.
+		unlock, err := p.lockNetwork(ctx, spec.ManagedNetwork.Name)
+		if err != nil {
+			return err
+		}
+		_, err = p.ensureNetwork(ctx, *spec.ManagedNetwork)
+		unlock()
+		if err != nil {
 			return err
 		}
 	}

@@ -502,6 +502,9 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 	}
 
 	var spec providers.MachineSpec
+	// building is set when nothing exists and Create will define a domain, as
+	// opposed to adopting one a previous attempt left.
+	var building bool
 	// recordedNote explains a Create failure when the machine is pinned to a
 	// recorded pool other than the one that resolves now.
 	var recordedNote string
@@ -549,6 +552,7 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		if spec, err = specFor(machine, link, bootstrapData); err != nil {
 			return nil, err
 		}
+		building = true
 		// Before Create, not after: a crash between Create allocating volumes
 		// and defining the domain is exactly the leftover teardown has to find,
 		// and it can only look in the right pool if this was already recorded.
@@ -576,6 +580,16 @@ func (r *HydraMachineReconciler) ensureMachine(ctx context.Context, prov provide
 		}
 	default:
 		return nil, fmt.Errorf("searching for an existing machine: %w", findErr)
+	}
+
+	// A machine that is about to be built, rather than adopted, must not join a
+	// network its cluster's teardown is removing (PET-41). The gate earlier read
+	// the cluster from the cache, which can be behind; this reads it again, from
+	// the API server, as late as the controller can.
+	if building {
+		if err := r.hydraClusterNotDeleting(ctx, machine, link); err != nil {
+			return nil, err
+		}
 	}
 
 	// Create is idempotent on name, which is what makes this safe: if a previous
@@ -896,6 +910,27 @@ func ownerMismatch(machine *infrav1.HydraMachine, ident identity, state *provide
 	}
 	return fmt.Errorf("%w: machine %q is recorded as owned by %s, not this HydraMachine (UID %s, identity %s)",
 		providers.ErrOwnerMismatch, state.Name, recorded, machine.UID, ident.uid)
+}
+
+// hydraClusterNotDeleting reads the machine's HydraCluster through the uncached
+// reader and refuses -- as a wait, not a failure -- when it is being deleted or
+// is gone.
+func (r *HydraMachineReconciler) hydraClusterNotDeleting(ctx context.Context, machine *infrav1.HydraMachine, link *linkage) error {
+	if link == nil || link.hydraClusterName == "" {
+		return nil
+	}
+	hc := &infrav1.HydraCluster{}
+	key := types.NamespacedName{Namespace: machine.Namespace, Name: link.hydraClusterName}
+	if err := r.APIReader.Get(ctx, key, hc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: HydraCluster %q is gone", errWaitingForHydraCluster, link.hydraClusterName)
+		}
+		return fmt.Errorf("reading HydraCluster %q before creating the machine: %w", link.hydraClusterName, err)
+	}
+	if !hc.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("%w: HydraCluster %q is being deleted", errWaitingForHydraCluster, link.hydraClusterName)
+	}
+	return nil
 }
 
 // verifyOwnership refuses to act on a machine this object does not own.

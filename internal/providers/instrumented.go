@@ -157,6 +157,13 @@ func (p *Instrumented) ClaimOwner(ctx context.Context, id, from, to string) erro
 	return err
 }
 
+func (p *Instrumented) DeleteNetwork(ctx context.Context, name string, owner NetworkOwner) error {
+	start := time.Now()
+	err := p.MachineProvider.DeleteNetwork(ctx, name, owner)
+	p.observe("DeleteNetwork", start, err)
+	return err
+}
+
 func (p *Instrumented) observe(operation string, start time.Time, err error) {
 	observe(p.hypervisor, operation, start, err)
 }
