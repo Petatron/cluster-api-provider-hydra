@@ -134,7 +134,7 @@ release-manifests: manifests generate kustomize ## Build the infrastructure-comp
 		exit $$status
 
 .PHONY: verify-installer
-verify-installer: release-manifests ## Assert the release installer ships no operator-owned ConfigMap.
+verify-installer: release-manifests ## Assert the release installer ships no operator-owned ConfigMap and labels every CRD for clusterctl move.
 	@# PET-45: libvirt-config holds site-specific values and is created by whoever
 	@# owns the site, so the installer must never carry a ConfigMap that would
 	@# overwrite it on deploy or upgrade. The comment in
@@ -147,6 +147,23 @@ verify-installer: release-manifests ## Assert the release installer ships no ope
 		exit 1; \
 	fi
 	@echo "verify-installer: the release installer ships no ConfigMap"
+	@# PET-76: `clusterctl move` only moves types whose CRD carries
+	@# clusterctl.cluster.x-k8s.io, and skips the rest without a word. Count
+	@# CRDs and CRDs carrying the label in their own metadata; they must match.
+	@counts=$$(awk ' \
+		/^---/ { if (crd) { n++; if (lab) l++ } crd=0; lab=0; meta=0; next } \
+		/^kind: CustomResourceDefinition$$/ { crd=1 } \
+		/^metadata:/ { meta=1; next } \
+		/^[^ ]/ { meta=0 } \
+		meta && /^    clusterctl\.cluster\.x-k8s\.io: ""$$/ { lab=1 } \
+		END { if (crd) { n++; if (lab) l++ } print n+0, l+0 }' out/infrastructure-components.yaml); \
+		set -- $$counts; \
+		if [ "$$1" -eq 0 ] || [ "$$1" -ne "$$2" ]; then \
+			echo "ERROR: $$2 of $$1 CRDs in out/infrastructure-components.yaml carry the clusterctl.cluster.x-k8s.io label."; \
+			echo "clusterctl move would silently leave the unlabelled types behind -- see PET-76 and config/crd/kustomization.yaml."; \
+			exit 1; \
+		fi; \
+		echo "verify-installer: all $$1 CRDs carry clusterctl.cluster.x-k8s.io"
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.

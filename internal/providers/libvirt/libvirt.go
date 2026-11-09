@@ -210,6 +210,8 @@ type client interface {
 	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
 	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
 	DomainInterfaceAddresses(dom golibvirt.Domain, source, flags uint32) ([]golibvirt.DomainInterface, error)
+	DomainGetMetadata(dom golibvirt.Domain, typ int32, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) (string, error)
+	DomainSetMetadata(dom golibvirt.Domain, typ int32, metadata, key, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) error
 
 	ConnectListAllStoragePools(needResults int32, flags golibvirt.ConnectListAllStoragePoolsFlags) ([]golibvirt.StoragePool, uint32, error)
 	StoragePoolLookupByName(name string) (golibvirt.StoragePool, error)
@@ -787,6 +789,15 @@ func (p *Provider) Create(ctx context.Context, spec providers.MachineSpec) (*pro
 	if err != nil {
 		rollback()
 		return nil, fmt.Errorf("libvirt: defining domain %q: %w", spec.Name, err)
+	}
+	// Recorded before the first start, and not rolled back on failure: the
+	// domain is defined either way, and a retry adopts it by name. The caller
+	// then finds no owner recorded -- which is what a domain made before owners
+	// existed looks like too -- and records it then (PET-76).
+	if spec.OwnerUID != "" {
+		if err := p.setOwner(ctx, dom, spec.OwnerUID); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.ensureRunning(ctx, dom); err != nil {
 		return nil, err
@@ -1384,6 +1395,89 @@ func (p *Provider) FindByName(ctx context.Context, name string) (*providers.Mach
 	return p.stateOf(ctx, dom)
 }
 
+// ClaimOwner implements providers.MachineProvider.
+//
+// libvirt cannot compare and set domain metadata in one call, so this reads,
+// compares and then writes. Two management clusters claiming one domain in the
+// same instant could both pass the comparison; anything slower than that sees
+// the first claim and is refused. Each management cluster runs one manager, and
+// `clusterctl move` pauses the source before the target can reconcile.
+func (p *Provider) ClaimOwner(ctx context.Context, id, from, to string) error {
+	ctx, cancel, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	dom, err := p.lookupByUUID(ctx, id)
+	if err != nil {
+		return err
+	}
+	current, err := p.ownerOf(ctx, dom)
+	if err != nil {
+		return err
+	}
+	if current != from {
+		return fmt.Errorf("%w: libvirt domain %q records owner %q, not %q",
+			providers.ErrOwnerMismatch, dom.Name, current, from)
+	}
+	return p.setOwner(ctx, dom, to)
+}
+
+// ownerOf reads the owner recorded in the domain's metadata, or "" when none
+// is: a domain defined before owners were recorded.
+//
+// The persistent definition is read, not the running one. Owners are written
+// there (see setOwner), and that is the copy that survives a restart.
+func (p *Provider) ownerOf(ctx context.Context, dom golibvirt.Domain) (string, error) {
+	doc, err := call(ctx, p, func() (string, error) {
+		return p.client().DomainGetMetadata(dom, int32(golibvirt.DomainMetadataElement),
+			golibvirt.OptString{ownerNamespace}, golibvirt.DomainAffectConfig)
+	})
+	if err != nil {
+		if isNoMetadata(err) {
+			return "", nil
+		}
+		if isInvalidState(err) {
+			// A transient domain has no persistent definition to keep a record
+			// in. Hydra defines every domain persistently, so this one was made
+			// some other way, or its definition was removed by hand while it ran
+			// (`virsh undefine`); say so rather than retry a read that cannot
+			// work. Defining it again from its running XML recovers it.
+			return "", fmt.Errorf("%w: libvirt domain %q has no persistent definition to record an owner in "+
+				"(made outside Hydra, or undefined while running): %v",
+				providers.ErrTerminal, dom.Name, err)
+		}
+		return "", fmt.Errorf("libvirt: reading the owner of domain %q: %w", dom.Name, err)
+	}
+	var rec ownerDef
+	if err := xml.Unmarshal([]byte(doc), &rec); err != nil || rec.UID == "" {
+		// Something wrote our namespace with content we did not. Guessing an
+		// owner from it would be guessing who may delete the domain.
+		return "", fmt.Errorf("%w: libvirt domain %q has an unreadable owner record %q",
+			providers.ErrTerminal, dom.Name, doc)
+	}
+	return rec.UID, nil
+}
+
+// setOwner records uid as the domain's owner in its persistent definition.
+// Only the persistent one: a running domain's live copy is discarded at its
+// next restart, and a record that can vanish is no record.
+func (p *Provider) setOwner(ctx context.Context, dom golibvirt.Domain, uid string) error {
+	doc, err := xml.Marshal(ownerDef{UID: uid})
+	if err != nil {
+		return fmt.Errorf("libvirt: encoding the owner of domain %q: %w", dom.Name, err)
+	}
+	if err := callVoid(ctx, p, func() error {
+		return p.client().DomainSetMetadata(dom, int32(golibvirt.DomainMetadataElement),
+			golibvirt.OptString{string(doc)}, golibvirt.OptString{ownerKey},
+			golibvirt.OptString{ownerNamespace}, golibvirt.DomainAffectConfig)
+	}); err != nil {
+		return fmt.Errorf("libvirt: recording the owner of domain %q: %w", dom.Name, err)
+	}
+	return nil
+}
+
 // Delete implements providers.MachineProvider.
 //
 // Deleting an absent machine succeeds: teardown is retried, and the second
@@ -1904,6 +1998,10 @@ func (p *Provider) stateOf(ctx context.Context, dom golibvirt.Domain) (*provider
 	}
 	state.Ready = golibvirt.DomainState(st) == golibvirt.DomainRunning
 
+	if state.Owner, err = p.ownerOf(ctx, dom); err != nil {
+		return nil, err
+	}
+
 	addrs, err := p.addressesOf(ctx, dom)
 	if err != nil {
 		return nil, err
@@ -2023,6 +2121,12 @@ func isNotFound(err error) bool {
 		}
 	}
 	return false
+}
+
+// isNoMetadata is a domain with nothing recorded under the namespace asked for.
+func isNoMetadata(err error) bool {
+	var e golibvirt.Error
+	return errors.As(err, &e) && golibvirt.ErrorNumber(e.Code) == golibvirt.ErrNoDomainMetadata
 }
 
 // isNoStorageVol is the narrow not-found: the pool answered, and the volume is
