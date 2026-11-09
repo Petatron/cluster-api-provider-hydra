@@ -6,10 +6,18 @@
 # the v1beta2 contract, so it can resolve object references. It is distinct from the
 # cluster.x-k8s.io/provider ownership label applied in config/default, and one does
 # not substitute for the other. Must stay in step with metadata.yaml.
+#
+# clusterctl.cluster.x-k8s.io is how `clusterctl move` finds the types to move:
+# it lists CRDs carrying it and nothing else. `clusterctl init` adds it to the
+# providers it installs, but this one is installed from these manifests, and
+# without it a move carries the Cluster API objects across and leaves every
+# HydraCluster and HydraMachine behind -- no error, no warning -- before deleting
+# the source objects (PET-76). verify-installer checks the release manifest.
 labels:
 - includeSelectors: false
   pairs:
     cluster.x-k8s.io/v1beta2: v1alpha1
+    clusterctl.cluster.x-k8s.io: ""
 
 resources:
 - bases/infrastructure.cluster.x-k8s.io_hydraclusters.yaml

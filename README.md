@@ -371,6 +371,13 @@ Writes `out/infrastructure-components.yaml` and `out/metadata.yaml` — the two 
 needs to install this provider. `metadata.yaml` declares which Cluster API contract each release
 series implements; keep it accurate or `clusterctl` will refuse the provider.
 
+### Moving clusters to another management cluster
+
+`clusterctl move` works for Hydra clusters only when every machine has been
+reconciled by a provider that records its identity, and each hypervisor
+credentials Secret is labelled to move. [docs/moving.md](docs/moving.md) has the
+checklist and the commands that check it. Read it before any move.
+
 ## Repository layout
 
 ```

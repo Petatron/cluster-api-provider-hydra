@@ -150,6 +150,13 @@ func (p *Instrumented) EnsureInfrastructure(ctx context.Context, spec Infrastruc
 	return err
 }
 
+func (p *Instrumented) ClaimOwner(ctx context.Context, id, from, to string) error {
+	start := time.Now()
+	err := p.MachineProvider.ClaimOwner(ctx, id, from, to)
+	p.observe("ClaimOwner", start, err)
+	return err
+}
+
 func (p *Instrumented) DeleteNetwork(ctx context.Context, name string, owner NetworkOwner) error {
 	start := time.Now()
 	err := p.MachineProvider.DeleteNetwork(ctx, name, owner)

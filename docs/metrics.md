@@ -40,7 +40,7 @@ controller-runtime can tell you the first, only this can tell you the second.
 
 `operation` is an interface method name, so its values are fixed by the code:
 `Dial`, `Create`, `Get`, `FindByName`, `Delete`, `DeleteByName`,
-`EnsureInfrastructure`, `DeleteNetwork`. `Dial` is connection establishment, which happens inside
+`EnsureInfrastructure`, `ClaimOwner`, `DeleteNetwork`. `Dial` is connection establishment, which happens inside
 the backend constructor rather than through the interface — it is included
 because an unreachable hypervisor consumes the whole dial timeout, and it would
 otherwise be the one operation producing no sample.

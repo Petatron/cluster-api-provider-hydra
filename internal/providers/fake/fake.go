@@ -65,6 +65,10 @@ type Provider struct {
 	GetErr            error
 	FindErr           error
 	DeleteErr         error
+	ClaimErr          error
+
+	// ClaimCalls counts ClaimOwner calls, including refused ones.
+	ClaimCalls int
 
 	// DefaultStoragePool is what StoragePoolFor answers for an empty request.
 	DefaultStoragePool string
@@ -137,6 +141,7 @@ func (p *Provider) Create(_ context.Context, spec providers.MachineSpec) (*provi
 	state := &providers.MachineState{
 		ID:    id,
 		Name:  spec.Name,
+		Owner: spec.OwnerUID,
 		Ready: p.ReadyOnCreate,
 		Addresses: []providers.Address{
 			{Type: providers.AddressTypeHostname, Address: spec.Name},
@@ -283,6 +288,37 @@ func (p *Provider) deleteLocked(id string) {
 		}
 	}
 	delete(p.machines, id)
+}
+
+// ClaimOwner implements providers.MachineProvider: it compares and sets under
+// one lock, which is the guarantee the interface asks a backend to approach.
+func (p *Provider) ClaimOwner(_ context.Context, id, from, to string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.ClaimCalls++
+	if p.ClaimErr != nil {
+		return p.ClaimErr
+	}
+	state, ok := p.machines[id]
+	if !ok {
+		return providers.ErrNotFound
+	}
+	if state.Owner != from {
+		return fmt.Errorf("%w: %s is owned by %q, not %q", providers.ErrOwnerMismatch, id, state.Owner, from)
+	}
+	state.Owner = to
+	return nil
+}
+
+// SetOwner overwrites the recorded owner, standing in for a machine made
+// before owners were recorded ("") or one another object owns.
+func (p *Provider) SetOwner(id, owner string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state, ok := p.machines[id]; ok {
+		state.Owner = owner
+	}
 }
 
 // AddPartial records leftover resources for a name that has no machine, so a

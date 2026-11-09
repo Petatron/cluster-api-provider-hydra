@@ -127,6 +127,7 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		"EnsureInfrastructure": func() error {
 			return p.EnsureInfrastructure(t.Context(), InfrastructureSpec{})
 		},
+		"ClaimOwner":    func() error { return p.ClaimOwner(t.Context(), "abc", "", "uid") },
 		"DeleteNetwork": func() error { return p.DeleteNetwork(t.Context(), "net", NetworkOwner{}) },
 	}
 	// Name is a constant and StoragePoolFor reads configuration; neither is a
@@ -225,6 +226,11 @@ func (p *recordingProvider) DeleteByName(_ context.Context, _, _ string) error {
 
 func (p *recordingProvider) EnsureInfrastructure(_ context.Context, _ InfrastructureSpec) error {
 	p.lastOp = "EnsureInfrastructure"
+	return p.err
+}
+
+func (p *recordingProvider) ClaimOwner(_ context.Context, _, _, _ string) error {
+	p.lastOp = "ClaimOwner"
 	return p.err
 }
 
