@@ -32,8 +32,10 @@ kubectl get hydramachines -A -o json | jq -r '.items[]
 
 The identity is the one that cannot be missing. A machine moved without
 `identity-uid` cannot be recovered by the provider: its VM's name hashes the UID
-it was made under, and nothing else the move carries says what that was. One
-moved without `owner-uid` still takes its VM over, from the owner the VM
+it was made under, and nothing else the move carries says what that was. An
+operator who still has that UID can recover it; see
+[If a machine was moved without its identity](#if-a-machine-was-moved-without-its-identity).
+One moved without `owner-uid` still takes its VM over, from the owner the VM
 records. The check asks for both so the next move, and the one after it, start
 from a confirmed owner.
 
@@ -80,6 +82,74 @@ Each moved HydraMachine takes its VM over the first time it reconciles on the
 target. It logs `Took over a machine moved from another management cluster`,
 and from then on only that object can manage or delete the VM. Nothing is
 recreated. The providerID and the VM are the same as before.
+
+## If a machine was moved without its identity
+
+A machine moved before it recorded `identity-uid` (from a provider without
+PET-76, or before it had reconciled under one) arrives with a new UID, so the VM
+name it derives is not its VM's. It refuses to act, and touches nothing:
+
+```
+Ready=False ProvisioningFailed: terminal provider failure: providerID resolves to machine
+"<namespace>-<name>-<old hash>", which is not owned by this HydraMachine (expected
+"<namespace>-<name>-<new hash>") ...
+```
+
+It stays that way. Deleting it does not help: the provider refuses the delete
+for the same reason and keeps its finalizer, so the VM is safe but the object
+never goes away. The provider cannot fix this, but you can, if you still have
+the UID the object had **before** the move. Places it can survive:
+
+- **Prometheus**, if it scraped this provider's kube-state-metrics config
+  (`config/metrics/`). Every `capi_hydramachine_*` series carries the object's
+  `uid`. Query the time before the move:
+  `capi_hydramachine_info{namespace="<namespace>",name="<name>"}`.
+- A manifest dump or backup of the source objects, taken before the move.
+- An etcd backup of the source management cluster.
+
+Recover each machine in turn:
+
+**1. Make sure no other copy exists.** The object it was moved from must be
+gone, and no other management cluster may hold a copy of the namespace. The VM
+records no owner yet, so the first copy to claim it wins.
+
+**2. Check that the VM records no owner.** The record is written to the VM's
+persistent definition only, so read the inactive XML; the live one never shows
+it:
+
+```bash
+virsh dumpxml --inactive <vm name> | grep -o '<hydra:owner[^>]*>'
+```
+
+This must print nothing. If it names an owner, stop: the VM belongs to another
+object, and this procedure is not for it.
+
+**3. Prove the UID is the one the name was made from.** The VM name ends in the
+first 20 hex digits of `sha256("<namespace>/<name>/<uid>")`. They must match
+the old hash in the error:
+
+```bash
+printf '%s' '<namespace>/<name>/<old uid>' | sha256sum | cut -c1-20   # macOS: shasum -a 256
+```
+
+Do not try a UID that does not match. A wrong one is refused like the original,
+but a match is the only evidence that this VM is the machine's.
+
+**4. Record it** on the HydraMachine on the target:
+
+```bash
+kubectl annotate hydramachine <name> -n <namespace> \
+  hydramachine.infrastructure.cluster.x-k8s.io/identity-uid=<old uid>
+```
+
+On its next reconcile, the provider finds the VM under that name and claims it
+from nobody. It logs `Recorded owner on a machine that had none recorded`, sets
+`owner-uid` to the object's own UID, and the machine goes `Ready`. The VM is not
+restarted or recreated. From then on the machine is like any other: it can be
+deleted, and it can be moved again.
+
+If it is still refused, remove the annotation (`identity-uid-`) and recheck the
+steps above. Never overwrite an `identity-uid` the provider recorded itself.
 
 ## What not to do
 
