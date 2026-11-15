@@ -37,10 +37,19 @@ HydraMachineTemplate  — the template a MachineDeployment stamps machines from
 
 | Thing | Version | Note |
 |---|---|---|
-| Go | **1.26** | Per `go.mod`. The installed toolchain may be newer; **`go.mod` wins.** |
+| Go | **1.26**, toolchain **go1.26.11** | `go.mod` declares `go 1.26.0` plus `toolchain go1.26.11`; the `Dockerfile` and devcontainer pin `golang:1.26.11`. Bump all three together. |
 | Cluster API | **v1.14.0** | Contract **v1beta2** |
 | controller-runtime | v0.24.1 | |
 | kubebuilder | v4.15.0 | Invoke via its full path if it is not on your `PATH` |
+
+**Why the patch is pinned.** `actions/setup-go` with `go-version-file: go.mod` installs exactly the
+version it finds there, and without a `toolchain` line that was `go 1.26.0`, which leaves about 40
+reachable standard-library vulnerabilities (net/http, crypto/x509, crypto/tls, net/url, …) that later
+1.26 patches fix. The official `golang` images set `GOTOOLCHAIN=local` and ignore the `toolchain`
+line, so the Docker tag has to be pinned separately. To check a bump:
+`GOTOOLCHAIN=go1.26.N go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`. A locally installed
+newer Go (1.27+) takes precedence over the `toolchain` line, which hides this; set `GOTOOLCHAIN`
+explicitly when reproducing CI.
 
 **CAPI v1.14 moved its API types into a separate Go module.** Import from
 `sigs.k8s.io/cluster-api/api`, core package `sigs.k8s.io/cluster-api/api/core/v1beta2`. Any guide or
