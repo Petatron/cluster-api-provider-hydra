@@ -93,11 +93,13 @@ jobs:
       - name: Log in to ghcr.io
         run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
-      - name: Build image
-        run: make docker-build IMG='${{ steps.img.outputs.image }}'
-
-      - name: Push image
-        run: make docker-push IMG='${{ steps.img.outputs.image }}'
+      # amd64 and arm64 in one manifest list. The temporary management cluster
+      # `hydra bootstrap` creates is a kind cluster on the operator's machine,
+      # often Apple Silicon, where an amd64-only image fails with "no matching
+      # manifest". The Dockerfile cross-compiles on the build platform and its
+      # final stage has no RUN, so no emulation is needed.
+      - name: Build and push the multi-arch image
+        run: make docker-buildx IMG='${{ steps.img.outputs.image }}' PLATFORMS=linux/amd64,linux/arm64
 
       # The release manifest must reference the image just published, not the
       # placeholder in config/manager. release-manifests takes IMG for this.

@@ -361,6 +361,29 @@ cannot be set is not reported as created: the provider retries until it can be, 
 it (an unwritable autostart directory, say) shows up as a machine that never finishes provisioning
 rather than as one that silently stays down after the next reboot.
 
+### Installing with clusterctl
+
+Hydra is not in clusterctl's built-in provider list, so name it in a clusterctl config file
+(`~/.config/cluster-api/clusterctl.yaml`, or pass `--config`):
+
+```yaml
+providers:
+  - name: hydra
+    type: InfrastructureProvider
+    url: https://github.com/Petatron/cluster-api-provider-hydra/releases/latest/infrastructure-components.yaml
+```
+
+then:
+
+```bash
+clusterctl init --infrastructure hydra            # or hydra:v0.1.0 to pin
+```
+
+The provider starts without any site configuration and reports a missing hypervisor only when a
+cluster needs one. Give it a hypervisor per cluster (`HydraCluster.spec.hypervisor`, see
+[docs/hypervisors.md](docs/hypervisors.md)) or manager-wide through the `libvirt-config` ConfigMap.
+Releases are published as described in [docs/releasing.md](docs/releasing.md).
+
 ### Building the clusterctl release manifest
 
 ```bash
