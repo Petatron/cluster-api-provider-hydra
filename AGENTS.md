@@ -91,7 +91,8 @@ make test                 # unit tests (envtest: real kube-apiserver + etcd)
 Full local loop before opening a PR: `make manifests generate lint test build`, plus
 `make test-etcd-backup` when `tools/etcd-backup/` changed, `make test-adopted-join` when
 `tools/adopted-join/` changed, `make test-alerts` when `config/prometheus/` or
-`config/metrics/` changed, and `make test-race` when `internal/providers/libvirt/` changed.
+`config/metrics/` changed, `make test-race` when `internal/providers/libvirt/` changed, and
+`make vuln` (govulncheck) when `go.mod` changed.
 
 **Include `build`.** CI builds the manager binary as a separate step, and `make test` does not cover
 it — a change can pass the whole test suite and still fail CI. Both `make build` and the Dockerfile
@@ -104,7 +105,8 @@ Other targets: `make run` (run against current kubeconfig), `make build`,
 `make setup-test-e2e` / `make cleanup-test-e2e` manage it). **`make deploy` is not in that
 list on purpose — see the traps below before running it.**
 
-CI on every PR: `lint`, `test`, `verify`. `test-e2e` runs on `main` and manual dispatch. `release`
+CI on every PR: `lint`, `test`, `verify`, `vuln` (govulncheck; it also runs weekly, because a new
+advisory can make `main` vulnerable without any change here). `test-e2e` runs on `main` and manual dispatch. `release`
 publishes to ghcr on `main` and cuts a GitHub Release on `v*` tags.
 
 ## Repo-specific traps
