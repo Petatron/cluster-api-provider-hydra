@@ -2,6 +2,8 @@ module github.com/Petatron/cluster-api-provider-hydra
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/digitalocean/go-libvirt v0.0.0-20260814190004-1a83157e1858
 	github.com/kdomanski/iso9660 v0.4.0
