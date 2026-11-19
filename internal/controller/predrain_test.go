@@ -327,14 +327,36 @@ var _ = Describe("Pre-drain guest hook", func() {
 		Expect(held(r)).To(BeTrue())
 	})
 
-	It("never starts the program twice: a start whose pid was never recorded releases the hook", func() {
+	It("holds, without starting again, a start whose outcome is unknown, until its timeout", func() {
 		running()
 		r := provisioned(deletingOwner(time.Second))
+		withRun(r, runRecord(r, runStarting))
+		res, err := reconcile(r)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(held(r)).To(BeTrue(), "the program may be running: the drain waits")
+		Expect(provider.GuestStarts).To(BeEmpty(), "never a second copy")
+	})
+
+	It("releases a start whose outcome is unknown once its timeout has passed", func() {
+		running()
+		r := provisioned(deletingOwner(infrav1.DefaultGuestHookTimeoutSeconds*time.Second + 5*time.Second))
 		withRun(r, runRecord(r, runStarting))
 		_, err := reconcile(r)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(held(r)).To(BeFalse())
 		Expect(provider.GuestStarts).To(BeEmpty())
+	})
+
+	It("treats a start that reports no pid as a failed start, and retries it", func() {
+		running()
+		provider.GuestPID = -1
+		r := provisioned(deletingOwner(time.Second))
+		res, err := reconcile(r)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(preDrainHookRetry))
+		Expect(held(r)).To(BeTrue())
+		Expect(reloadHM(ctx, r, key).Annotations).NotTo(HaveKey(PreDrainHookRunAnnotation))
 	})
 
 	It("ignores a run record from another deletion, such as one copied by clusterctl move", func() {
@@ -380,14 +402,23 @@ var _ = Describe("Pre-drain guest hook", func() {
 		Expect(held(r)).To(BeFalse())
 	})
 
-	It("keeps a hook that has time left when no provider is available", func() {
+	It("keeps a hook that has time left when no provider is available, on a timer within the bound", func() {
 		running()
 		r := provisioned(deletingOwner(time.Second))
 		link := &linkage{machine: machineOf(r)}
 		requeue, err := r.reconcilePreDrainHook(ctx, reloadHM(ctx, r, key), link, nil)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(requeue).To(BeZero())
+		Expect(requeue).To(Equal(preDrainHookRetry), "a timer, not the caller's growing error backoff")
 		Expect(held(r)).To(BeTrue())
+	})
+
+	It("never waits past the bound for a missing provider", func() {
+		running()
+		r := provisioned(deletingOwner(infrav1.DefaultGuestHookTimeoutSeconds*time.Second + preDrainHookSlack - 2*time.Second))
+		link := &linkage{machine: machineOf(r)}
+		requeue, err := r.reconcilePreDrainHook(ctx, reloadHM(ctx, r, key), link, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(requeue).To(BeNumerically("<=", 4*time.Second))
 	})
 })
 

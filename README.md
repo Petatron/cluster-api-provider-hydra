@@ -219,15 +219,16 @@ healthy node. That makes it the place to hand over what the node serves: Hydra's
 move the control-plane virtual IP off a control-plane machine before it is deleted (PET-88).
 
 The hook never blocks a deletion for long.
-- **One run.** The program runs once, and the deletion goes on whatever it returned.
-- **Errors don't block.** A failed program, a program that outlives `timeoutSeconds`, or a guest
-  agent that cannot be reached is logged, and the hook is released.
-- **A hard bound.** Even a run that never starts is released `timeoutSeconds` plus 60 s after the
-  deletion began.
-- **Skipped where Cluster API skips.** The hook is skipped where Cluster API skips pre-drain hooks:
-  a cluster being deleted, or its last control-plane node.
-
-The program may run more than once (a retry after a status read failed), so it must be idempotent.
+- **The deletion always goes on.** A program that fails, cannot be run, or is still running after
+  `timeoutSeconds` (it is left running, not killed) releases the hook.
+- **A hard bound.** An unreachable guest agent or backend is retried on a short timer, but only
+  until `timeoutSeconds` plus 60 s after the deletion began.
+- **Starts.** A start that failed is retried. A start whose outcome is unknown (a lost reply, a
+  controller restart) is not retried, and holds the deletion until `timeoutSeconds`. So the
+  program must be idempotent and safe to leave running.
+- **Where it doesn't run.** It is not run while the Cluster is being deleted. Where Cluster API
+  doesn't wait on pre-drain hooks for other reasons (no Node, the last control-plane machine, a
+  control plane being deleted), it may still run, but nothing waits for it.
 
 Deliberately **not** here: GPU. That belongs to the machine-class model in PET-28,
 and adding an optional field later is a non-breaking change.

@@ -86,9 +86,11 @@ const runStarting = "starting"
 //	  no providerID, machine gone or not running -> release (nothing to run)
 //	  no run recorded, past timeout              -> release (too late to start)
 //	  no run recorded                            -> record "starting", start, record pid, poll
-//	  "starting" recorded, no pid                -> release (it may have run; never start twice)
+//	  "starting" recorded, no pid, within timeout -> hold (it may be running; never start twice)
+//	  "starting" recorded, no pid, past timeout  -> release
 //	  the guest refused (no program, pid unknown) -> release
-//	  start or status call failed                -> retry, within the bound above
+//	  start or status call failed                -> retry on a timer, within the bound above
+//	  no provider (backend unreachable)          -> retry on a timer, within the bound above
 //	  still running, past timeout                -> release (the program is not stopped)
 //	  still running                              -> poll
 //	  exited, any code                           -> release
@@ -130,8 +132,11 @@ func (r *HydraMachineReconciler) reconcilePreDrainHook(ctx context.Context, mach
 	case deleting > hook.Timeout()+preDrainHookSlack:
 		return release("Released pre-drain hook: its time ran out", "timeout", hook.Timeout(), "slack", preDrainHookSlack)
 	case prov == nil:
-		// The caller reports why there is no provider and retries.
-		return 0, nil
+		// Come back on a short timer, not through the caller's error path:
+		// its backoff grows past the bound above. The backend error is
+		// reported again once the hook is released.
+		log.Info("Pre-drain hook is waiting for the infrastructure backend")
+		return min(preDrainHookRetry, hook.Timeout()+preDrainHookSlack-deleting+time.Second), nil
 	case machine.Spec.ProviderID == nil:
 		return release("Released pre-drain hook without running it: the machine has no providerID")
 	}
@@ -197,20 +202,34 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 			return release("Released pre-drain hook without running it: the machine is not running", "reason", err.Error())
 		case errors.Is(err, providers.ErrGuestRefused):
 			return release("Released pre-drain hook: the guest could not run it", "path", hook.Path, "reason", err.Error())
+		case err == nil && pid <= 0:
+			err = fmt.Errorf("the guest reported pid %d", pid)
+			fallthrough
 		case err != nil:
-			// Not started: clear the marker so a retry may start it.
-			if clearErr := r.setRunRecord(ctx, machine, "", false); clearErr != nil {
+			// Not started: clear the marker so a retry may start it. Should
+			// even that fail, the marker stays and the run is treated as
+			// unknown below: held until the timeout, never started again.
+			if clearErr := r.setRunRecordRetrying(ctx, machine, ""); clearErr != nil {
 				return 0, clearErr
 			}
 			return retry("start", err), nil
 		}
 		log.Info("Started pre-drain hook", "path", hook.Path, "pid", pid)
-		if err := r.setRunRecord(ctx, machine, thisRun+strconv.Itoa(pid), false); err != nil {
+		if err := r.setRunRecordRetrying(ctx, machine, thisRun+strconv.Itoa(pid)); err != nil {
+			// The program is running and its pid is lost: the record
+			// stays "starting", and the hook is held until the timeout.
 			return 0, err
 		}
 		return preDrainHookPoll, nil
+	case record == runStarting && deleting <= hook.Timeout():
+		// A start whose outcome this controller does not know -- it
+		// crashed, or a record could not be written. The program may be
+		// running: hold the drain until the timeout, and never start a
+		// second copy.
+		log.V(1).Info("Pre-drain hook run is unknown; holding until its timeout", "timeout", hook.Timeout())
+		return min(preDrainHookRetry, hook.Timeout()-deleting+time.Second), nil
 	case record == runStarting:
-		return release("Released pre-drain hook: a start was under way but its pid was never recorded; it is not started twice")
+		return release("Released pre-drain hook: a start's outcome was never recorded, and its time is up; it is not started twice")
 	}
 	pid, err := strconv.Atoi(record)
 	if err != nil || pid <= 0 {
@@ -235,6 +254,28 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 		return release("Ran pre-drain hook", "path", hook.Path)
 	}
 	return release("Pre-drain hook failed; the deletion goes on", "path", hook.Path, "exitCode", run.ExitCode)
+}
+
+// setRunRecordRetrying is setRunRecord against a fresh read, tried a few
+// times: a run record that cannot be written turns a known outcome into an
+// unknown one.
+func (r *HydraMachineReconciler) setRunRecordRetrying(ctx context.Context, machine *infrav1.HydraMachine, value string) error {
+	var err error
+	for attempt := range 4 {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+			fresh := &infrav1.HydraMachine{}
+			if getErr := r.APIReader.Get(ctx, client.ObjectKeyFromObject(machine), fresh); getErr != nil {
+				err = getErr
+				continue
+			}
+			*machine = *fresh
+		}
+		if err = r.setRunRecord(ctx, machine, value, false); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // setRunRecord sets PreDrainHookRunAnnotation on machine to value, or removes

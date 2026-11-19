@@ -81,6 +81,8 @@ type Provider struct {
 	GuestStatusErr error
 	GuestRunning   bool
 	GuestResult    providers.GuestRun
+	// GuestPID, when non-zero, is the pid StartInGuest reports.
+	GuestPID int
 
 	// DefaultStoragePool is what StoragePoolFor answers for an empty request.
 	DefaultStoragePool string
@@ -326,6 +328,9 @@ func (p *Provider) StartInGuest(_ context.Context, id, path string) (int, error)
 	}
 	if p.GuestStartErr != nil {
 		return 0, p.GuestStartErr
+	}
+	if p.GuestPID != 0 {
+		return p.GuestPID, nil
 	}
 	return len(p.GuestStarts), nil
 }

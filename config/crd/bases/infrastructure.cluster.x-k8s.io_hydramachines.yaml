@@ -182,17 +182,24 @@ spec:
                   member, so the program still runs on a healthy node: the place to hand
                   over anything the node serves, such as a control-plane virtual IP.
 
-                  The program is started once per deletion, as root, and the deletion
-                  then proceeds whatever it returned: a program that fails, cannot be run,
-                  or is still running after timeoutSeconds (it is left running, not
-                  killed) releases the hook, as does a guest agent that cannot be reached
-                  within timeoutSeconds plus 60 seconds of the deletion starting. The
-                  program must be idempotent and safe to leave running.
+                  The program runs as root. The deletion then proceeds whatever it
+                  returned: a program that fails, cannot be run, or is still running
+                  after timeoutSeconds (it is left running, not killed) releases the
+                  hook, as does a guest agent or infrastructure backend that cannot be
+                  reached within timeoutSeconds plus 60 seconds of the deletion starting.
 
-                  Where Cluster API skips pre-drain hooks -- the cluster or control plane
-                  being deleted, a machine with no Node, the last control-plane node --
-                  the program is not run. A standalone HydraMachine, with no Cluster API
-                  Machine to hold, never runs it.
+                  A start that failed is tried again; a start whose outcome is unknown
+                  (a lost reply, a controller restart) is not, and holds the deletion
+                  until timeoutSeconds. The program must therefore be idempotent, and
+                  safe to leave running.
+
+                  The program is not run while the Cluster is being deleted. Where
+                  Cluster API does not wait on pre-drain hooks for other reasons -- a
+                  machine with no Node, the last control-plane machine, a control plane
+                  being deleted -- it may still run, but the deletion does not wait for
+                  it, and the hook is released once the HydraMachine is deleted. A
+                  standalone HydraMachine, with no Cluster API Machine to hold, never runs
+                  it.
                 properties:
                   path:
                     description: |-
