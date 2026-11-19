@@ -294,6 +294,9 @@ func (r *HydraMachineReconciler) release(ctx context.Context, owner providers.Ow
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hydramachines/finalizers,verbs=update
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;clusters,verbs=get;list;watch
+// Machines are patched only to add and remove this controller's own pre-drain
+// hook annotation (spec.preDrainHook).
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=patch
 // Secrets are read one at a time through the uncached APIReader, never listed
 // or watched -- so this grant is deliberately get-only. Widening it would make
 // a cluster-wide Secret informer possible again.
@@ -355,6 +358,19 @@ func (r *HydraMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	var prov providers.MachineProvider
 	if err == nil {
 		prov, err = r.provider(ctx, machine, link, placement)
+	}
+	// Before the provider's own outcome is acted on: a hook whose time has run
+	// out is released even while the hypervisor cannot be reached.
+	hookProv := prov
+	if err != nil {
+		hookProv = nil
+	}
+	requeue, hookErr := r.reconcilePreDrainHook(ctx, machine, link, hookProv)
+	if hookErr != nil {
+		return ctrl.Result{}, hookErr
+	}
+	if requeue > 0 {
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 	if reason := waitReasonFor(err); reason != "" {
 		if statusErr := r.recordWaiting(ctx, machine, reason, err.Error()); statusErr != nil {

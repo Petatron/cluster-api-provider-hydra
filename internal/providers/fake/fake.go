@@ -70,6 +70,18 @@ type Provider struct {
 	// ClaimCalls counts ClaimOwner calls, including refused ones.
 	ClaimCalls int
 
+	// GuestStarts records the path of every StartInGuest call, in order.
+	GuestStarts []string
+	// GuestStatusCalls counts GuestStatus calls.
+	GuestStatusCalls int
+	// GuestStartErr and GuestStatusErr make the calls fail. GuestRunning
+	// keeps GuestStatus answering "still running"; otherwise it answers
+	// GuestResult.
+	GuestStartErr  error
+	GuestStatusErr error
+	GuestRunning   bool
+	GuestResult    providers.GuestRun
+
 	// DefaultStoragePool is what StoragePoolFor answers for an empty request.
 	DefaultStoragePool string
 
@@ -288,6 +300,52 @@ func (p *Provider) deleteLocked(id string) {
 		}
 	}
 	delete(p.machines, id)
+}
+
+// guestMachine answers ErrNotFound or ErrNotRunning the way a backend does.
+// Callers hold p.mu.
+func (p *Provider) guestMachine(id string) error {
+	state, ok := p.machines[id]
+	switch {
+	case !ok:
+		return providers.ErrNotFound
+	case !state.Ready:
+		return providers.ErrNotRunning
+	}
+	return nil
+}
+
+// StartInGuest implements providers.MachineProvider. The pid it returns is
+// the number of starts so far.
+func (p *Provider) StartInGuest(_ context.Context, id, path string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.GuestStarts = append(p.GuestStarts, path)
+	if err := p.guestMachine(id); err != nil {
+		return 0, err
+	}
+	if p.GuestStartErr != nil {
+		return 0, p.GuestStartErr
+	}
+	return len(p.GuestStarts), nil
+}
+
+// GuestStatus implements providers.MachineProvider.
+func (p *Provider) GuestStatus(_ context.Context, id string, _ int) (*providers.GuestRun, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.GuestStatusCalls++
+	if err := p.guestMachine(id); err != nil {
+		return nil, err
+	}
+	if p.GuestStatusErr != nil {
+		return nil, p.GuestStatusErr
+	}
+	if p.GuestRunning {
+		return nil, nil
+	}
+	run := p.GuestResult
+	return &run, nil
 }
 
 // ClaimOwner implements providers.MachineProvider: it compares and sets under

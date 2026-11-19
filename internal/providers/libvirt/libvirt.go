@@ -211,6 +211,7 @@ type client interface {
 	DomainUndefineFlags(dom golibvirt.Domain, flags golibvirt.DomainUndefineFlagsValues) error
 	DomainGetState(dom golibvirt.Domain, flags uint32) (int32, int32, error)
 	DomainInterfaceAddresses(dom golibvirt.Domain, source, flags uint32) ([]golibvirt.DomainInterface, error)
+	QEMUDomainAgentCommand(dom golibvirt.Domain, cmd string, timeout int32, flags uint32) (golibvirt.OptString, error)
 	DomainGetMetadata(dom golibvirt.Domain, typ int32, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) (string, error)
 	DomainSetMetadata(dom golibvirt.Domain, typ int32, metadata, key, uri golibvirt.OptString, flags golibvirt.DomainModificationImpact) error
 	ConnectListAllDomains(needResults int32, flags golibvirt.ConnectListAllDomainsFlags) ([]golibvirt.Domain, uint32, error)

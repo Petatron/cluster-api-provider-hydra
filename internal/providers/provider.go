@@ -417,6 +417,37 @@ type MachineProvider interface {
 	// records no owner or another one, which it leaves alone; and
 	// ErrNetworkInUse while any machine on the host still references it.
 	DeleteNetwork(ctx context.Context, name string, owner NetworkOwner) error
+
+	// StartInGuest starts the program at path inside the machine's guest,
+	// without arguments, and returns its process ID there. It returns
+	// ErrNotFound when the machine does not exist and ErrNotRunning when it is
+	// not running.
+	StartInGuest(ctx context.Context, id, path string) (int, error)
+
+	// GuestStatus reports how the program StartInGuest started as pid ended,
+	// or nil while it is still running. ErrNotFound and ErrNotRunning as for
+	// StartInGuest; a program that exits non-zero is a result, not an error.
+	GuestStatus(ctx context.Context, id string, pid int) (*GuestRun, error)
+}
+
+// ErrNotRunning is returned by StartInGuest and GuestStatus when the machine
+// is not running.
+var ErrNotRunning = errors.New("machine is not running")
+
+// ErrGuestRefused is returned by StartInGuest and GuestStatus when the guest
+// itself refused the request -- the program does not exist or cannot be run,
+// or the guest does not know the process (it was restarted, or its exit was
+// already reported). Retrying cannot change the answer.
+var ErrGuestRefused = errors.New("the guest refused the request")
+
+// GuestRun is how a program started by StartInGuest ended.
+type GuestRun struct {
+	// ExitCode is the program's exit status; 128+N for a program killed by
+	// signal N.
+	ExitCode int
+	// Output is the program's standard output then standard error, as the
+	// guest reported them (the guest agent truncates long output).
+	Output string
 }
 
 // ProviderID renders the Cluster API providerID for a machine.

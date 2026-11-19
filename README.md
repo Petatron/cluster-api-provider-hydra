@@ -201,6 +201,34 @@ around libvirt.
 That reads naturally (`8Gi`), and it is the same type `corev1.ResourceList` uses,
 so the autoscaler capacity contract (PET-27) can reuse these values directly.
 
+#### Pre-drain guest hook
+
+```yaml
+spec:
+  preDrainHook:
+    path: /usr/local/sbin/hydra-pre-drain   # run in the guest, as root, no arguments
+    timeoutSeconds: 60                      # optional; default 60, at most 600
+```
+
+A machine that sets `preDrainHook` has its Cluster API `Machine` held by the pre-drain hook
+`pre-drain.delete.hook.machine.cluster.x-k8s.io/hydra-guest-hook`. When the Machine starts
+deleting, the controller runs the program inside the guest (libvirt: through the QEMU guest agent),
+waits for it to exit, and releases the hook. Cluster API drains the Node only after that. On a
+control-plane machine, that is before KCP removes its etcd member, so the program still runs on a
+healthy node. That makes it the place to hand over what the node serves: Hydra's CLI uses it to
+move the control-plane virtual IP off a control-plane machine before it is deleted (PET-88).
+
+The hook never blocks a deletion for long.
+- **One run.** The program runs once, and the deletion goes on whatever it returned.
+- **Errors don't block.** A failed program, a program that outlives `timeoutSeconds`, or a guest
+  agent that cannot be reached is logged, and the hook is released.
+- **A hard bound.** Even a run that never starts is released `timeoutSeconds` plus 60 s after the
+  deletion began.
+- **Skipped where Cluster API skips.** The hook is skipped where Cluster API skips pre-drain hooks:
+  a cluster being deleted, or its last control-plane node.
+
+The program may run more than once (a retry after a status read failed), so it must be idempotent.
+
 Deliberately **not** here: GPU. That belongs to the machine-class model in PET-28,
 and adding an optional field later is a non-breaking change.
 

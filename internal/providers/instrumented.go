@@ -164,6 +164,20 @@ func (p *Instrumented) DeleteNetwork(ctx context.Context, name string, owner Net
 	return err
 }
 
+func (p *Instrumented) StartInGuest(ctx context.Context, id, path string) (int, error) {
+	start := time.Now()
+	pid, err := p.MachineProvider.StartInGuest(ctx, id, path)
+	p.observe("StartInGuest", start, err)
+	return pid, err
+}
+
+func (p *Instrumented) GuestStatus(ctx context.Context, id string, pid int) (*GuestRun, error) {
+	start := time.Now()
+	run, err := p.MachineProvider.GuestStatus(ctx, id, pid)
+	p.observe("GuestStatus", start, err)
+	return run, err
+}
+
 func (p *Instrumented) observe(operation string, start time.Time, err error) {
 	observe(p.hypervisor, operation, start, err)
 }
