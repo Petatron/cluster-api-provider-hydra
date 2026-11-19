@@ -172,3 +172,29 @@ func TestGuestStatusRejectsBadBase64(t *testing.T) {
 		t.Fatal("undecodable output must be an error")
 	}
 }
+
+// A guest-exec that libvirt never sent (no agent connected) is a plain
+// failure; one sent but unanswered has an unknown outcome.
+func TestStartInGuestTellsUnsentFromUnanswered(t *testing.T) {
+	p, f := newFakeProvider(t)
+	d := f.addDomain("cp-1", "<domain/>", true)
+	id := formatUUID(d.dom.UUID)
+	for _, tc := range []struct {
+		name    string
+		err     golibvirt.Error
+		unknown bool
+	}{
+		{"not connected", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: QEMU guest agent is not connected"}, false},
+		{"timed out", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: Guest agent not available for now"}, true},
+		{"connection dropped", golibvirt.Error{Code: uint32(golibvirt.ErrInternalError), Message: "internal error: client socket is closed"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lerr := tc.err
+			d.agent = func(string) (string, error) { return "", lerr }
+			_, err := p.StartInGuest(t.Context(), id, "/x")
+			if err == nil || errors.Is(err, providers.ErrGuestOutcomeUnknown) != tc.unknown {
+				t.Fatalf("%v; unknown want %v", err, tc.unknown)
+			}
+		})
+	}
+}

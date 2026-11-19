@@ -28,6 +28,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
@@ -75,7 +76,7 @@ const runStarting = "starting"
 //
 //	Machine not deleting:
 //	  HydraMachine deleting, hook present        -> remove it
-//	  hook wanted and absent                     -> add it
+//	  hook wanted and absent, finalizer present  -> add it
 //	  not wanted and present                     -> remove it (nobody would serve it)
 //	  a run record is left over                  -> remove the record
 //	Machine deleting, hook present:
@@ -156,7 +157,9 @@ func (r *HydraMachineReconciler) holdPreDrainHook(ctx context.Context, machine *
 	case held && !machine.DeletionTimestamp.IsZero():
 		log.Info("Removed pre-drain hook from Machine: the HydraMachine is being deleted")
 		return r.setPreDrainHook(ctx, m, false)
-	case hook != nil && !held && machine.DeletionTimestamp.IsZero():
+	case hook != nil && !held && machine.DeletionTimestamp.IsZero() && controllerutil.ContainsFinalizer(machine, MachineFinalizer):
+		// Only once the finalizer is in place: a HydraMachine deleted without
+		// it would never come back to release the hook.
 		return r.setPreDrainHook(ctx, m, true)
 	case hook == nil && held:
 		log.Info("Removed pre-drain hook from Machine: preDrainHook is not set")
@@ -184,12 +187,22 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 		record = ""
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, guestCallTimeout)
+	// No call may outlast the hook's hard bound.
+	callCtx, cancel := context.WithTimeout(ctx, min(guestCallTimeout, hook.Timeout()+preDrainHookSlack-deleting))
 	defer cancel()
 	switch {
 	case record == "" && deleting > hook.Timeout():
 		return release("Released pre-drain hook without running it: too late to start it", "timeout", hook.Timeout())
 	case record == "":
+		// The same check teardown makes before touching a machine: a
+		// providerID can be written at creation, so it must resolve to this
+		// object's own machine before anything runs in it as root.
+		if reason, ok := r.ownsGuest(callCtx, prov, machine, id); !ok {
+			if reason == "" {
+				return retry("ownership check", errors.New("the machine could not be read")), nil
+			}
+			return release("Released pre-drain hook without running it: the machine is not this HydraMachine's", "reason", reason)
+		}
 		// Recorded before the start, under an optimistic lock: a second
 		// reconcile reading a stale object fails here instead of starting a
 		// second copy.
@@ -198,6 +211,11 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 		}
 		pid, err := prov.StartInGuest(callCtx, id, hook.Path)
 		switch {
+		case errors.Is(err, providers.ErrGuestOutcomeUnknown):
+			// The guest may have started it: the record stays "starting",
+			// so the run is held until the timeout and never started again.
+			log.Info("Pre-drain hook start has an unknown outcome; holding until its timeout", "path", hook.Path, "reason", err.Error())
+			return preDrainHookRetry, nil
 		case errors.Is(err, providers.ErrNotFound), errors.Is(err, providers.ErrNotRunning):
 			return release("Released pre-drain hook without running it: the machine is not running", "reason", err.Error())
 		case errors.Is(err, providers.ErrGuestRefused):
@@ -254,6 +272,31 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 		return release("Ran pre-drain hook", "path", hook.Path)
 	}
 	return release("Pre-drain hook failed; the deletion goes on", "path", hook.Path, "exitCode", run.ExitCode)
+}
+
+// ownsGuest reports whether the machine id resolves to is this object's, by
+// the checks teardown uses: its name derives from this object, and its owner
+// record is this object (or unset, for one not moved here). A false with an
+// empty reason means the machine could not be read.
+func (r *HydraMachineReconciler) ownsGuest(ctx context.Context, prov providers.MachineProvider, machine *infrav1.HydraMachine, id string) (string, bool) {
+	ident, err := identityOf(machine)
+	if err != nil {
+		return err.Error(), false
+	}
+	state, err := prov.Get(ctx, id)
+	switch {
+	case errors.Is(err, providers.ErrNotFound):
+		return "the machine does not exist", false
+	case err != nil:
+		return "", false
+	}
+	if err := verifyOwnership(machine, ident, state); err != nil {
+		return err.Error(), false
+	}
+	if err := ownsForDeletion(machine, ident, state); err != nil {
+		return err.Error(), false
+	}
+	return "", true
 }
 
 // setRunRecordRetrying is setRunRecord against a fresh read, tried a few

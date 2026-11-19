@@ -434,6 +434,11 @@ type MachineProvider interface {
 // is not running.
 var ErrNotRunning = errors.New("machine is not running")
 
+// ErrGuestOutcomeUnknown is returned by StartInGuest when the request may
+// have reached the guest but no answer came back (a timeout, a dropped
+// connection): the program may or may not be running.
+var ErrGuestOutcomeUnknown = errors.New("the guest's answer was lost")
+
 // ErrGuestRefused is returned by StartInGuest and GuestStatus when the guest
 // itself refused the request -- the program does not exist or cannot be run,
 // or the guest does not know the process (it was restarted, or its exit was

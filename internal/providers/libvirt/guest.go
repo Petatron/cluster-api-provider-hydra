@@ -51,6 +51,10 @@ func (p *Provider) StartInGuest(ctx context.Context, id, path string) (int, erro
 		PID int `json:"pid"`
 	}
 	if err := p.agentCommand(ctx, dom, "guest-exec", map[string]any{"path": path, "capture-output": true}, &started); err != nil {
+		if !errors.Is(err, providers.ErrGuestRefused) && !agentNotConnected(err) {
+			// Sent, but no answer: the guest may have started it.
+			err = fmt.Errorf("%w: %v", providers.ErrGuestOutcomeUnknown, err)
+		}
 		return 0, fmt.Errorf("libvirt: starting %s in domain %q: %w", path, dom.Name, err)
 	}
 	return started.PID, nil
@@ -176,4 +180,12 @@ func isAgentRefusal(err error) bool {
 	// Older libvirt reports the agent's own error as an internal error.
 	return lerr.Code == uint32(golibvirt.ErrInternalError) &&
 		strings.Contains(lerr.Message, "unable to execute QEMU agent command")
+}
+
+// agentNotConnected reports whether libvirt refused a guest-agent command
+// before sending it, because no agent is connected: then nothing ran.
+func agentNotConnected(err error) bool {
+	var lerr golibvirt.Error
+	return errors.As(err, &lerr) && lerr.Code == uint32(golibvirt.ErrAgentUnresponsive) &&
+		strings.Contains(lerr.Message, "not connected")
 }

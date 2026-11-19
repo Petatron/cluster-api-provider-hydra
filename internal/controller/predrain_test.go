@@ -71,8 +71,11 @@ var _ = Describe("Pre-drain guest hook", func() {
 		live := &clusterv1.Machine{}
 		Expect(c.Get(ctx, client.ObjectKeyFromObject(capi), live)).To(Succeed())
 		if live.DeletionTimestamp.IsZero() {
-			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
-			Expect(err).NotTo(HaveOccurred())
+			// Twice: the first adds the finalizer, after which the hook may go on.
+			for range 2 {
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+			}
 		}
 		return r
 	}
@@ -136,6 +139,46 @@ var _ = Describe("Pre-drain guest hook", func() {
 	It("holds the Machine's deletion with a pre-drain hook when preDrainHook is set", func() {
 		r := provisioned(ownerMachine(&secret))
 		Expect(machineOf(r).Annotations).To(HaveKeyWithValue(infrav1.PreDrainHookAnnotation, infrav1.PreDrainHookOwner))
+	})
+
+	It("adds the hook only once the HydraMachine's finalizer is in place", func() {
+		s := linkScheme()
+		c := fakeclient.NewClientBuilder().WithScheme(s).
+			WithObjects(hm, ownerMachine(&secret), readyCluster(), bootstrapSecret(secret, map[string][]byte{bootstrapDataSecretKey: []byte("#cloud-config\n")})).
+			WithStatusSubresource(&infrav1.HydraMachine{}).Build()
+		r := &HydraMachineReconciler{Client: c, APIReader: c, Scheme: s, Provider: provider}
+		_, err := r.reconcilePreDrainHook(ctx, reloadHM(ctx, r, key), &linkage{machine: machineOf(r)}, provider)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(held(r)).To(BeFalse(), "without the finalizer, a deleted HydraMachine could never release it")
+	})
+
+	It("never runs the program in a machine that is not this HydraMachine's", func() {
+		running()
+		r := provisioned(deletingOwner(time.Second))
+		_, id, err := providers.ParseProviderID(*reloadHM(ctx, r, key).Spec.ProviderID)
+		Expect(err).NotTo(HaveOccurred())
+		provider.SetOwner(id, "uid-of-someone-else")
+		// Directly: the rest of the reconcile refuses the machine as well.
+		_, err = r.reconcilePreDrainHook(ctx, reloadHM(ctx, r, key), &linkage{machine: machineOf(r)}, provider)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(held(r)).To(BeFalse())
+		Expect(provider.GuestStarts).To(BeEmpty())
+	})
+
+	It("holds, and never starts again, a start whose answer was lost", func() {
+		running()
+		provider.GuestStartErr = fmt.Errorf("%w: timed out", providers.ErrGuestOutcomeUnknown)
+		r := provisioned(deletingOwner(time.Second))
+		res, err := reconcile(r)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(preDrainHookRetry))
+		Expect(held(r)).To(BeTrue())
+		Expect(reloadHM(ctx, r, key).Annotations).To(HaveKeyWithValue(PreDrainHookRunAnnotation, runRecord(r, runStarting)))
+
+		provider.GuestStartErr = nil
+		_, err = reconcile(r)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(provider.GuestStarts).To(HaveLen(1), "the program may be running: never a second start")
 	})
 
 	It("removes a hook nobody would serve when preDrainHook is unset", func() {
