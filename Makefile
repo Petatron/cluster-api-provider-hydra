@@ -255,6 +255,21 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 		mv config/manager/kustomization.yaml.orig config/manager/kustomization.yaml; \
 		exit $$status
 
+##@ Release
+
+# A release is a PR that changes VERSION (PET-92); see docs/releasing.md.
+.PHONY: bump-patch bump-minor bump-major
+bump-patch: ## Bump VERSION's patch number (fixes only)
+	@hack/version.sh bump patch
+bump-minor: ## Bump VERSION's minor number and add its metadata.yaml releaseSeries entry
+	@hack/version.sh bump minor
+bump-major: ## Bump VERSION's major number and add its metadata.yaml releaseSeries entry
+	@hack/version.sh bump major
+
+.PHONY: check-version
+check-version: ## Fail unless VERSION is well formed, not behind the newest tag, and in metadata.yaml (needs tags fetched)
+	@hack/version.sh check
+
 ##@ Deployment
 
 ifndef ignore-not-found

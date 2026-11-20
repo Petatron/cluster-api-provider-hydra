@@ -3,8 +3,12 @@ name: Release
 # Post-merge pipeline.
 #
 #   push to main  -> build and publish a container image tagged with the commit
-#   push of a tag -> same, plus a GitHub Release carrying the two files
-#                    clusterctl needs to install this provider
+#   push to main whose VERSION has no tag yet (PET-92)
+#                 -> same, plus tag the commit vX.Y.Z and cut a GitHub Release
+#                    carrying the two files clusterctl needs to install this
+#                    provider. This is the normal way to release: a PR that
+#                    changes VERSION (make bump-patch|minor|major).
+#   push of a tag -> the same release, from a tag pushed by hand (fallback)
 #
 # Deliberately does NOT run on pull_request: a PR must never be able to publish
 # an image or a release.
@@ -20,6 +24,70 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Decides whether this run releases, and as which tag. A tag the release job
+  # creates with GITHUB_TOKEN does not start another workflow run, so the
+  # main-push path cannot release twice. Runs on main are serialised by the
+  # concurrency group, so the next run sees the tag this one created.
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+      invalid: ${{ steps.v.outputs.invalid }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the existing tags decide whether VERSION is released
+
+      # Main path, VERSION = vX.Y.Z:
+      #   tag absent, VERSION releasable      -> release
+      #   tag absent, VERSION not releasable  -> sha image only, run fails at the end
+      #   tag on this commit, no Release      -> release (finishes a half-done one)
+      #   tag present, Release exists         -> sha image only
+      #   tag on another commit, no Release   -> sha image only, warning (recover by hand)
+      - name: Resolve
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          out() { { echo "release=$1"; echo "tag=$2"; echo "invalid=${3:-false}"; } >> "$GITHUB_OUTPUT"; }
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "Tag push: releasing $REF_NAME"
+            out true "$REF_NAME"
+            exit 0
+          fi
+          if ! v="$(hack/version.sh get)"; then
+            echo "::error::VERSION is unreadable; publishing the commit image only, and failing the run"
+            out false "" true
+            exit 0
+          fi
+          tag="v$v"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$tag is released; publishing the commit image only"
+              out false "$tag"
+            elif [ "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA" ]; then
+              echo "::warning::$tag names this commit but has no GitHub Release; finishing the release"
+              out true "$tag"
+            else
+              echo "::warning::$tag has no GitHub Release and names another commit; see 'Recovering a release' in docs/releasing.md"
+              out false "$tag"
+            fi
+          elif ! hack/version.sh check; then
+            echo "::error::VERSION is not releasable; publishing the commit image only, and failing the run"
+            out false "$tag" true
+          else
+            echo "::notice::VERSION is untagged; releasing $tag from $GITHUB_SHA"
+            out true "$tag"
+          fi
+
   # Publishing must not depend on the PR workflows. They are scoped to
   # branches: [main] and so do not run for tag pushes at all, and on main they
   # run concurrently with this one -- either way an unverified commit could
@@ -61,7 +129,7 @@ jobs:
 
   publish:
     name: Build and publish
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required to create the GitHub Release on a tag
@@ -78,20 +146,72 @@ jobs:
           go-version-file: go.mod
 
       # ghcr.io requires a lowercase path, and the org is 'Petatron'.
+      # A release is published under its version tag; every other run under
+      # the commit. A release from main also gets the commit tag, below.
       - name: Resolve image reference
         id: img
+        env:
+          RELEASE: ${{ needs.version.outputs.release }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          repo_lc="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tag="${{ github.ref_name }}"
-          else
-            tag="sha-$(echo '${{ github.sha }}' | cut -c1-12)"
-          fi
-          echo "image=ghcr.io/${repo_lc}:${tag}" >> "$GITHUB_OUTPUT"
+          repo_lc="$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          sha_tag="sha-$(echo "$GITHUB_SHA" | cut -c1-12)"
+          if [ "$RELEASE" = "true" ]; then tag="$TAG"; else tag="$sha_tag"; fi
+          {
+            echo "image=ghcr.io/${repo_lc}:${tag}"
+            echo "sha_image=ghcr.io/${repo_lc}:${sha_tag}"
+            echo "backup_image=ghcr.io/${repo_lc}-etcd-backup:${tag}"
+            echo "backup_sha_image=ghcr.io/${repo_lc}-etcd-backup:${sha_tag}"
+          } >> "$GITHUB_OUTPUT"
           echo "Publishing ghcr.io/${repo_lc}:${tag}"
 
       - name: Log in to ghcr.io
-        run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      # On the main path the tag is created FIRST and is the lock: once it
+      # names a commit, only that commit can produce the release (the version
+      # job finishes a half-done one on re-run), and a hand-pushed tag on
+      # another commit fails here before any vX.Y.Z image is pushed.
+      # Annotated, like a hand-made `git tag -a`. Idempotent for this commit;
+      # a tag that names a different commit is an error, never moved.
+      - name: Tag the release commit
+        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null)"; then
+            obj="$(echo "$ref" | jq -r .object.sha)"
+            if [ "$(echo "$ref" | jq -r .object.type)" = "tag" ]; then
+              obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$obj" --jq .object.sha)"
+            fi
+            [ "$obj" = "$GITHUB_SHA" ] || { echo "::error::$TAG already names $obj, not $GITHUB_SHA"; exit 1; }
+            echo "$TAG already names $GITHUB_SHA"
+            exit 0
+          fi
+          tag_obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags" \
+            -f tag="$TAG" -f message="$TAG" -f object="$GITHUB_SHA" -f type=commit --jq .sha)"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$tag_obj" >/dev/null
+          echo "Tagged $GITHUB_SHA as $TAG"
+
+      # Release images are not rebuilt on the main path: one that exists was
+      # pushed by an earlier attempt for this same commit (the tag above
+      # guarantees it), and rebuilding would change a published digest.
+      - name: Find release images already published
+        id: have
+        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          BACKUP_IMAGE: ${{ steps.img.outputs.backup_image }}
+        run: |
+          for pair in "manager=$IMAGE" "backup=$BACKUP_IMAGE"; do
+            if docker buildx imagetools inspect "${pair#*=}" >/dev/null 2>&1; then
+              echo "${pair%%=*}=true" >> "$GITHUB_OUTPUT"
+              echo "${pair#*=} already published; reusing it"
+            fi
+          done
 
       # amd64 and arm64 in one manifest list. The temporary management cluster
       # `hydra bootstrap` creates is a kind cluster on the operator's machine,
@@ -99,42 +219,80 @@ jobs:
       # manifest". The Dockerfile cross-compiles on the build platform and its
       # final stage has no RUN, so no emulation is needed.
       - name: Build and push the multi-arch image
-        run: make docker-buildx IMG='${{ steps.img.outputs.image }}' PLATFORMS=linux/amd64,linux/arm64
+        if: steps.have.outputs.manager != 'true'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+        run: make docker-buildx IMG="$IMAGE" PLATFORMS=linux/amd64,linux/arm64
+
+      # Keeps the sha-<12 hex> image every main commit has, for a release
+      # commit too. A copy of the manifest list, not a rebuild.
+      - name: Also tag a release from main by its commit
+        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          SHA_IMAGE: ${{ steps.img.outputs.sha_image }}
+        run: docker buildx imagetools create -t "$SHA_IMAGE" "$IMAGE"
 
       # The release manifest must reference the image just published, not the
       # placeholder in config/manager. release-manifests takes IMG for this.
       - name: Build clusterctl release manifests
-        run: make release-manifests IMG='${{ steps.img.outputs.image }}'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+        run: make release-manifests IMG="$IMAGE"
 
       - name: Upload release manifests as artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-manifests-${{ github.ref_name }}
+          name: release-manifests-${{ needs.version.outputs.release == 'true' && needs.version.outputs.tag || github.ref_name }}
           path: |
             out/infrastructure-components.yaml
             out/metadata.yaml
           if-no-files-found: error
 
+      # Re-runnable: a Release left by an earlier attempt gets its assets
+      # (re)uploaded instead of failing on "already exists".
       - name: Create GitHub Release
-        if: github.ref_type == 'tag'
+        if: needs.version.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create '${{ github.ref_name }}' \
-            out/infrastructure-components.yaml \
-            out/metadata.yaml \
-            --title '${{ github.ref_name }}' \
-            --generate-notes
+          assets=(out/infrastructure-components.yaml out/metadata.yaml)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber -R "$GITHUB_REPOSITORY"
+            echo "$TAG already existed; assets re-uploaded"
+            exit 0
+          fi
+          # A tag with a "-" (v0.3.0-rc.1) is a pre-release.
+          set -- --title "$TAG" --generate-notes --verify-tag -R "$GITHUB_REPOSITORY"
+          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac
+          gh release create "$TAG" "${assets[@]}" "$@"
 
       # Same tag as the manager image, under a sibling name, so one merge sha
       # names both. Last, so a base-image or package-mirror failure here cannot
       # block the provider's own image, manifests or release.
       - name: Build and push the etcd-backup image
+        if: steps.have.outputs.backup != 'true'
+        env:
+          BACKUP_IMAGE: ${{ steps.img.outputs.backup_image }}
         run: |
-          img='${{ steps.img.outputs.image }}'
-          backup="${img%:*}-etcd-backup:${img##*:}"
           make docker-build-etcd-backup
           docker run --rm --entrypoint sh -v "$PWD/tools/etcd-backup:/t:ro" etcd-backup:dev /t/etcd-backup_test.sh
-          docker tag etcd-backup:dev "$backup"
-          make docker-push-etcd-backup ETCD_BACKUP_IMG="$backup"
-          echo "Published $backup"
+          docker tag etcd-backup:dev "$BACKUP_IMAGE"
+          make docker-push-etcd-backup ETCD_BACKUP_IMG="$BACKUP_IMAGE"
+          echo "Published $BACKUP_IMAGE"
+
+      - name: Also tag the release's etcd-backup image by its commit
+        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
+        env:
+          BACKUP_IMAGE: ${{ steps.img.outputs.backup_image }}
+          BACKUP_SHA_IMAGE: ${{ steps.img.outputs.backup_sha_image }}
+        run: docker buildx imagetools create -t "$BACKUP_SHA_IMAGE" "$BACKUP_IMAGE"
+
+      # The commit image above is published even when VERSION is broken, so
+      # main never loses its sha- images; the run still goes red.
+      - name: Fail on an unreleasable VERSION
+        if: needs.version.outputs.invalid == 'true'
+        run: |
+          echo "::error::VERSION on main is not releasable; see the version job, and fix it in a PR (make check-version)"
+          exit 1
