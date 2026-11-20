@@ -31,6 +31,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	infrav1 "github.com/Petatron/cluster-api-provider-hydra/api/v1alpha1"
 	"github.com/Petatron/cluster-api-provider-hydra/internal/providers"
@@ -422,6 +423,38 @@ var _ = Describe("Pre-drain guest hook", func() {
 		_, err := reconcile(r)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(held(r)).To(BeFalse())
+	})
+
+	It("releases the hook without running it when the Cluster is already gone", func() {
+		running()
+		r := provisioned(deletingOwner(time.Second))
+		link := &linkage{machine: machineOf(r), clusterName: linkClusterName}
+		_, err := r.reconcilePreDrainHook(ctx, reloadHM(ctx, r, key), link, provider)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(held(r)).To(BeFalse())
+		Expect(provider.GuestStarts).To(BeEmpty())
+	})
+
+	It("patches only its own annotation, so another pre-drain hook is never overwritten", func() {
+		m := ownerMachine(&secret)
+		m.Annotations = map[string]string{"pre-drain.delete.hook.machine.cluster.x-k8s.io/other": "someone"}
+		var sent string
+		s := linkScheme()
+		c := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(m).WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, o client.Object, p client.Patch, opts ...client.PatchOption) error {
+				b, err := p.Data(o)
+				Expect(err).NotTo(HaveOccurred())
+				sent = string(b)
+				return cl.Patch(ctx, o, p, opts...)
+			},
+		}).Build()
+		r := &HydraMachineReconciler{Client: c, APIReader: c, Scheme: s}
+		live := &clusterv1.Machine{}
+		Expect(c.Get(ctx, client.ObjectKeyFromObject(m), live)).To(Succeed())
+		Expect(r.setPreDrainHook(ctx, live, true)).To(Succeed())
+		Expect(sent).To(Equal(`{"metadata":{"annotations":{"` + infrav1.PreDrainHookAnnotation + `":"` + infrav1.PreDrainHookOwner + `"}}}`))
+		Expect(r.setPreDrainHook(ctx, live, false)).To(Succeed())
+		Expect(sent).To(Equal(`{"metadata":{"annotations":{"` + infrav1.PreDrainHookAnnotation + `":null}}}`))
 	})
 
 	It("releases the hook without running it while the Cluster is being deleted", func() {

@@ -51,7 +51,7 @@ func (p *Provider) StartInGuest(ctx context.Context, id, path string) (int, erro
 		PID int `json:"pid"`
 	}
 	if err := p.agentCommand(ctx, dom, "guest-exec", map[string]any{"path": path, "capture-output": true}, &started); err != nil {
-		if !errors.Is(err, providers.ErrGuestRefused) && !agentNotConnected(err) {
+		if !errors.Is(err, providers.ErrGuestRefused) && !agentNotDispatched(err) {
 			// Sent, but no answer: the guest may have started it.
 			err = fmt.Errorf("%w: %v", providers.ErrGuestOutcomeUnknown, err)
 		}
@@ -182,10 +182,13 @@ func isAgentRefusal(err error) bool {
 		strings.Contains(lerr.Message, "unable to execute QEMU agent command")
 }
 
-// agentNotConnected reports whether libvirt refused a guest-agent command
-// before sending it, because no agent is connected: then nothing ran.
-func agentNotConnected(err error) bool {
+// agentNotDispatched reports whether libvirt failed a guest-agent command
+// before sending it: no agent connected, or no answer to the guest-sync it
+// sends first. libvirt reports both as ErrAgentUnresponsive; once the command
+// is sent, a missing reply is ErrAgentCommandTimeout, and an agent lost mid
+// command is ErrAgentUnresponsive saying it "disappeared while executing".
+func agentNotDispatched(err error) bool {
 	var lerr golibvirt.Error
 	return errors.As(err, &lerr) && lerr.Code == uint32(golibvirt.ErrAgentUnresponsive) &&
-		strings.Contains(lerr.Message, "not connected")
+		!strings.Contains(lerr.Message, "disappeared while executing")
 }

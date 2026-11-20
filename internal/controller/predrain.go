@@ -130,6 +130,10 @@ func (r *HydraMachineReconciler) reconcilePreDrainHook(ctx context.Context, mach
 		return release("Released pre-drain hook without running it: preDrainHook is not set")
 	case link.cluster != nil && !link.cluster.DeletionTimestamp.IsZero():
 		return release("Released pre-drain hook without running it: the Cluster is being deleted")
+	case link.cluster == nil && link.clusterName != "":
+		// Named but gone (resolveLinkage leaves a Cluster that is not found
+		// as nil and fails on any other read error): its teardown has begun.
+		return release("Released pre-drain hook without running it: the Cluster is gone")
 	case deleting > hook.Timeout()+preDrainHookSlack:
 		return release("Released pre-drain hook: its time ran out", "timeout", hook.Timeout(), "slack", preDrainHookSlack)
 	case prov == nil:
@@ -215,7 +219,7 @@ func (r *HydraMachineReconciler) runPreDrainHook(ctx context.Context, machine *i
 			// The guest may have started it: the record stays "starting",
 			// so the run is held until the timeout and never started again.
 			log.Info("Pre-drain hook start has an unknown outcome; holding until its timeout", "path", hook.Path, "reason", err.Error())
-			return preDrainHookRetry, nil
+			return min(preDrainHookRetry, hook.Timeout()+preDrainHookSlack-deleting+time.Second), nil
 		case errors.Is(err, providers.ErrNotFound), errors.Is(err, providers.ErrNotRunning):
 			return release("Released pre-drain hook without running it: the machine is not running", "reason", err.Error())
 		case errors.Is(err, providers.ErrGuestRefused):

@@ -184,8 +184,11 @@ func TestStartInGuestTellsUnsentFromUnanswered(t *testing.T) {
 		err     golibvirt.Error
 		unknown bool
 	}{
+		// libvirt 12.0.0's messages (src/qemu/qemu_agent.c).
 		{"not connected", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: QEMU guest agent is not connected"}, false},
-		{"timed out", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: Guest agent not available for now"}, true},
+		{"guest-sync unanswered", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: guest agent didn't respond to synchronization within '10' seconds"}, false},
+		{"command unanswered", golibvirt.Error{Code: uint32(golibvirt.ErrAgentCommandTimeout), Message: "Guest agent command timed out: guest agent didn't respond to command within '10' seconds"}, true},
+		{"agent lost mid command", golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding: Guest agent disappeared while executing command"}, true},
 		{"connection dropped", golibvirt.Error{Code: uint32(golibvirt.ErrInternalError), Message: "internal error: client socket is closed"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
