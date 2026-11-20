@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"time"
+
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -156,7 +158,76 @@ type HydraMachineSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
 	Networks []HydraNetworkAttachment `json:"networks,omitempty"`
+
+	// preDrainHook is a program the controller runs inside the machine's guest,
+	// through the QEMU guest agent, when the owning Cluster API Machine starts
+	// deleting and before Cluster API drains its Node.
+	//
+	// Setting it makes the controller hold the Machine's deletion with a Cluster
+	// API pre-drain hook (PreDrainHookAnnotation) until the program has run.
+	// For a control-plane machine that is before Cluster API removes its etcd
+	// member, so the program still runs on a healthy node: the place to hand
+	// over anything the node serves, such as a control-plane virtual IP.
+	//
+	// The program runs as root. The deletion then proceeds whatever it
+	// returned: a program that fails, cannot be run, or is still running
+	// after timeoutSeconds (it is left running, not killed) releases the
+	// hook, as does a guest agent or infrastructure backend that cannot be
+	// reached within timeoutSeconds plus 60 seconds of the deletion starting.
+	//
+	// A start that failed is tried again; a start whose outcome is unknown
+	// (a lost reply, a controller restart) is not, and holds the deletion
+	// until timeoutSeconds. The program must therefore be idempotent, and
+	// safe to leave running.
+	//
+	// The program is not run while the Cluster is being deleted. Where
+	// Cluster API does not wait on pre-drain hooks for other reasons -- a
+	// machine with no Node, the last control-plane machine, a control plane
+	// being deleted -- it may still run, but the deletion does not wait for
+	// it, and the hook is released once the HydraMachine is deleted. A
+	// standalone HydraMachine, with no Cluster API Machine to hold, never runs
+	// it.
+	// +optional
+	PreDrainHook *HydraGuestHook `json:"preDrainHook,omitempty"`
 }
+
+// HydraGuestHook is a program run inside a machine's guest.
+type HydraGuestHook struct {
+	// path is the absolute path of the program in the guest. It is executed
+	// directly, without a shell and without arguments.
+	// +required
+	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:Pattern=`^/[^\x00]*$`
+	Path string `json:"path"`
+
+	// timeoutSeconds is how long after the Machine starts deleting the
+	// controller waits for the program to finish, and the latest it starts
+	// it. Defaults to 60.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=600
+	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
+}
+
+// DefaultGuestHookTimeoutSeconds is HydraGuestHook.timeoutSeconds when unset.
+const DefaultGuestHookTimeoutSeconds = 60
+
+// Timeout is the hook's bound, defaulted.
+func (h *HydraGuestHook) Timeout() time.Duration {
+	if h == nil || h.TimeoutSeconds == nil {
+		return DefaultGuestHookTimeoutSeconds * time.Second
+	}
+	return time.Duration(*h.TimeoutSeconds) * time.Second
+}
+
+// PreDrainHookAnnotation is the Cluster API pre-drain hook this controller
+// puts on a Machine whose HydraMachine sets preDrainHook, and removes once
+// the hook has run (or when preDrainHook is unset). Its value names the owner.
+const PreDrainHookAnnotation = clusterv1.PreDrainDeleteHookAnnotationPrefix + "/hydra-guest-hook"
+
+// PreDrainHookOwner is PreDrainHookAnnotation's value.
+const PreDrainHookOwner = "cluster-api-provider-hydra"
 
 // HydraMachineInitializationStatus provides observations of the HydraMachine
 // initialization process.

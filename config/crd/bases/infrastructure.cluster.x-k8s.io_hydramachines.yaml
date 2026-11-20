@@ -170,6 +170,57 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+              preDrainHook:
+                description: |-
+                  preDrainHook is a program the controller runs inside the machine's guest,
+                  through the QEMU guest agent, when the owning Cluster API Machine starts
+                  deleting and before Cluster API drains its Node.
+
+                  Setting it makes the controller hold the Machine's deletion with a Cluster
+                  API pre-drain hook (PreDrainHookAnnotation) until the program has run.
+                  For a control-plane machine that is before Cluster API removes its etcd
+                  member, so the program still runs on a healthy node: the place to hand
+                  over anything the node serves, such as a control-plane virtual IP.
+
+                  The program runs as root. The deletion then proceeds whatever it
+                  returned: a program that fails, cannot be run, or is still running
+                  after timeoutSeconds (it is left running, not killed) releases the
+                  hook, as does a guest agent or infrastructure backend that cannot be
+                  reached within timeoutSeconds plus 60 seconds of the deletion starting.
+
+                  A start that failed is tried again; a start whose outcome is unknown
+                  (a lost reply, a controller restart) is not, and holds the deletion
+                  until timeoutSeconds. The program must therefore be idempotent, and
+                  safe to leave running.
+
+                  The program is not run while the Cluster is being deleted. Where
+                  Cluster API does not wait on pre-drain hooks for other reasons -- a
+                  machine with no Node, the last control-plane machine, a control plane
+                  being deleted -- it may still run, but the deletion does not wait for
+                  it, and the hook is released once the HydraMachine is deleted. A
+                  standalone HydraMachine, with no Cluster API Machine to hold, never runs
+                  it.
+                properties:
+                  path:
+                    description: |-
+                      path is the absolute path of the program in the guest. It is executed
+                      directly, without a shell and without arguments.
+                    maxLength: 256
+                    minLength: 2
+                    pattern: ^/[^\x00]*$
+                    type: string
+                  timeoutSeconds:
+                    description: |-
+                      timeoutSeconds is how long after the Machine starts deleting the
+                      controller waits for the program to finish, and the latest it starts
+                      it. Defaults to 60.
+                    format: int32
+                    maximum: 600
+                    minimum: 1
+                    type: integer
+                required:
+                - path
+                type: object
               providerID:
                 description: |-
                   providerID is the unique identifier for this machine, in the form

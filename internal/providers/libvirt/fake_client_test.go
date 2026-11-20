@@ -109,6 +109,9 @@ type fakeDomain struct {
 	// inactiveXML, when set, is the persistent definition where it differs from
 	// the running one -- an interface added with --config only, say.
 	inactiveXML string
+	// agent answers guest-agent commands (the JSON sent) with the agent's
+	// reply; nil fails every command, the way an absent guest agent does.
+	agent func(cmd string) (string, error)
 }
 
 type fakeNetwork struct {
@@ -315,6 +318,25 @@ func (f *fakeLibvirt) domain(dom golibvirt.Domain) (*fakeDomain, error) {
 		return nil, lvErr(golibvirt.ErrNoDomain)
 	}
 	return d, nil
+}
+
+func (f *fakeLibvirt) QEMUDomainAgentCommand(dom golibvirt.Domain, cmd string, _ int32, _ uint32) (golibvirt.OptString, error) {
+	defer f.mu.Unlock()
+	if err := f.enter("QEMUDomainAgentCommand", dom.Name); err != nil {
+		return nil, err
+	}
+	d, err := f.domain(dom)
+	if err != nil {
+		return nil, err
+	}
+	if d.agent == nil {
+		return nil, golibvirt.Error{Code: uint32(golibvirt.ErrAgentUnresponsive), Message: "Guest agent is not responding"}
+	}
+	reply, err := d.agent(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return golibvirt.OptString{reply}, nil
 }
 
 func (f *fakeLibvirt) DomainIsActive(dom golibvirt.Domain) (int32, error) {

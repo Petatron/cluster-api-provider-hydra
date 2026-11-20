@@ -129,6 +129,8 @@ func TestInstrumentedTimesEveryOperation(t *testing.T) {
 		},
 		"ClaimOwner":    func() error { return p.ClaimOwner(t.Context(), "abc", "", "uid") },
 		"DeleteNetwork": func() error { return p.DeleteNetwork(t.Context(), "net", NetworkOwner{}) },
+		"StartInGuest":  func() error { _, err := p.StartInGuest(t.Context(), "id", "/x"); return err },
+		"GuestStatus":   func() error { _, err := p.GuestStatus(t.Context(), "id", 1); return err },
 	}
 	// Name is a constant and StoragePoolFor reads configuration; neither is a
 	// backend operation, and neither touches the hypervisor.
@@ -237,6 +239,16 @@ func (p *recordingProvider) ClaimOwner(_ context.Context, _, _, _ string) error 
 func (p *recordingProvider) DeleteNetwork(_ context.Context, _ string, _ NetworkOwner) error {
 	p.lastOp = "DeleteNetwork"
 	return p.err
+}
+
+func (p *recordingProvider) StartInGuest(_ context.Context, _, _ string) (int, error) {
+	p.lastOp = "StartInGuest"
+	return 1, p.err
+}
+
+func (p *recordingProvider) GuestStatus(_ context.Context, _ string, _ int) (*GuestRun, error) {
+	p.lastOp = "GuestStatus"
+	return nil, p.err
 }
 
 // Every sample carries the hypervisor its provider was wrapped with, so two
