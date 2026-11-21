@@ -65,10 +65,14 @@ jobs:
         run: |
           out() { { echo "release=$1"; echo "tag=$2"; echo "invalid=${3:-false}"; } >> "$GITHUB_OUTPUT"; }
           if [ "$REF_TYPE" = "tag" ]; then
+            # A hand-pushed tag name is untrusted: refuse anything but vX.Y.Z or
+            # vX.Y.Z-rc.N before it reaches a Make recipe, an image name or a shell.
+            hack/version.sh tag-ok "$REF_NAME"
             # Runs are serialised, so an existing Release is finished work
             # (usually the main run's, for the same version): never publish
             # over it.
-            if gh release view "$REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            state="$(hack/version.sh release-state "$REF_NAME")"   # fails on any API error but 404
+            if [ "$state" = present ]; then
               echo "::warning::$REF_NAME is already released; publishing the commit image only"
               out false "$REF_NAME"
             else
@@ -84,7 +88,8 @@ jobs:
           fi
           tag="v$v"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            state="$(hack/version.sh release-state "$tag")"   # fails on any API error but 404
+            if [ "$state" = present ]; then
               echo "$tag is released; publishing the commit image only"
               out false "$tag"
             elif [ "$(git rev-parse "$tag^{commit}")" = "$GITHUB_SHA" ]; then
@@ -313,7 +318,8 @@ jobs:
           TAG: ${{ needs.version.outputs.tag }}
         run: |
           assets=(out/infrastructure-components.yaml out/metadata.yaml)
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          state="$(hack/version.sh release-state "$TAG")"   # fails on any API error but 404
+          if [ "$state" = present ]; then
             gh release upload "$TAG" "${assets[@]}" --clobber -R "$GITHUB_REPOSITORY"
             echo "$TAG already existed; assets re-uploaded"
             exit 0

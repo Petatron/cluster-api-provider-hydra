@@ -172,6 +172,50 @@ printf 'releaseSeries: []\n' > "$sandbox/metadata.yaml"
 echo 0.2.0 > "$sandbox/VERSION"; run bump minor; expect_rc "metadata: no entry to copy a contract from" 1 'no releaseSeries entry to copy'
 expect_version "metadata: failed series add leaves VERSION" 0.2.0
 
+# --- tag-ok -------------------------------------------------------------------------
+
+new_repo
+for good in v0.3.0 v10.20.30 v0.4.0-rc.1 v1.0.0-rc.12; do
+	run tag-ok "$good"; expect_rc "tag-ok accepts $good" 0
+done
+# shellcheck disable=SC2016 # literal $(...) and backticks are the point: they must be refused
+for bad in '0.3.0' 'v0.3' 'v01.2.3' 'v0.3.0-beta.1' 'v0.3.0;id' 'v0.3.0$(id)' 'v0.3.0 x' "v0.3.0'" 'v0.3.0`id`' ''; do
+	run tag-ok "$bad"; expect_rc "tag-ok rejects '$bad'" 1 'is not vX\.Y\.Z'
+done
+
+# --- release-state, against a stub gh on PATH --------------------------------------
+
+stub="$(mktemp -d)"
+cat > "$stub/gh" <<'STUB'
+#!/usr/bin/env bash
+# Answers `gh api repos/<repo>/releases/tags/<tag>` as GH_STUB says.
+printf '%s\n' "$*" >> "$GH_STUB_LOG"
+case "$GH_STUB" in
+	present) echo '{"tag_name":"x"}' ;;
+	absent) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+	error) echo 'gh: Server Error (HTTP 502)' >&2; exit 1 ;;
+	denied) echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1 ;;
+	offline) echo 'error connecting to api.github.com' >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$stub/gh"
+state() { GH_STUB="$1" GH_STUB_LOG="$stub/log" GITHUB_REPOSITORY="${3-o/r}" PATH="$stub:$PATH" run release-state "$2"; }
+
+new_repo
+state present v0.3.0; expect_rc "release-state: present" 0 '^present$'
+state absent v0.3.0; expect_rc "release-state: 404 is absent" 0 '^absent$'
+state error v0.3.0; expect_rc "release-state: 5xx fails, not absent" 1 'cannot tell.*HTTP 502'
+state denied v0.3.0; expect_rc "release-state: 403 fails, not absent" 1 'cannot tell.*HTTP 403'
+state offline v0.3.0; expect_rc "release-state: network error fails" 1 'cannot tell'
+state absent 'v0.3.0;id'; expect_rc "release-state: refuses a malformed tag" 1 'is not vX\.Y\.Z'
+state absent v0.3.0 ''; expect_rc "release-state: needs GITHUB_REPOSITORY" 1 'needs GITHUB_REPOSITORY'
+if grep -qx 'api repos/o/r/releases/tags/v0.3.0' "$stub/log" && ! grep -q ';id' "$stub/log"; then
+	pass "release-state: asks for the right endpoint, never with a bad tag"
+else
+	fail "release-state: gh was called as: $(cat "$stub/log")"
+fi
+rm -rf -- "$stub"
+
 # --- usage -------------------------------------------------------------------------
 
 new_repo

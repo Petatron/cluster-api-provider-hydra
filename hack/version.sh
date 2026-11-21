@@ -12,6 +12,15 @@
 #   hack/version.sh check           fail unless VERSION is well formed, not behind
 #                                   the newest v* tag, and (where metadata.yaml
 #                                   exists) covered by a releaseSeries entry
+#   hack/version.sh tag-ok <tag>    fail unless <tag> is exactly vX.Y.Z or vX.Y.Z-rc.N;
+#                                   a hand-pushed tag must pass this before its
+#                                   name reaches any shell or Make recipe
+#   hack/version.sh release-state <tag>
+#                                   print "present" or "absent" for the GitHub
+#                                   Release of <tag> in $GITHUB_REPOSITORY (needs
+#                                   gh and GH_TOKEN). Only a 404 means absent; any
+#                                   other API error fails, so a transient error is
+#                                   never taken as permission to publish
 #
 # Pre-releases are written by hand as X.Y.Z-rc.N. They sort below X.Y.Z.
 #
@@ -123,9 +132,29 @@ cmd_check() {
 	fi
 }
 
+cmd_tag_ok() {
+	local t="${1:-}"
+	[[ "$t" == v* && "${t#v}" =~ $SEMVER_RE ]] || die "tag '$t' is not vX.Y.Z or vX.Y.Z-rc.N"
+}
+
+cmd_release_state() {
+	local t="${1:-}" err
+	cmd_tag_ok "$t"
+	[ -n "${GITHUB_REPOSITORY:-}" ] || die "release-state needs GITHUB_REPOSITORY (owner/name)"
+	if err="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$t" 2>&1 >/dev/null)"; then
+		echo present
+	elif [[ "$err" == *"(HTTP 404)"* ]]; then
+		echo absent
+	else
+		die "cannot tell whether Release $t exists: $err"
+	fi
+}
+
 case "${1:-}" in
 	get) read_version ;;
 	bump) shift; cmd_bump "$@" ;;
 	check) cmd_check ;;
-	*) die "usage: $0 get | bump <major|minor|patch> | check" ;;
+	tag-ok) cmd_tag_ok "${2:-}" ;;
+	release-state) cmd_release_state "${2:-}" ;;
+	*) die "usage: $0 get | bump <major|minor|patch> | check | tag-ok <tag> | release-state <tag>" ;;
 esac
