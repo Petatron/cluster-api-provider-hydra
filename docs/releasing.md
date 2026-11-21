@@ -43,7 +43,7 @@ A pre-release is written by hand: put `0.3.0-rc.1` in `VERSION`. `make bump-*` d
 suffix while it bumps, so to finalise `0.3.0-rc.2` write `0.3.0` by hand too.
 
 Merging releases. The image and the Release appear when the workflow finishes, in about seven
-minutes. Runs on `main` are serialised, and a tag the workflow creates with `GITHUB_TOKEN` does not
+minutes. Every release run, `main` and tag pushes alike, is serialised in one concurrency group, and a tag the workflow creates with `GITHUB_TOKEN` does not
 start another run, so a version cannot be released twice. If a run fails, see
 [Recovering a release](#recovering-a-release).
 
@@ -69,14 +69,18 @@ git push origin vX.Y.Z
 Then set `VERSION` to that version in a PR. Until then it is behind the newest tag, and every PR's
 `VERSION is releasable` check fails (main keeps publishing `sha-` images).
 
-**Never hand-tag a version that `VERSION` already names but has not released yet.** A tag push runs
-in its own concurrency group, so it races the `main` run:
+**Avoid hand-tagging a version that `VERSION` already names but has not released yet.** It cannot
+corrupt a release, because every release run shares one concurrency group and so never overlaps
+another:
 
-- **Tag on another commit.** The `main` run's tag step refuses before it pushes any `vX.Y.Z` image,
-  and the tag run releases the hand-tagged commit.
-- **Tag on the same commit the `main` run is releasing.** The `main` run finds its own tag and
-  carries on. The tag run always rebuilds and pushes `vX.Y.Z`, so the image digest can change under
-  a Release the `main` run has already created. Both runs also upload the manifests.
+- **The `main` run goes first.** It releases. The tag push then finds the Release already there and
+  publishes nothing over it.
+- **The tag run goes first.** It releases the hand-tagged commit. The `main` run then finds the
+  Release and publishes only its commit image, whichever commit the tag names. If the tag run
+  failed and the tag names another commit, the `main` run refuses at its tag step, before it pushes any `vX.Y.Z` image.
+
+GitHub keeps only one *pending* run per group, and a newer push replaces a queued one. If a queued
+tag run is replaced, the tag exists with no Release. Re-run that cancelled run from the Actions tab.
 
 ## Recovering a release
 

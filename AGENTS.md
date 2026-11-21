@@ -123,6 +123,7 @@ make bump-patch      # fixes only
 make bump-minor      # new behaviour or any CRD change; also adds the metadata.yaml releaseSeries entry
 make bump-major      # reserved for leaving v1alpha1
 make check-version   # what CI's "VERSION is releasable" job runs (needs tags: git fetch --tags)
+make test-version    # tests for hack/version.sh; run after changing it (CI runs it too)
 ```
 
 - **Never edit `VERSION` by hand except to write or finalise a pre-release** (`X.Y.Z-rc.N`), and

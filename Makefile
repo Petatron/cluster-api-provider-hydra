@@ -270,6 +270,10 @@ bump-major: ## Bump VERSION's major number and add its metadata.yaml releaseSeri
 check-version: ## Fail unless VERSION is well formed, not behind the newest tag, and in metadata.yaml (needs tags fetched)
 	@hack/version.sh check
 
+.PHONY: test-version
+test-version: ## Test hack/version.sh (parsing, tag ordering, bumping, metadata.yaml)
+	bash hack/version_test.sh
+
 ##@ Deployment
 
 ifndef ignore-not-found

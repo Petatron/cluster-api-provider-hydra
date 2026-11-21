@@ -17,8 +17,14 @@ on:
     branches: [main]
     tags: ['v*']
 
+# One group for every release run, main pushes and tag pushes alike, so a
+# hand-pushed tag can never overlap a main run releasing the same version and
+# publish over it. GitHub keeps one pending run per group: a newer push
+# replaces a queued (never a running) one. A replaced main run is harmless,
+# the next one sees the same untagged VERSION; a replaced tag run is not,
+# see "Fallback: tagging by hand" in docs/releasing.md.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 permissions: {}
@@ -59,8 +65,16 @@ jobs:
         run: |
           out() { { echo "release=$1"; echo "tag=$2"; echo "invalid=${3:-false}"; } >> "$GITHUB_OUTPUT"; }
           if [ "$REF_TYPE" = "tag" ]; then
-            echo "Tag push: releasing $REF_NAME"
-            out true "$REF_NAME"
+            # Runs are serialised, so an existing Release is finished work
+            # (usually the main run's, for the same version): never publish
+            # over it.
+            if gh release view "$REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::warning::$REF_NAME is already released; publishing the commit image only"
+              out false "$REF_NAME"
+            else
+              echo "Tag push: releasing $REF_NAME"
+              out true "$REF_NAME"
+            fi
             exit 0
           fi
           if ! v="$(hack/version.sh get)"; then

@@ -64,6 +64,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # the check compares VERSION with every v* tag
 
+      - name: Test hack/version.sh
+        run: make test-version
+
       - name: Check VERSION
         run: |
           msg="$(hack/version.sh check)"

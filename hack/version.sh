@@ -30,8 +30,11 @@ die() { echo "version: $*" >&2; exit 1; }
 read_version() {
 	[ -f "$VERSION_FILE" ] || die "$VERSION_FILE is missing"
 	local v
-	v="$(tr -d '[:space:]' < "$VERSION_FILE")"
-	[[ "$v" =~ $SEMVER_RE ]] || die "$VERSION_FILE holds '$v'; want X.Y.Z or X.Y.Z-rc.N, no leading v"
+	# Exactly one version, optionally followed by newlines ($(...) drops
+	# those). Any other whitespace, a CR or a second line is malformed: a
+	# release request must not pass CI on a value it does not literally hold.
+	v="$(cat "$VERSION_FILE")"
+	[[ "$v" =~ $SEMVER_RE ]] || die "$VERSION_FILE holds '$v'; want X.Y.Z or X.Y.Z-rc.N alone on one line, no leading v"
 	printf '%s\n' "$v"
 }
 
@@ -95,9 +98,10 @@ cmd_bump() {
 		patch) pat=$((pat + 1)) ;;
 		*) die "bump wants major, minor or patch, not '$part'" ;;
 	esac
+	# metadata.yaml first: if it cannot take the series, VERSION is left alone.
+	if [ -f "$METADATA" ]; then add_series "$maj" "$min"; fi
 	printf '%s.%s.%s\n' "$maj" "$min" "$pat" > "$VERSION_FILE"
 	echo "VERSION $v -> $maj.$min.$pat"
-	if [ -f "$METADATA" ]; then add_series "$maj" "$min"; fi
 }
 
 cmd_check() {
