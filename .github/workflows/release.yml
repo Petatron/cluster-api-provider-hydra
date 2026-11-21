@@ -176,7 +176,9 @@ jobs:
       # another commit fails here before any vX.Y.Z image is pushed.
       # Annotated, like a hand-made `git tag -a`. Idempotent for this commit;
       # a tag that names a different commit is an error, never moved.
+      # `existed` says whether an earlier attempt for this commit made it.
       - name: Tag the release commit
+        id: tag
         if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,28 +190,42 @@ jobs:
               obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$obj" --jq .object.sha)"
             fi
             [ "$obj" = "$GITHUB_SHA" ] || { echo "::error::$TAG already names $obj, not $GITHUB_SHA"; exit 1; }
+            echo "existed=true" >> "$GITHUB_OUTPUT"
             echo "$TAG already names $GITHUB_SHA"
             exit 0
           fi
           tag_obj="$(gh api "repos/$GITHUB_REPOSITORY/git/tags" \
             -f tag="$TAG" -f message="$TAG" -f object="$GITHUB_SHA" -f type=commit --jq .sha)"
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$tag_obj" >/dev/null
+          echo "existed=false" >> "$GITHUB_OUTPUT"
           echo "Tagged $GITHUB_SHA as $TAG"
 
-      # Release images are not rebuilt on the main path: one that exists was
-      # pushed by an earlier attempt for this same commit (the tag above
-      # guarantees it), and rebuilding would change a published digest.
+      # Release images are reused only on a re-run for the commit the tag
+      # already named before this job: then a vX.Y.Z image can only have come
+      # from an earlier attempt at this commit, and rebuilding would change a
+      # digest. When this run just created the tag (first attempt, or after
+      # the tag was deleted to release from a newer commit), any existing
+      # vX.Y.Z image may be another commit's and is rebuilt over; no Release
+      # exists yet on that path, so no published digest moves. Only "not
+      # found" counts as absent: any other registry error fails the step,
+      # so a blip cannot push a new digest over a tag that is already there.
       - name: Find release images already published
         id: have
-        if: needs.version.outputs.release == 'true' && github.ref_type != 'tag'
+        if: steps.tag.outputs.existed == 'true'
         env:
           IMAGE: ${{ steps.img.outputs.image }}
           BACKUP_IMAGE: ${{ steps.img.outputs.backup_image }}
         run: |
           for pair in "manager=$IMAGE" "backup=$BACKUP_IMAGE"; do
-            if docker buildx imagetools inspect "${pair#*=}" >/dev/null 2>&1; then
-              echo "${pair%%=*}=true" >> "$GITHUB_OUTPUT"
-              echo "${pair#*=} already published; reusing it"
+            name="${pair%%=*}" ref="${pair#*=}"
+            if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+              echo "$ref already published; reusing it"
+            elif echo "$out" | grep -qiE 'not found|manifest unknown'; then
+              echo "$ref not published yet"
+            else
+              echo "::error::cannot tell whether $ref exists: $out"
+              exit 1
             fi
           done
 
@@ -233,44 +249,11 @@ jobs:
           SHA_IMAGE: ${{ steps.img.outputs.sha_image }}
         run: docker buildx imagetools create -t "$SHA_IMAGE" "$IMAGE"
 
-      # The release manifest must reference the image just published, not the
-      # placeholder in config/manager. release-manifests takes IMG for this.
-      - name: Build clusterctl release manifests
-        env:
-          IMAGE: ${{ steps.img.outputs.image }}
-        run: make release-manifests IMG="$IMAGE"
-
-      - name: Upload release manifests as artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-manifests-${{ needs.version.outputs.release == 'true' && needs.version.outputs.tag || github.ref_name }}
-          path: |
-            out/infrastructure-components.yaml
-            out/metadata.yaml
-          if-no-files-found: error
-
-      # Re-runnable: a Release left by an earlier attempt gets its assets
-      # (re)uploaded instead of failing on "already exists".
-      - name: Create GitHub Release
-        if: needs.version.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          assets=(out/infrastructure-components.yaml out/metadata.yaml)
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${assets[@]}" --clobber -R "$GITHUB_REPOSITORY"
-            echo "$TAG already existed; assets re-uploaded"
-            exit 0
-          fi
-          # A tag with a "-" (v0.3.0-rc.1) is a pre-release.
-          set -- --title "$TAG" --generate-notes --verify-tag -R "$GITHUB_REPOSITORY"
-          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac
-          gh release create "$TAG" "${assets[@]}" "$@"
-
       # Same tag as the manager image, under a sibling name, so one merge sha
-      # names both. Last, so a base-image or package-mirror failure here cannot
-      # block the provider's own image, manifests or release.
+      # names both. Before the Release, on purpose: once the Release exists a
+      # "Re-run all jobs" treats the version as done, so everything a release
+      # publishes must already be there. A backup-image failure therefore
+      # holds the Release back; re-running finishes it (the tag is the lock).
       - name: Build and push the etcd-backup image
         if: steps.have.outputs.backup != 'true'
         env:
@@ -288,6 +271,43 @@ jobs:
           BACKUP_IMAGE: ${{ steps.img.outputs.backup_image }}
           BACKUP_SHA_IMAGE: ${{ steps.img.outputs.backup_sha_image }}
         run: docker buildx imagetools create -t "$BACKUP_SHA_IMAGE" "$BACKUP_IMAGE"
+
+      # The release manifest must reference the image just published, not the
+      # placeholder in config/manager. release-manifests takes IMG for this.
+      - name: Build clusterctl release manifests
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+        run: make release-manifests IMG="$IMAGE"
+
+      - name: Upload release manifests as artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-manifests-${{ needs.version.outputs.release == 'true' && needs.version.outputs.tag || github.ref_name }}
+          path: |
+            out/infrastructure-components.yaml
+            out/metadata.yaml
+          if-no-files-found: error
+
+      # The last publishing step, so a Release only exists once everything
+      # else has been published. If an earlier attempt created the Release
+      # but failed attaching assets, "Re-run failed jobs" lands here again
+      # and re-uploads them; "Re-run all jobs" does not (see the version job).
+      - name: Create GitHub Release
+        if: needs.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          assets=(out/infrastructure-components.yaml out/metadata.yaml)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber -R "$GITHUB_REPOSITORY"
+            echo "$TAG already existed; assets re-uploaded"
+            exit 0
+          fi
+          # A tag with a "-" (v0.3.0-rc.1) is a pre-release.
+          set -- --title "$TAG" --generate-notes --verify-tag -R "$GITHUB_REPOSITORY"
+          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac
+          gh release create "$TAG" "${assets[@]}" "$@"
 
       # The commit image above is published even when VERSION is broken, so
       # main never loses its sha- images; the run still goes red.

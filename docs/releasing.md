@@ -7,15 +7,19 @@ and superseded), `.github/workflows/release.yml`:
 
 1. re-runs the generated-file check, lint, unit tests and the etcd-backup tests, and refuses to
    publish if any fail;
-2. creates the annotated tag `vX.Y.Z` on that commit, then builds and pushes `ghcr.io/petatron/cluster-api-provider-hydra:vX.Y.Z` for **linux/amd64 and
-   linux/arm64**, and tags the same image `sha-<12 hex>` like every other main commit;
-3. renders `out/infrastructure-components.yaml` pointing at exactly that image, plus
+2. creates the annotated tag `vX.Y.Z` on that commit. The tag is the lock: from here on only this
+   commit can produce the release;
+3. builds and pushes `ghcr.io/petatron/cluster-api-provider-hydra:vX.Y.Z` for **linux/amd64 and
+   linux/arm64**, and the etcd-backup image beside it, and tags both `sha-<12 hex>` too, like every
+   other main commit;
+4. renders `out/infrastructure-components.yaml` pointing at exactly that image, plus
    `out/metadata.yaml`;
-4. creates the GitHub Release `vX.Y.Z` with those two files attached, which is what `clusterctl`
-   downloads. A version with a `-` (`0.3.0-rc.1`) is marked a pre-release. The etcd-backup image is
-   published last, under both `vX.Y.Z` and `sha-<12 hex>` too.
+5. creates the GitHub Release `vX.Y.Z` with those two files attached, which is what `clusterctl`
+   downloads. This comes last, so a Release exists only once everything else is published. A
+   version with a `-` (`0.3.0-rc.1`) is marked a pre-release.
 
-Every other merge to `main` runs steps 1–3 under `sha-<12 hex>` only, with no tag and no release.
+Every other merge to `main` runs steps 1, 3 and 4 under `sha-<12 hex>` only, with no tag and no
+release.
 If `VERSION` on `main` is not releasable (malformed, behind the newest tag, or missing from
 `metadata.yaml`), the `sha-` images are still published and the run then fails.
 
@@ -65,20 +69,33 @@ git push origin vX.Y.Z
 Then set `VERSION` to that version in a PR. Until then it is behind the newest tag, and every PR's
 `VERSION is releasable` check fails (main keeps publishing `sha-` images).
 
-**Never hand-tag a version that `VERSION` already names but has not released yet.** If both runs
-are in flight, the `main` run's tag step fails before it pushes a `vX.Y.Z` image. But it can still
-have read the tag as absent. The tag run then builds and pushes `vX.Y.Z` from the tagged commit.
+**Never hand-tag a version that `VERSION` already names but has not released yet.** A tag push runs
+in its own concurrency group, so it races the `main` run:
+
+- **Tag on another commit.** The `main` run's tag step refuses before it pushes any `vX.Y.Z` image,
+  and the tag run releases the hand-tagged commit.
+- **Tag on the same commit the `main` run is releasing.** The `main` run finds its own tag and
+  carries on. The tag run always rebuilds and pushes `vX.Y.Z`, so the image digest can change under
+  a Release the `main` run has already created. Both runs also upload the manifests.
 
 ## Recovering a release
 
 The tag is the lock: once `vX.Y.Z` names a commit, only that commit can produce the release.
 
-- **The run failed after the tag was created.** Re-run it, with either "Re-run failed jobs" or
-  "Re-run all jobs". The version job sees the tag on this commit with no Release and finishes
-  the release. If a Release already exists, its assets are re-uploaded.
+- **The run failed after the tag was created, and there is no Release yet.** Use either re-run
+  button. "Re-run all jobs" works because the version job sees the tag on this commit with no
+  Release and finishes the release. The re-run reuses any `vX.Y.Z` image an earlier attempt at
+  this commit pushed.
+- **The Release exists but its assets are incomplete.** This happens when the run failed while
+  attaching them. Use **"Re-run failed jobs"**: it keeps the original decision to release and
+  re-uploads the assets with `--clobber`. "Re-run all jobs" sees the Release and treats the version
+  as done. To upload by hand instead, run
+  `gh run download <run-id> -n release-manifests-vX.Y.Z` and then
+  `gh release upload vX.Y.Z infrastructure-components.yaml metadata.yaml --clobber`.
 - **The tag names a commit that can never build**, or a newer commit's run warns
   "`vX.Y.Z` has no GitHub Release and names another commit". Delete the tag and let the next
-  `main` run release from its own commit, or bump `VERSION` again:
+  `main` run release from its own commit, or bump `VERSION` again. That run created the tag
+  itself, so it rebuilds the `vX.Y.Z` images rather than reusing the failed commit's:
 
   ```bash
   git push origin :refs/tags/vX.Y.Z
@@ -86,7 +103,6 @@ The tag is the lock: once `vX.Y.Z` names a commit, only that commit can produce 
 
 - **The run failed before the tag was created.** Fix it forward. The next green `main` run whose
   `VERSION` is still untagged releases from that commit.
-
 
 ## After tagging
 

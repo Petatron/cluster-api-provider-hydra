@@ -114,9 +114,9 @@ a hand-pushed `v*` tag) — see [Releasing](#releasing--bump-version-never-push-
 ## Releasing — bump `VERSION`, never push a tag (PET-92)
 
 **A release is a PR that changes the `VERSION` file.** It holds the version `main` is at, without the
-`v` (`0.3.0`). When a commit reaches `main` with a `VERSION` that has no `v*` tag yet, `release.yml`
-re-runs the checks, publishes, creates the annotated tag `vX.Y.Z` on that commit and cuts the GitHub
-Release. Full procedure: [`docs/releasing.md`](docs/releasing.md).
+`v` (`0.2.0`). When a commit reaches `main` with a `VERSION` that has no `v*` tag yet, `release.yml`
+re-runs the checks, creates the annotated tag `vX.Y.Z` on that commit first (the tag is the lock),
+publishes the images and manifests, and cuts the GitHub Release last. Full procedure: [`docs/releasing.md`](docs/releasing.md).
 
 ```bash
 make bump-patch      # fixes only
