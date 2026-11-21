@@ -8,7 +8,7 @@ coding agent (Claude Code, Codex, Cursor). It is imported below — read it befo
 **Do not duplicate guidance in this file.** If something needs to change, change `AGENTS.md`; this
 file exists only to point Claude Code at it.
 
-## The three rules most often missed
+## The four rules most often missed
 
 1. **PR titles carry the ticket, commit messages do not.** `[PET-27] Publish template capacity`, not
    `feat: … (PET-27)`. Commits stay conventional (`feat:` / `fix:` / `docs:`) with no prefix.
@@ -26,3 +26,7 @@ file exists only to point Claude Code at it.
 
    Several agents review the same PRs; the thread has to say who is speaking. This applies to
    comments only, never to the PR body, PR title, or commit message.
+
+4. **Release by bumping `VERSION`, never by pushing a tag.** `make bump-patch|minor|major` in a PR;
+   merging it tags and publishes. Bump only when the user asks for a release. See *Releasing* in
+   `AGENTS.md`.

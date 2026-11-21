@@ -48,3 +48,26 @@ jobs:
             echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the result."
             exit 1
           fi
+
+  # A PR that changes VERSION is a release request (PET-92): merging it tags
+  # and publishes vX.Y.Z. Refuse a VERSION that is malformed, behind the newest
+  # tag, or missing from metadata.yaml, before it can reach main.
+  version:
+    permissions:
+      contents: read
+    name: VERSION is releasable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the check compares VERSION with every v* tag
+
+      - name: Test hack/version.sh
+        run: make test-version
+
+      - name: Check VERSION
+        run: |
+          msg="$(hack/version.sh check)"
+          echo "::notice::$msg"

@@ -106,8 +106,36 @@ Other targets: `make run` (run against current kubeconfig), `make build`,
 list on purpose — see the traps below before running it.**
 
 CI on every PR: `lint`, `test`, `verify`, `vuln` (govulncheck; it also runs weekly, because a new
-advisory can make `main` vulnerable without any change here). `test-e2e` runs on `main` and manual dispatch. `release`
-publishes to ghcr on `main` and cuts a GitHub Release on `v*` tags.
+advisory can make `main` vulnerable without any change here), and `VERSION is releasable`
+(`make check-version`). `test-e2e` runs on `main` and manual dispatch. `release` publishes a
+`sha-<12 hex>` image on every `main` push, and cuts a GitHub Release when `VERSION` is untagged (or on
+a hand-pushed `v*` tag) — see [Releasing](#releasing--bump-version-never-push-a-tag-pet-92).
+
+## Releasing — bump `VERSION`, never push a tag (PET-92)
+
+**A release is a PR that changes the `VERSION` file.** It holds the version `main` is at, without the
+`v` (`0.2.0`). When a commit reaches `main` with a `VERSION` that has no `v*` tag yet, `release.yml`
+re-runs the checks, creates the annotated tag `vX.Y.Z` on that commit first (the tag is the lock),
+publishes the images and manifests, and cuts the GitHub Release last. Full procedure: [`docs/releasing.md`](docs/releasing.md).
+
+```bash
+make bump-patch      # fixes only
+make bump-minor      # new behaviour or any CRD change; also adds the metadata.yaml releaseSeries entry
+make bump-major      # reserved for leaving v1alpha1
+make check-version   # what CI's "VERSION is releasable" job runs (needs tags: git fetch --tags)
+make test-version    # tests for hack/version.sh; run after changing it (CI runs it too)
+```
+
+- **Never edit `VERSION` by hand except to write or finalise a pre-release** (`X.Y.Z-rc.N`), and
+  never push a `v*` tag yourself — the hand-tag path is a documented fallback for when the workflow
+  is broken, and it is the user's call.
+- **Bumping `VERSION` is a release decision.** Do it only when the user asks for a release, in the
+  release PR or the change's own PR — never as a side effect of other work.
+- `hack/version.sh` is **identical in `hydra` and `cluster-api-provider-hydra`**; change both
+  together.
+- **`metadata.yaml` must cover the version.** `make bump-minor` / `bump-major` add the
+  `releaseSeries` entry (copying the last contract); the check fails without it, because clusterctl
+  refuses a release whose series is missing. Change the contract if Cluster API's changes.
 
 ## Repo-specific traps
 
